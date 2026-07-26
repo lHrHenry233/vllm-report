@@ -20,6 +20,26 @@ from sig_config import classify_by_paths, is_trivial_commit, triage_trivial_sig 
 
 COMMITS_DIR = os.path.join(PROJECT_ROOT, "data", "vllm", "commits")
 ANALYSIS_DIR = os.path.join(PROJECT_ROOT, "data", "vllm", "analysis")
+PRS_DIR = os.path.join(PROJECT_ROOT, "data", "vllm", "prs")
+
+
+def load_pr_map(date):
+    """Return {sha: pr_entry} for *date*, or empty dict if no PR file."""
+    path = os.path.join(PRS_DIR, f"{date}.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return {e["sha"]: e for e in data.get("commits", [])}
+
+
+def truncate(text, limit=2000):
+    """Truncate *text* to *limit* chars, adding an ellipsis if cut."""
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... [truncated, see full PR for more]"
 
 
 def pending_dates():
@@ -49,7 +69,10 @@ def digest_date(date):
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
     commits = data.get("commits", [])
-    print(f"\n=== {date}: {len(commits)} commits ===")
+    pr_map = load_pr_map(date)
+    has_prs = bool(pr_map)
+    print(f"\n=== {date}: {len(commits)} commits ===" +
+          ("" if has_prs else "  [no PR descriptions — run fetch_pr_descriptions.py first]"))
     for c in commits:
         sha = c["sha"]
         title = c.get("message", "").split("\n")[0]
@@ -64,6 +87,17 @@ def digest_date(date):
         print(f"  stats: +{stats.get('total_additions', 0)}/-{stats.get('total_deletions', 0)} files={stats.get('files_changed', 0)}")
         print(f"  paths: {top_dirs(files)}")
         print(f"  sig_hint: {hint} ({conf})")
+        pr = pr_map.get(sha)
+        if pr and pr.get("pr_number"):
+            print(f"  pr: #{pr['pr_number']} {pr.get('pr_title', '')}")
+            print(f"  pr_url: {pr.get('pr_url', '')}")
+            body = truncate(pr.get("pr_body", ""), 2000)
+            if body:
+                print(f"  pr_body: |")
+                for line in body.split("\n"):
+                    print(f"    {line}")
+        elif has_prs:
+            print("  pr: (no associated PR)")
 
 
 def main():

@@ -1,164 +1,185 @@
 {
   "date": "2026-07-24",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-07-26T15:40:00+08:00",
-  "daily_summary": "当日 21 条变更，主线是量化生态扩展与大规模服务修复：新增 DeepSeek4 CompressedTensors 量化和 llm-compressor Inkling NVFP4 权重支持，修复 packed KV cache 混合精度检测；PD 分离方向修复 NixlPush writer 线程阻塞握手问题；性能方向合入了 GLM-5.2 Blackwell decode 大规模 kernel 优化（次日被 revert，需关注）。其余为配置校验、模型加载等核心修复和大量 CI 基础设施调整（AMD mirror regating、依赖升级等）。",
+  "generated_at": "2026-07-26T20:10:00+08:00",
+  "daily_summary": "当日 21 条变更，量化生态扩展是显著主线：新增 DeepSeek4 CompressedTensors 量化支持、llm-compressor Inkling NVFP4 权重加载、packed KV cache 混合精度检测修复，三项协同推进 NVFP4/FP8 量化模型在 vLLM 上的覆盖。PD 分离方向修复 NixlPush writer 线程上的阻塞握手——握手耗时数秒，新 D 实例扩容时其余请求被卡住等待推送。性能方向合入 GLM-5.2 Blackwell decode 大规模 kernel 优化（+2139 行 skinny GEMM/fused kernel，次日已 revert，跟踪后续重新拆分合入）。核心侧为 encoder cache 引入扩展 hook（服务 Ascend score-based 两级缓存）、修复 layerwise reload 的 bias 损坏与 has_bias 为 None 的 Humming 崩溃。CI 基础设施大规模调整：AMD mirror regating（23 文件）、Transformers 升级至 5.14.1。",
   "sig_summaries": {
-    "sig-core": "配置系统加强校验（嵌套 runtime override 拒绝不兼容组合）、encoder cache 引入扩展 hook、模型加载修复 layerwise reload 偏置损坏与 has_bias 为 None 的崩溃。",
-    "sig-large-scale-serving": "DP 部署启动校验体验改进；NixlPush PD 连接器修复 writer 线程上的阻塞握手，避免传输停顿。",
-    "sig-model-performance": "GLM-5.2 Blackwell decode 优化合入大量 skinny GEMM/fused kernel（+2139 行，次日已 revert）；修复 AITER Fused AllReduce RMSNorm 与 benchmark 的 --skip-tokenizer-init。",
-    "sig-quantization": "DeepSeek4 CompressedTensors 量化支持、Inkling NVFP4（llm-compressor）权重加载、packed KV cache spec 混合精度检测修复。",
-    "sig-omni": "修复 base64 data URL 对 RFC 2397 参数的解析，提升多模态媒体输入兼容性。",
-    "sig-ci": "量化测试并行度调整、Transformers 升级至 5.14.1、AMD mirror regating 大规模流水线改造、若干平台特定测试跳过/看护补充。",
-    "other": "文档锚点链接修复。"
+    "sig-core": "配置系统三项加固：嵌套 runtime override 校验从不兼容 dataclass 静默替换改为递归类型检查并报完整路径的 ValueError（`python -O` 下不再消失）；encoder cache 引入 `EncoderCacheManagerConfig` 扩展 hook，允许外部定制两级缓存策略（服务 Ascend NPU+CPU score-based 缓存），默认行为不变；模型加载修复 layerwise reload 时 bias 被 `materialize_layer` 用 `empty_strided` 重分配导致永久损坏（`#49586` 将 bias 加入 SKIP_TENSORS，但次日 #49805 发现此修复引入了新的时序问题）。Humming kernel 修复 `has_bias=None` 时 `kHasBias` 字段被省略导致 NVRTC 编译失败。",
+    "sig-large-scale-serving": "DP 启动校验从 assert 改为 ValueError，覆盖 hybrid+external LB 冲突、多节点无 MP、world_size 不可分等 7 种场景，报错含 CLI flag 和纠正建议。NixlPush PD 连接器修复 P→D 阻塞握手——writer 线程同步发起握手耗时数秒，新 D 实例扩容时其余请求被卡住，改为复用 Pull 模式的后台线程异步发起。",
+    "sig-model-performance": "GLM-5.2 Blackwell decode 优化合入大规模 CUDA kernel（+2139 行/29 文件），含 bf16 skinny GEMM、dsv3 fused A GEMM、量化 kernel 等——该 commit 次日被 revert，PR 已转为跟踪页拆分为 4 个后续 PR。ROCm AITER Fused AllReduce+RMSNorm 修复 3D Transformers 输入下 token 数跨前导维度计算错误（误选 1-stage kernel 导致 RuntimeError），Qwen3-32B-FP8 gsm8k 精度 0.91。benchmark 恢复 `--skip-tokenizer-init` 与自定义数据集组合（Prithvi 等无 tokenizer 模型）。",
+    "sig-quantization": "DeepSeek4 CompressedTensors 量化支持（+4 行打通已有路径），8×B200 上 DeepSeek-V4-Flash-NVFP4-FP8 达 3258 tok/s 生成吞吐。Inkling NVFP4 权重加载——规范化 llm-compressor 嵌套 expert 名到 fused-MoE 参数名，加载 per-expert global scale 到 w13/w2 布局，GSM8K 5-shot 精度 0.895。packed KV cache spec 混合精度检测修复——worker 侧 `has_mixed_precision_kv_cache` 只查顶层 AttentionSpec 而 `generate_scheduler_kv_cache_config` 会解包 packed spec，导致 scheduler 标记需清零但 worker 未创建 zeroer，首个请求失败。",
+    "sig-omni": "修复 base64 data URL 对 RFC 2397 参数的解析——`_load_data_url` 按 first `;` 分割要求余部等于 `base64`，带 charset 等参数的 data URL 被拒（HTTP 501）；改为取 last `;` 分隔的 token 作为编码标记，并从 mediatype 中剥离参数避免 `VideoMediaIO` 比对 `video/jpeg` 失败。",
+    "sig-ci": "AMD mirror regating 大规模改造（23 文件）：MI325→MI300/MI250 重路由、DinD 禁用、超时调整、HIP_VISIBLE_DEVICES 修复。量化测试移除 H200 并行度以降低 fan-out 压力。Transformers 升级至 5.14.1（零修复直接通过）。另加 Quark W4A8 MoE CI（gfx950）、IR 测试显式 device、XPU 跳过 marlin LoRA、hybrid SSM P_TP>D_TP 精度 sweep。",
+    "other": "修复 serving/pooling/MoE 文档中 4 处失效锚点链接（`#rerank-api`→`#cohere-rerank-api` 等），markdownlint 0 error。"
   },
   "commits": [
     {
       "sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
-      "comment": "修复 base64 data URL 解析：按 RFC 2397 允许 media type 携带参数（如 charset），此前带参数的 data URL 会被多模态媒体加载器拒绝。变更集中在 vllm/multimodal/media 并补充了测试，兼容性向前，风险低。",
+      "comment": "**背景**：`MediaConnector._load_data_url` 按 first `;` 分割 header 并要求余部等于 `base64`，但 RFC 2397 允许 mediatype 后携带参数（如 `data:image/jpeg;charset=utf-8;base64,...`），带参数的 data URL 被拒为 HTTP 501。\n**方法**：取 last `;` 分隔的 token 作为编码标记（仅当前面有真正的 `;` 时），从 mediatype 中剥离参数后再传给 `MediaIO.load_base64`（避免 `VideoMediaIO` 比对 `video/jpeg` 失败），缺失 `,` 分隔符时抛 `ValueError`（→400）。\n**效果**：带 RFC 2397 参数的 data URL 正常工作；非 base64 data URL 仍正确抛 501；补充 base64/data_url/error_conversion 测试。",
       "sig": "sig-omni",
       "sig_reason": "多模态媒体输入解析路径的兼容性修复。",
-      "tags": ["bugfix", "low-risk", "multimodal"]
+      "tags": ["bugfix", "low-risk", "multimodal"],
+      "pr_number": 48973
     },
     {
       "sha": "453f01783d44abc3f325bcc6efadf4246ec18873",
-      "comment": "改进 data-parallel 启动参数校验：在 arg_utils 中对 DP 相关参数组合做更早、更清晰的验证与报错，避免用户以非法组合启动后在运行期才失败。纯校验逻辑增强，不改变运行时行为。",
+      "comment": "**背景**：数据并行启动参数组合的校验使用 assert，`python -O` 下消失导致无效组合进入运行期才失败，且报错不含可操作信息。\n**方法**：将 DP 相关断言替换为 `ValueError`，使用一致前缀、相关 CLI flag 和值、纠正建议；覆盖 hybrid+external LB 冲突、hybrid 无 local size、多节点无 MP、world_size 不可分、node_rank 越界等 7 种场景；新增 `--node-rank` 下界校验。\n**效果**：用户在启动时即获得可操作的错误信息，不再需要等运行期才失败。",
       "sig": "sig-large-scale-serving",
       "sig_reason": "面向 DP 大规模部署的启动校验体验改进。",
-      "tags": ["feature", "low-risk", "config"]
+      "tags": ["feature", "low-risk", "config"],
+      "pr_number": 49124
     },
     {
       "sha": "7b40fb96450e1deef40ebc383ff549bea35b9b8f",
-      "comment": "配置系统加固：拒绝互不兼容的嵌套 runtime override（config/utils + v1/worker），防止用户通过嵌套 override 注入冲突配置导致未定义行为。附带 test_config 与 worker 测试，属防御性校验。",
+      "comment": "**背景**：`update_config` 的嵌套 override 校验只检查值是否为任意 dataclass，不兼容的 dataclass 可静默替换期望的嵌套配置类型；其他无效 override 使用 assert，`python -O` 下消失产生低级 AttributeError。\n**方法**：递归校验——只接受 mapping 或期望嵌套 dataclass 的实例，报错含完整嵌套字段路径；不支持的 runner config 和未知字段抛带上下文的 `ValueError`。\n**效果**：`wrong_dataclass` 从静默接受变为 `ValueError: must be Inner, got Other`；`python -O` 下校验不再消失。",
       "sig": "sig-core",
       "sig_reason": "核心配置系统的校验逻辑增强。",
-      "tags": ["bugfix", "low-risk", "config"]
+      "tags": ["bugfix", "low-risk", "config"],
+      "pr_number": 49247
     },
     {
       "sha": "8eac21a602d4959eb8478c430d7fe1ca5b57311f",
-      "comment": "修复 ROCm 平台 AITER Fused AllReduce RMSNorm 在 Transformers 后端下的问题（_aiter_ops），并在 fusions_e2e 增加覆盖。属于平台特定融合 kernel 修复，仅影响 ROCm + AITER 路径。",
+      "comment": "**背景**：ROCm AITER Fused AllReduce+RMSNorm 对 3D Transformers 输入的 token 数计算错误，误选 1-stage kernel 导致 `RuntimeError: Token number is too large for allreduce_fusion_kernel_1stage`。\n**方法**：正确跨所有前导维度计算 token 数；在 TP2 AR+RMS 融合测试中增加 Transformers 后端覆盖。\n**效果**：Qwen3-32B-FP8 TP=2 gsm8k 精度 0.905（flexible）/0.923（strict）；融合测试通过。",
       "sig": "sig-model-performance",
       "sig_reason": "融合 kernel（allreduce+rmsnorm）在 ROCm 后端的修复。",
-      "tags": ["bugfix", "low-risk", "kernel", "rocm"]
+      "tags": ["bugfix", "low-risk", "kernel", "rocm"],
+      "pr_number": 49673
     },
     {
       "sha": "a454a1dd25a181334f6f126b2a2bec3d7c1d9aab",
-      "comment": "恢复 benchmark serve 场景下 --skip-tokenizer-init 与自定义数据集的组合能力，此前重构导致该选项失效。变更在 vllm/benchmarks 且补充了回归测试，仅影响基准测试工具链。",
+      "comment": "**背景**：PR #39896 为满足 mypy 类型标注在 `serve.py` 中加了 `assert tokenizer is not None`，但 Prithvi 等无 tokenizer 模型使用 `--skip-tokenizer-init` + 自定义数据集时该断言直接失败。\n**方法**：恢复 `--skip-tokenizer-init` 与自定义数据集的组合能力，调整 tokenizer 存在性检查逻辑；补充 `test_skip_tokenizer_init.py` 回归测试。\n**效果**：Prithvi-EO-2.0-300M 等无 tokenizer 模型可正常使用 bench serve + 自定义数据集。",
       "sig": "sig-model-performance",
       "sig_reason": "性能基准测试工具链修复。",
-      "tags": ["bugfix", "low-risk", "benchmarks"]
+      "tags": ["bugfix", "low-risk", "benchmarks"],
+      "pr_number": 49180
     },
     {
       "sha": "833483f3578a2c4766977d0fe431bd32a01ce250",
-      "comment": "为 encoder cache 引入扩展 hook：新增 ec_manager_config 配置项并在 v1/core、v1/worker 打通 hook 点，允许外部定制 encoder cache 管理策略（主要服务多模态 encoder 输出缓存）。接口面新增但默认行为不变，风险中等。",
+      "comment": "**背景**：V1 encoder cache 生命周期不可定制，平台实现（如 Ascend score-based 两级缓存：NPU 热缓存 + CPU 大容量缓存 + 评分驱动的晋升/驱逐）需要覆写或复制大段 `Scheduler` 和 `GPUModelRunner` 代码，难以维护。\n**方法**：新增 `EncoderCacheManagerConfig` 和 `EncoderCacheManagerMetadata`；`VllmConfig` 可通过 `ec_manager_config.encoder_cache_manager_cls` 提供自定义调度器侧缓存管理器类；通过 `SchedulerOutput` 传播元数据；新增 `GPUModelRunner` 可覆写 hook（请求清理、调度器 encoder-cache 更新、encoder 输出缓存/查找）。默认行为不变。\n**效果**：外部实现可定制 encoder cache 策略而不修改默认 vLLM 路径（8 文件 +106/-15）。",
       "sig": "sig-core",
-      "sig_reason": "v1 核心 encoder cache 管理器的可扩展性改造（主要惠及多模态）。",
-      "tags": ["feature", "medium-risk", "kv-cache"]
+      "sig_reason": "v1 核心 encoder cache 管理器的可扩展性改造。",
+      "tags": ["feature", "medium-risk", "kv-cache"],
+      "pr_number": 48218
     },
     {
       "sha": "163ecba37766e22036d8456a64d9122520647ab7",
-      "comment": "模型加载修复：layerwise reload 时跳过 linear bias，避免在线逐层重载场景下 bias 被重复处理导致权重损坏。3 行小修，针对性强。",
+      "comment": "**背景**：在线量化 + layerwise reload 路径中，`bias` 在 `create_weights()` 之后才创建，而 `initialize_online_processing()` 在 `create_weights()` 内调用——此时 bias 不存在。导致 `load_numel_total` 只计 weight，weight 加载完即触发 `_layerwise_process()`，`materialize_layer` 用 `empty_strided` 重分配已加载的非 meta bias，替换为未初始化内存，replay 循环因 bias 不在 `loaded_weights` 中永不写回——损坏永久。\n**方法**：将 `\"bias\"` 加入 `SKIP_TENSORS`（bias 不被量化、很小、走 eager 路径，不应进入 meta/重 materialize）。\n**效果**：Qwen3 vision tower 110 个 bias 从全部 mismatch 修复为全部 `allclose` 通过。（注：此修复次日被 #49805 发现引入了新的时序问题——bias 不计入 load_numel_total 导致 OPT 交错排列的提前触发。）",
       "sig": "sig-core",
       "sig_reason": "model_loader 权重重载路径的正确性修复。",
-      "tags": ["bugfix", "low-risk", "model-loader"]
+      "tags": ["bugfix", "low-risk", "model-loader"],
+      "pr_number": 49586
     },
     {
       "sha": "589a5b884bcc9a7662aac4a184529aa68da77436",
-      "comment": "PD 分离修复：NixlPush 连接器把握手调用从 writer 线程移出，避免阻塞 KV 传输写路径造成停顿；同步更新设计文档与 kv_connector 测试（+196/-80）。对使用 Nixl push 模式的 disagg 部署重要。",
+      "comment": "**背景**：NixlPush 模式下 P→D 握手由 writer 线程同步发起（D→P 方向已正确异步），握手耗时数秒，新 D 实例扩容时其余请求被卡住等待推送。\n**方法**：复用 Pull 模式和 D→P 的做法——将握手卸载到 `base_worker.py` 已有的后台线程作为异步任务。\n**效果**：writer 线程不再被握手阻塞，扩容期间请求推送不受影响（+196/-80，含设计文档和测试）。",
       "sig": "sig-large-scale-serving",
       "sig_reason": "PD 分离 KV 传输连接器（Nixl）的并发正确性修复。",
-      "tags": ["bugfix", "medium-risk", "kv-transfer", "disagg"]
+      "tags": ["bugfix", "medium-risk", "kv-transfer", "disagg"],
+      "pr_number": 49221
     },
     {
       "sha": "5c5434e2d89fe7008ec7a6046faa65a69ba568ca",
-      "comment": "（自动判定）移除量化测试的并行执行配置（.buildkite），推测为规避并行导致的资源争抢/不稳定。仅 CI 配置。",
+      "comment": "**背景**：H200 量化测试使用 parallelism:8/3 + shard 参数，对 h200_35gb 队列造成 fan-out 压力。\n**方法**：移除 H200 Quantization test 和 Quantized Models Test 的并行度和 shard 参数；测试仍完整运行，但每步作为单个 job 而非分片并行 job。\n**效果**：降低 h200_35gb 队列 fan-out 压力。",
       "sig": "sig-ci",
-      "sig_reason": "仅 Buildkite 测试编排调整。",
-      "tags": ["ci", "low-risk"]
+      "sig_reason": "Buildkite 测试编排调整。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 49693
     },
     {
       "sha": "dd72658e7db0c6a674f473f6f9f0f5c2ebe7e523",
-      "comment": "GLM-5.2 Blackwell decode 大规模性能优化：新增 bf16 skinny GEMM、dsv3 fused A GEMM 等 libtorch_stable CUDA kernel 及量化 kernel（29 文件 +2139 行）。属 SIG Model Performance 的 GLM-5.2 sprint 产物。注意：该 commit 已于次日（07-25, 213f681f）被 revert，说明存在问题，跟进后续重新合入。",
+      "comment": "**背景**：GLM-5.2 Blackwell decode 性能优化需要大量 CUDA kernel（bf16 skinny GEMM、dsv3 fused A GEMM、量化 kernel等），此前 squash merge 被 #49768 revert。\n**方法**：重新合入大规模 kernel 优化（29 文件 +2139/-138），覆盖 CMakeLists、csrc/libtorch_stable 等。PR 已转为跟踪页，将工作拆分为 4 个后续 PR：SM100 sparse-model 集成、小 batch decode GEMM、CuTeDSL fused-query kernel、MTP/spec-decode 优化。\n**效果**：注意该 commit 次日被 revert，需跟踪后续拆分 PR 的重新合入。",
       "sig": "sig-model-performance",
       "sig_reason": "GLM-5.2 模型 sprint 的 Blackwell decode kernel 优化。",
-      "tags": ["performance", "high-risk", "kernel", "cuda"]
+      "tags": ["performance", "high-risk", "kernel", "cuda"],
+      "pr_number": 48597
     },
     {
       "sha": "0d77325b10f932b7912f186ba8f3aec632acb034",
-      "comment": "（自动判定）升级 Transformers 至 5.14.1，仅改 requirements 锁定文件。",
+      "comment": "**背景**：Transformers 版本需要升级以跟进上游变更。\n**方法**：在 CPU/CUDA/ROCm/nightly-torch 等 8 个 requirements 文件中升级 Transformers 至 5.14.1。\n**效果**：零修复直接通过（No fixes needed, it just worked）。",
       "sig": "sig-ci",
       "sig_reason": "依赖版本升级。",
-      "tags": ["chore", "low-risk", "deps"]
+      "tags": ["chore", "low-risk", "deps"],
+      "pr_number": 49223
     },
     {
       "sha": "2ac125123a8d312823cf4ef56ca165f04f579dd1",
-      "comment": "IR 测试改用显式 device 指定，并微调 vllm/ir/ops 以配合；目的是消除 CI 上 device 隐式选择造成的不稳定。",
+      "comment": "**背景**：IR RMSNorm/LayerNorm 测试依赖 class-level 默认 device 状态，function-scoped fixture 重置后后续参数化 case 的生成输入留在 CPU，而算子编译为 ROCm——导致 vLLM IR Tests 失败。\n**方法**：IR input generator 接受 device 参数，每个受影响的加速器测试显式传入 device。\n**效果**：修复 vLLM IR Tests 测试组（Buildkite AMD-CI #11147）。",
       "sig": "sig-ci",
-      "sig_reason": "主要意图为 IR 测试稳定性治理。",
-      "tags": ["test", "low-risk", "ci"]
+      "sig_reason": "IR 测试稳定性治理。",
+      "tags": ["test", "low-risk", "ci"],
+      "pr_number": 49513
     },
     {
       "sha": "7bdf8cc37cddf14d7da746ad18274155dd0a6b1c",
-      "comment": "修复 humming 模型在 layer.has_bias 为 None 时的 kernel 崩溃：1 行防御性判断，把 None 当作无 bias 处理。",
+      "comment": "**背景**：`LinearBase.__init__` 设 `self.has_bias = bias`，自定义模型层（如 Hy3-NVFP4-FP8）传 `bias=None`，None 传播到 `HummingLayerMeta`。`to_cpp_str()` 跳过 `isinstance` 检查失败的字段（None 不是 bool/int/Enum），`kHasBias` 被省略，NVRTC 报 `class LayerConfig has no member kHasBias`。\n**方法**：1 行修复——将 None 当作无 bias 处理。\n**效果**：`RedHatAI/Hy3-NVFP4-FP8` 正常运行。",
       "sig": "sig-core",
-      "sig_reason": "模型实现（model_executor/models）的空值防御修复。",
-      "tags": ["bugfix", "low-risk", "model"]
+      "sig_reason": "模型实现的空值防御修复。",
+      "tags": ["bugfix", "low-risk", "model"],
+      "pr_number": 48769
     },
     {
       "sha": "bf27e34ebb5d2542b96647cffe42c3e8f9d83f16",
-      "comment": "为 DeepSeek4 启用 CompressedTensors（CT）量化支持：在 deepseek_v4 模型侧接入 CT 量化配置。改动很小（+4），主要是打通已有量化路径。",
+      "comment": "**背景**：DeepSeek-V4-Flash 模型使用 NVFP4+FP8 混合量化，需要在 vLLM 模型侧打通 CompressedTensors 量化路径。\n**方法**：在 `deepseek_v4` 模型侧接入 CT 量化配置（+4 行），主要是打通已有量化路径。\n**效果**：8×B200 上 `RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8` TP=4 达 3258 tok/s 生成吞吐，GSM8K 精度 91.0（vs 原始 92.6）。",
       "sig": "sig-quantization",
       "sig_reason": "模型侧启用 CompressedTensors 量化。",
-      "tags": ["feature", "low-risk", "quantization"]
+      "tags": ["feature", "low-risk", "quantization"],
+      "pr_number": 41276
     },
     {
       "sha": "275556c35cb4ea12ee362a38e222f66f711a8060",
-      "comment": "修复 packed KV cache spec 的混合精度检测（kv_cache_interface）：当不同层的 KV cache 精度不一致（如部分层量化 KV）被 pack 在一起时正确识别，避免错误共享布局。对量化 KV cache 与混合注意力布局组合重要。",
+      "comment": "**背景**：worker 侧 `KVCacheConfig.has_mixed_precision_kv_cache` 只查顶层 `AttentionSpec` 对象，但 `generate_scheduler_kv_cache_config` 会解包 `UniformTypeKVCacheSpecs` 中的 packed spec。scheduler 标记需清零但 worker 未创建 zeroer，首个请求因 KV cache 未清零而失败。\n**方法**：检查 packed spec 内部的 attention spec 是否含混合精度；新增回归测试验证 worker 和 scheduler 配置一致。\n**效果**：DeepSeek-V4-Flash-DSpark FP8 KV cache + TP=2 + DSpark 首个请求正常返回，`_zero_kv_blocks_kernel` 成功运行；71 项 KV-cache 工具测试通过。",
       "sig": "sig-quantization",
       "sig_reason": "量化 KV cache 混合精度场景的正确性修复。",
-      "tags": ["bugfix", "medium-risk", "kv-cache", "quantization"]
+      "tags": ["bugfix", "medium-risk", "kv-cache", "quantization"],
+      "pr_number": 49623
     },
     {
       "sha": "d65acd83d87b1ad8d13eaa9452510488de642543",
-      "comment": "支持 llm-compressor 产出的 Inkling NVFP4 权重加载：inkling 模型侧适配 NVFP4 checkpoint 格式并补充模型测试。延续量化生态（llm-compressor）协同路线。",
+      "comment": "**背景**：llm-compressor 产出的 Inkling NVFP4 权重使用嵌套 expert 命名和 per-expert global scale 布局，需适配到 vLLM 的 fused-MoE 参数名和 w13/w2 布局。\n**方法**：规范化嵌套 expert 名到 fused-MoE 参数名（保留扁平名兼容）；加载 compressed-tensors per-expert global scale 到 w13/w2 布局。非 #48876 的重复——基于已落地的通用 CT 基础设施构建。\n**效果**：31 项权重布局测试通过；原始 ModelOpt checkpoint TP=4 GSM8K 5-shot 精度 0.895。",
       "sig": "sig-quantization",
       "sig_reason": "NVFP4 量化权重格式支持。",
-      "tags": ["feature", "low-risk", "quantization", "nvfp4"]
+      "tags": ["feature", "low-risk", "quantization", "nvfp4"],
+      "pr_number": 49258
     },
     {
       "sha": "80c9d5d5e0448ddee3097a687fcbdbb427a8e9ee",
-      "comment": "（自动判定）为 ROCm Quark W4A8（INT4-FP8）MoE 增加 CI 测试覆盖，仅测试文件。",
+      "comment": "**背景**：Quark W4A8（INT4 权重 + FP8 激活）fused-MoE 路径通过 ROCm AITER fused MoE kernel 在 gfx942/gfx950 上调度，但缺少 CI 覆盖。\n**方法**：新增 `test_quark_w4a8_fp8_moe`——加载 `amd/tiny-qwen3-moe-w4a8` 参考模型，断言路由 expert 使用 `QuarkW4A8Fp8MoEMethod` 并运行生成；gated on gfx950 + AITER。\n**效果**：MI355 端到端验证通过——加载 W4A8 模型、通过 AITER W4A8 fused MoE kernel 调度并生成。",
       "sig": "sig-ci",
-      "sig_reason": "仅新增量化测试覆盖。",
-      "tags": ["test", "low-risk", "rocm"]
+      "sig_reason": "新增量化测试覆盖。",
+      "tags": ["test", "low-risk", "rocm"],
+      "pr_number": 48050
     },
     {
       "sha": "da54a5bf053fbb2fc73aec0955d2d9bf76b01b1c",
-      "comment": "（自动判定）修复 serving/pooling/MoE 文档中的失效锚点链接。",
+      "comment": "**背景**：4 处文档内锚点指向渲染站点上不存在的 fragment，链接落在目标页面顶部而非预期章节。\n**方法**：`scoring.md#rerank-api`→`#cohere-rerank-api`、`moe_kernel_features.md#fused-moe-experts-kernels`→`#fused-experts-kernels`、`openai_compatible_server.md#chat-template`→同页 `#chat-template`、`generative_scoring.md#generative-scoring-api`→链接到页面。\n**效果**：markdownlint 0 error，4 个替换锚点在已发布页面上均存在。",
       "sig": "other",
       "sig_reason": "纯文档修复。",
-      "tags": ["docs", "low-risk"]
+      "tags": ["docs", "low-risk"],
+      "pr_number": 49654
     },
     {
       "sha": "1479bd9e9d3e7e06a4167980d4d4662eeda0638c",
-      "comment": "（自动判定）AMD mirror regating 准备：大规模调整 .buildkite 测试区域配置与硬件 CI 脚本（23 文件），为 MI3xx 进入 gating 铺路，对应 SIG CI 路线图中的 AMD gating 目标。",
+      "comment": "**背景**：AMD CI mirror 需要从 MI325 迁移到 MI300/MI250 以准备 regating。\n**方法**：23 文件大规模调整——MI325→MI300/MI250 重路由、MI300 禁用 DinD、基于观测运行时间更新超时、CPU-only 工作负载移至 MI250、修复 ROCm 测试命令使用 `HIP_VISIBLE_DEVICES`、更新 pytest/faulthandler 超时、移除 flaky AMD compile-passes mirror。\n**效果**：为 MI3xx 进入 gating 铺路。",
       "sig": "sig-ci",
       "sig_reason": "Buildkite AMD 流水线改造。",
-      "tags": ["ci", "low-risk", "rocm"]
+      "tags": ["ci", "low-risk", "rocm"],
+      "pr_number": 49270
     },
     {
       "sha": "0231dd5467c61dca76f66269b6298a43772b3519",
-      "comment": "（自动判定）在 XPU 上跳过 marlin 后端的 gpt-oss LoRA 测试，规避平台不支持导致的失败。",
+      "comment": "**背景**：`test_gpt_oss_lora_tp2` 和 `test_gpt_oss_lora` 在 XPU 上显式请求 `moe_backend=marlin` 和 `linear_backend=marlin`，但 Marlin MXFP4 kernel 仅 CUDA 支持、未为 XPU 注册，显式请求直接失败而非回退。\n**方法**：添加与 ROCm 等价的 XPU skipif 条件。\n**效果**：XPU 上跳过 marlin 后端 gpt-oss LoRA 测试，不再因不支持而失败。",
       "sig": "sig-ci",
-      "sig_reason": "仅测试跳过调整。",
-      "tags": ["test", "low-risk", "xpu"]
+      "sig_reason": "测试跳过调整。",
+      "tags": ["test", "low-risk", "xpu"],
+      "pr_number": 49385
     },
     {
       "sha": "26594674975cf68b4b33b329b9a9ad2d508bb243",
-      "comment": "（自动判定）为 hybrid SSM 模型增加 P_TP>D_TP 场景的 PD 精度 sweep 测试入口，加强 disagg 异构 TP 的精度看护。",
+      "comment": "**背景**：hybrid SSM 模型在 P_TP>D_TP（prefill TP > decode TP）异构 TP 场景下缺少 PD 精度 CI 覆盖。\n**方法**：在 kv_connector 测试中新增 hybrid SSM P_TP>D_TP 精度 sweep 入口。\n**效果**：加强 disagg 异构 TP 的精度看护。",
       "sig": "sig-ci",
-      "sig_reason": "仅新增 kv_connector 精度测试条目。",
-      "tags": ["test", "low-risk", "disagg"]
+      "sig_reason": "新增 kv_connector 精度测试条目。",
+      "tags": ["test", "low-risk", "disagg"],
+      "pr_number": 49593
     }
   ]
 }

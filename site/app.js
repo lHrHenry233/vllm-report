@@ -468,6 +468,9 @@
     html += `<div class="commit-header">`;
     html += `<span class="expand-arrow">\u25B6</span>`;
     html += `<a class="commit-sha" href="https://github.com/${REPO}/commit/${commit.sha}" target="_blank">${shaShort}</a>`;
+    if (hasAnalysis && a.pr_number) {
+      html += `<a class="pr-link" href="https://github.com/${REPO}/pull/${a.pr_number}" target="_blank">#${a.pr_number}</a>`;
+    }
     html += `<div class="commit-message">`;
     html += `<div class="commit-title">${highlightText(title, searchQuery)}</div>`;
     if (body) html += `<div class="commit-body">${escapeHtml(body)}</div>`;
