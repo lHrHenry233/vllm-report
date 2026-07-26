@@ -3,6 +3,10 @@
 vLLM daily commit monitor with AI analysis, categorized by **vLLM SIG**
 (Special Interest Group).
 
+> **Attribution:** Based on [vllm-ascend/vllm-report](https://github.com/vllm-ascend/vllm-report).
+> This version adds a local AI-driven SIG analysis workflow (Qoder skill),
+> hybrid cloud-local automation, and independently generated analysis data.
+
 SIG taxonomy follows the latest community roadmap
 ([\[Roadmap\] vLLM Roadmap Q3 2026 #48168](https://github.com/vllm-project/vllm/issues/48168)),
 where vLLM's goals are broken down into SIGs (#32455):
