@@ -1,0 +1,208 @@
+{
+  "date": "2026-06-06",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-08T20:45:52.374876+08:00",
+  "daily_summary": "当日变更主要集中在四个方向：(1) Qwen3.5 模型 GDN attention 的混合 prefill+decode 批次的性能优化——将 decode token 剥离到循环更新内核，仅 prefill tail 走 chunk 内核；(2) 编译管道的若干 bugfix——RMSNorm+quant 融合中 fused_add_rms_norm 的 dtype 检查补全、clone elimination 保留改变 layout 的 clone、sequence_parallel_chunk_impl 透传输入别名的修复、mHC fused-RMSNorm big-fuse 针对非 4096 hidden_size 的 miscompile 修复；(3) ROCm 平台两个特性——RotaryEmb 在 HIP grid 超限时回退到 native 实现、RoPE + 静态 Q FP8 量化融合；(4) 三个跨模块改进——VLLM_RAY_DP_PLACEMENT_NODE_IPS 允许指定 DataParallel 放置节点、Pooler 层将 assert 替换为 ValueError/RuntimeError 提升 UX、Cohere MoE RoutingMethodType 增加 Sigmoid 路由支持、Voxtral 音频处理器 fetch_audio 兼容 transformers 5.10、MoE FusedMoEConfig 快照 max_cudagraph_capture_size、GPT-OSS Harmony 指令渲染修复。",
+  "sig_summaries": {
+    "sig-core": "SIG Core 方向当日共 6 条变更。",
+    "sig-model-performance": "SIG Model Performance 方向当日共 5 条变更。",
+    "sig-quantization": "SIG Quantization 方向当日共 2 条变更。",
+    "sig-ci": "SIG CI 方向当日共 2 条变更。",
+    "sig-omni": "vLLM-Omni 方向当日共 1 条变更。",
+    "other": "Other 方向当日共 1 条变更。"
+  },
+  "commits": [
+    {
+      "sha": "fa27d4e9cf3c8d8a5a143f38c346b27c02b2c2e3",
+      "comment": "对 Qwen3.5 的 GatedDeltaNet (GDN) attention 层的 `_forward_core` 进行性能优化。在非投机解码的混合批次中（prefill + 1-token decode 并存），将 decode token（连续的前端切片）剥离出来走 `fused_sigmoid_gating_delta_rule_update` 循环更新内核，仅 prefill tail 走 `chunk_gated_delta_rule` chunk 内核。核心变更：GDNAttentionMetadata (gdn_attn.py) 新增 prefill_query_start_loc/prefill_state_indices/prefill_has_initial_state 三个字段，metadata builder 在混合批次中会 rebase chunk_indices/chunk_offsets 到 prefill-only 子集；_forward_core (qwen_gdn_linear_attn.py) 新增 split_non_spec 条件，先执行 decode 段循环更新，再拼接结果。同时将 fast_kernel→use_aiter 参数重命名以澄清语义。新增 296 行集成测试验证 split 路径与 unified 路径输出一致。风险：低风险——split 路径只是计算次序重组，测试覆盖了多种序列长度和状态 dtype 组合。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention",
+        "model-runner"
+      ]
+    },
+    {
+      "sha": "67d3792d99f345015a8bd01a3703be1469b60d7d",
+      "comment": "修复 Qwen3.5-FP8 夜间测试失败。在 `rms_quant_fusion.py` 的 `_rms_input_weight_dtype_match` dtype 检查函数中增加了对 `fused_add_rms_norm`（`torch.ops.vllm_ir.fused_add_rms_norm.default`）的分支处理。原本该函数只检查 `rms_norm` 的 input 和 weight dtype 是否匹配，忽略 `fused_add_rms_norm` 节点。当 FP8 量化模型同时使用 `fused_add_rms_norm`（残差+归一化融合）时，dtype 不匹配会导致 RMSNorm+quant 融合生产错误的 kernel。该修复确保两种 RMSNorm 变体都被检查，防止融合生成不正确的算子。风险：低——增加的是 guard 而非移除 guard，仅阻止不应发生的融合。",
+      "sig": "sig-quantization",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation"
+      ]
+    },
+    {
+      "sha": "00d1fb77475567aef7d019881612e7ad564bb132",
+      "comment": "修复 ROCm 平台上 ApplyRotaryEmb 在 vision encoder 处理大量图像 patch 时因 HIP grid 维度限制（65535）导致 Triton kernel 启动失败的问题。flash_attn 的 rotary triton kernel 使用 grid = (cdiv(nheads, BLOCK_H), cdiv(seq_len, BLOCK_M), batch) 布局，当 profile_run 同时处理大量图像时 seq_len/BLOCK_M 会超过 65535 限制。修复方式是在调用 flash_attn rotary 前预计算 grid_y 和 batch 值，如果超限则回退到 native PyTorch forward_static 实现。风险：低——超限条件硬编码 65535（HIP 规范值），回退路径是已存在的 native 实现。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rotary_embedding",
+        "rocm"
+      ]
+    },
+    {
+      "sha": "c9b4b184b408ca1ad779828cd1394c6c5217ded2",
+      "comment": "为 Mistral Voxtral 模型添加 fetch_audio 方法以兼容 transformers>=5.10。transformers 5.10 在 ProcessorMixin 中新增了 prepare_inputs_layout 方法，该方法会无条件调用 self.feature_extractor.fetch_audio()。MistralCommonFeatureExtractor 是 duck-typed 的 feature extractor（非继承 transformers 的 SequenceFeatureExtractor），缺少该方法导致 AttributeError。新增的 fetch_audio 遵循与 transformers.SequenceFeatureExtractor.fetch_audio 相同的契约：支持的输入类型包括 np.ndarray、torch.Tensor、list[float]、str URL/path 和嵌套列表。新增 127 行单元测试全面覆盖各种输入类型。风险：低——纯新增方法，不修改现有行为。",
+      "sig": "sig-omni",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "tokenizer",
+        "compatibility"
+      ]
+    },
+    {
+      "sha": "f87df1df9e93042fcfbd939d5fab0b7b0f47abc8",
+      "comment": "将 max_cudagraph_capture_size 快照到 FusedMoEConfig 中，消除多个 MoE 实现中通过 get_current_vllm_config() 动态获取该值的运行时开销。FusedMoEConfig 新增 max_capture_size: int = 0 字段，在 FusedMoE.__init__ 中从 compilation_config.max_cudagraph_capture_size 赋值。FlashInferExperts、TrtLlmMxfp4ExpertsBase、GptOssMxfp4MoEMethod、Mxfp4MoEMethod 四个类中的重复代码被替换为直接引用 moe_config.max_capture_size。这消除了 import get_current_vllm_config 的依赖，减少了模块耦合。风险：低——纯重构，行为不变。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "moe",
+        "compilation"
+      ]
+    },
+    {
+      "sha": "eafbb06331caf580023b8da6871063499a37b403",
+      "comment": "将 pooler 层的各种 assert 替换为合适的异常类型（ValueError 和 RuntimeError），并提供更友好的错误消息。涉及 7 个文件：PoolerConfig 的 get_seq_pooling_type/get_tok_pooling_type、CLSPool/MeanPool 的 partial prefill 检查、EmbeddingPoolerHead/ClassifierPoolerHead/TokenPoolerHead 的 length 匹配检查、pooler_for_classify/pooler_for_token_classify 的 pooler_config 空值检查。AssertionError 在 Python 中默认不显示可读的错误消息（assert 表达式被优化掉时更是如此），改用 ValueError/RuntimeError 确保用户始终获得明确的错误指示。风险：低——纯 UX 改进，语义等价。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "pooler"
+      ]
+    },
+    {
+      "sha": "ec0a31d4aa019567395d9e7cce67d1e6ac56974a",
+      "comment": "修复 mHC (multi-head coalescing) fused-RMSNorm big-fuse 在 hidden_size != 4096 时的 miscompile 问题。变更仅一行：Tilelang kernel 的 `T.Pipelined` 的 `num_stages` 从 3 改为 2。当 hidden_size 不是 4096 时，hidden_size // hidden_block 的循环量可能小于 3，导致 pipeline 阶段数过多引发 miscompile。将 num_stages 固定为 2 确保在所有 hidden_size 上都能正确编译。风险：低——单行数值调整，由原作者验证。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernel",
+        "compilation"
+      ]
+    },
+    {
+      "sha": "c8beda4cc38b1b34c172dc149b31b4e39dc2b569",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ]
+    },
+    {
+      "sha": "2f27c9a1500accc4faf7217f2af254a981df084e",
+      "comment": "修复 UnsafeCloneEliminationPass 误删改变 tensor layout 的 clone 操作。当 clone 产生 compact slice（如 x[:, :3].contiguous()）时，clone 前后的 stride/storage_offset 不同，删除 clone 会导致后续使用获取到非 compact 视图，影响数据布局。新增 clone_preserves_layout() 函数比较 clone 前后的 stride() 和 storage_offset()，仅当 layout 完全一致时才允许删除 clone。风险：低——clone 保留是保守行为，不会导致错误；缺少的是优化机会而不是正确性问题。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation"
+      ]
+    },
+    {
+      "sha": "4765f0f189fd0cd032a79da37ba427c3ba60ec33",
+      "comment": "修复 sequence_parallel_chunk_impl 自定义 op 在 no-pad 情况下返回输入视图（view）而非副本的问题。torch.narrow() 返回的是视图，当输入没有 padding 时（y is x），返回的视图会与输入 alias，违反 functional custom op 的契约——custom op 不得返回输入的视图。修复方式：当 y is x（无 padding）时对 narrow 结果做 clone()，否则直接返回视图。风险：低——clone 仅在不安全时进行，不影响有 padding 的路径。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "distributed",
+        "compilation"
+      ]
+    },
+    {
+      "sha": "a50e675b0d864660b10bfdc40f3b0224695d0a92",
+      "comment": "修复 Cohere MoE 的 RoutingMethodType 未区分 Sigmoid 和 SigmoidRenorm 两种路由模式的问题。Cohere MoE 使用 sigmoid→top-k 路由，可选择是否 renormalize。原代码对所有情况都返回 SigmoidRenorm，但 Cohere 也支持非 renormalize 的 Sigmoid 模式。变更：CustomRoutingRouter 在检测到 token_choice_with_bias 路由函数时，根据 self.renormalize 标志返回 SigmoidRenorm 或 Sigmoid；TrtLlmBf16Experts 和 TrtLlmNvFp4ExpertsMonolithic 的支持列表中增加 Sigmoid 类型。风险：低——修复了 enum 分类的不完整性。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "moe",
+        "router"
+      ]
+    },
+    {
+      "sha": "f6a708ab2bfd1278d4ca54ed150295efb3f16ed5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "other",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ]
+    },
+    {
+      "sha": "4200f621472925f8039191b9ff3b72951134cdf5",
+      "comment": "为 ROCm 平台实现 RoPE + 静态 Q FP8 量化融合到 fused_rope_and_unified_kv_cache_update op 中。在 RopeKVCacheFusionPass 中新增 RopeStaticQQuantKVCachePattern 类，匹配 rope → static_scaled_fp8_quant(scale=static) → unified_kv_cache_update 的算子序列，融合为 fused_rope_and_unified_kv_cache_update + static_scaled_fp8_quant 序列。融合后 RoPE 输出直接进入 KV cache 更新，Q 的 FP8 量化在 RoPE 之后（而非之前）执行。新增的测试覆盖了多种参数组合（is_neox、enable_aiter_triton_rope、kv_cache_dtype）并包含负向控制验证。风险：中——涉及编译 graph pattern 匹配，需确保数值精度达标（测试允许 1e-2 公差）。",
+      "sig": "sig-quantization",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "compilation",
+        "rocm",
+        "quantization"
+      ]
+    },
+    {
+      "sha": "c73b0d0db97b90e32b7c8dc2a92756eaf0ec237c",
+      "comment": "新增 VLLM_RAY_DP_PLACEMENT_NODE_IPS 环境变量，允许用户指定 Ray DataParallel placement groups 可放置的节点 IP 列表。在 CoreEngineActorManager.create_dp_placement_groups 中增加节点过滤逻辑：读取环境变量中的逗号分隔 IP 列表，与 DP master IP 合并后过滤可用节点，仅从被允许的节点上创建 placement groups。新增了 5 个单元测试覆盖：正常过滤、空列表（无操作）、master 自动添加、多引擎隔离、节点不足时的错误。同时将 _node_ip_from_resources 抽取为独立函数，替换原有的内联 node IP 提取逻辑。风险：低——纯新增功能，不影响现有行为（环境变量默认空）。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "distributed",
+        "engine"
+      ]
+    },
+    {
+      "sha": "e28e369f78c3453c031ad89dd089f966a63e9f2b",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "sig-ci",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "chore"
+      ]
+    },
+    {
+      "sha": "703fb17b132f784c397493bfe69bce58ec58a0a7",
+      "comment": "修复 GPT-OSS Harmony 渲染的指令（system/developer message）处理逻辑。核心变更：(1) 新增 build_harmony_preamble()、extract_instructions_from_messages()、flatten_input_text_content() 工具函数，取代之前的分散逻辑；(2) 系统消息统一转换为 developer 角色（使用 DeveloperContent 格式），而不是保留 system 角色，通过 VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS 环境变量可回退到旧行为；(3) Chat Completion 和 Responses API 入口统一使用新 preamble builder；(4) developer 消息的内容不再用 \"Instructions:\\n\" 文本前缀，而是使用 DeveloperContent.instructions 字段。受影响 9 个文件包括 serving_chat 测试、harmony_utils、harmony.py、responses/serving.py、render/serving.py 等。风险：中——涉及 Harmony 消息格式的语义变化（system→developer 角色转换、DeveloperContent 替代 text prefix），可能影响下游渲染输出格式。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "entrypoints",
+        "renderer"
+      ]
+    },
+    {
+      "sha": "b593396c7a70ddf31ddbbfaac2007e6c5f4650bd",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "sig-ci",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "chore"
+      ]
+    }
+  ]
+}

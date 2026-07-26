@@ -1,0 +1,118 @@
+{
+  "date": "2026-07-05",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-06T03:13:43.448393+08:00",
+  "daily_summary": "当日变更主要集中在多模态推理的Prefix-LM双向注意力支持、Voxtral Realtime模型的token反馈超时修复、Mamba/Mamba2模型加载崩溃修复、序列并行与专家并行解耦优化、TurboQuant的KV cache dtype修复、Jina Reranker V3的指令转发支持以及Run:ai内存限制哨兵值修复。这些变更涉及模型配置、注意力后端、模型执行器、分布式通信、模型加载等多个核心模块。",
+  "sig_summaries": {
+    "sig-core": "SIG Core 方向当日共 6 条变更。",
+    "sig-quantization": "SIG Quantization 方向当日共 1 条变更。",
+    "sig-model-performance": "SIG Model Performance 方向当日共 1 条变更。",
+    "sig-ci": "SIG CI 方向当日共 1 条变更。"
+  },
+  "commits": [
+    {
+      "sha": "cc1d020d01949d11b7ef70dabb0eb196b3f39f53",
+      "comment": "该commit为MRV2（多模态推理V2）启用mm prefix双向注意力支持。核心变更包括：1) 在`vllm/v1/worker/gpu/attn_utils.py`中新增`compute_mm_prefix_ranges`函数，用于计算多模态token的PrefixLM双向注意力范围，并支持滑动窗口过滤；2) 修改`build_attn_metadata`函数，新增`mm_req_doc_ranges`参数，将多模态前缀范围传递给注意力元数据构建器；3) 在`vllm/v1/worker/gpu/model_states/default.py`的`prepare_attn`方法中，当模型支持多模态输入且为mm_prefix_lm时，调用`compute_mm_prefix_ranges`计算范围并传递给`build_attn_metadata`；4) 将`vllm/config/model.py`中的`is_mm_prefix_lm`属性从`@property`改为`@cached_property`，避免重复计算；5) 新增测试文件`tests/models/multimodal/generation/test_mm_prefix_lm.py`，验证Gemma3的prefix-LM mask正确性。实现方式是通过在注意力元数据构建时传入多模态token的文档范围，使注意力后端能够为这些token应用双向注意力mask。潜在风险：新增的`mm_req_doc_ranges`参数需要所有注意力后端的元数据构建器支持，否则可能导致兼容性问题。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "model-runner",
+        "multimodal"
+      ]
+    },
+    {
+      "sha": "8974ed89cd0b17615ae48cf09ef824cd8e3ec521",
+      "comment": "该commit修复Voxtral Realtime模型中的token反馈超时静默挂起问题。变更内容：移除`feed_tokens`协程中的`asyncio.wait_for`超时包装，直接使用`input_stream.get()`等待。原因是空闲等待是正常行为，请求清理通过finally块取消任务，不需要超时机制。同时移除对`VLLM_ENGINE_ITERATION_TIMEOUT_S`环境变量的导入。这是一个低风险的bug修复，仅影响Voxtral Realtime模型的特定实现。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model"
+      ]
+    },
+    {
+      "sha": "fb2faceacd7af2ea6aa51eed90f295c421c00ec5",
+      "comment": "该commit修复加载Mamba/Mamba2检查点时因缺少`architectures`字段导致的崩溃问题。变更内容：在`vllm/config/vllm.py`的`try_verify_and_update_config`方法中，当`MODELS_CONFIG_MAP`中找不到架构时，通过`ModelRegistry._normalize_arch`将HF基础模型名称（如\"Mamba2Model\"）标准化为已解析的架构名称，然后再次查找配置类。这确保了即使检查点省略了`architectures`字段，per-arch配置钩子也能正确应用。这是一个低风险的bug修复，仅影响Mamba/Mamba2模型的加载流程。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "config"
+      ]
+    },
+    {
+      "sha": "b6cc46ec3b903c71405f4355c1e9ecb47ae54bb2",
+      "comment": "该commit支持无需数据并行（DP）的序列并行，实现1.9%~5.0%的端到端吞吐量提升。核心变更包括：1) 在`vllm/config/parallel.py`中移除`use_sequence_parallel_moe`对`data_parallel_size > 1`的依赖，使序列并行可以在无DP时独立启用；2) 在`vllm/distributed/device_communicators/base_device_communicator.py`中，all2all管理器的初始化条件扩展为包含`use_sequence_parallel_moe`，确保序列并行EP时也初始化all2all通信；3) 在`vllm/forward_context.py`中，DPMetadata的创建逻辑扩展为支持序列并行场景，当无DP时直接使用本地token数量；4) 在`vllm/model_executor/layers/fused_moe/config.py`和`runner/moe_runner.py`中，all2all kernel和naive dispatch/combine的条件扩展为包含序列并行；5) 在`vllm/model_executor/models/deepseek_v2.py`中优化了序列并行的padding逻辑，使用更简洁的`(-hidden_states.shape[0]) % tp_world_size`计算padding大小；6) 在`vllm/model_executor/models/gpt_oss.py`中，当使用LoRA时禁用序列并行。这是一个性能优化变更，涉及分布式通信、MoE层和模型执行等多个模块。潜在风险：序列并行与LoRA的兼容性需要额外关注。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "distributed",
+        "moe",
+        "model-runner"
+      ]
+    },
+    {
+      "sha": "fa4321de3d894c50c5ca0766dffa352d3fb07423",
+      "comment": "该commit修复TurboQuant注意力后端中KV cache dtype丢失的问题。变更内容：在`vllm/v1/worker/gpu/attn_utils.py`的`_reshape_kv_cache`和`_update_hybrid_attention_layout`函数中，当KV cache spec是`TQFullAttentionSpec`类型时，即使`kv_quant_mode`为`NONE`，也强制使用`cache_dtype`而非`\"auto\"`。这是因为TurboQuant后端需要明确的dtype信息来正确计算KV cache形状。这是一个低风险的bug修复，仅影响TurboQuant注意力后端。",
+      "sig": "sig-quantization",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "quantization"
+      ]
+    },
+    {
+      "sha": "922661304357313700340e787cfe19d58b8c0a2f",
+      "comment": "该commit为Jina Reranker V3模型添加指令（instruction）转发支持，使评分和重排序请求可以包含任务指令。核心变更包括：1) 在`vllm/entrypoints/pooling/scoring/io_processor.py`的`JinaRankingIOProcessorMixin`中，重构`sanitize_input`为局部函数，并在`format_docs_prompts_func`中支持`instruction`参数，将指令插入到prompt模板中；2) 在`_pre_process`方法中，从`prompt_extras`的`chat_template_kwargs`中提取`instruction`并传递给`format_docs_prompts_func`；3) 新增示例文件`examples/pooling/token_embed/jina_reranker_v3_online.py`；4) 更新测试文件`tests/models/language/pooling/test_jina_reranker_v3.py`，添加指令测试用例。这是一个功能增强变更，仅影响Jina Reranker V3模型的评分/重排序入口。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "entrypoints",
+        "pooling"
+      ]
+    },
+    {
+      "sha": "34b560b725b401f33477464163244b4744d1c40f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "sig-model-performance",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ]
+    },
+    {
+      "sha": "91b56473005ccc9a0d009619b5494a9c306380ee",
+      "comment": "该commit修复Run:ai模型加载器中内存限制（memory_limit）哨兵值的问题。变更内容：在`vllm/model_executor/model_loader/runai_streamer_loader.py`中，将`memory_limit`的验证逻辑从统一的正整数验证改为独立验证，允许`memory_limit`为`-1`（表示无限制）。同时更新错误消息和测试用例。这是一个低风险的bug修复，仅影响Run:ai模型加载器。",
+      "sig": "sig-core",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-loader"
+      ]
+    },
+    {
+      "sha": "4a6bf3c77f05b398b46fe4207ea1ee715d56c64f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "sig": "sig-ci",
+      "sig_reason": "（启发式迁移）按变更文件路径归类，可用 analyze_commits.py --force 重新分析。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ]
+    }
+  ]
+}
