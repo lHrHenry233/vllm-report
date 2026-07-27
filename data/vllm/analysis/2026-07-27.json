@@ -1,0 +1,77 @@
+{
+  "date": "2026-07-27",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-27T20:00:00+08:00",
+  "daily_summary": "当日 8 条变更，KV transfer 与分布式通信为重点。MoRIIO 实现异构 TP<->DP prefill/decode 读路由（MI300X 上异构并行 PD 吞吐/TTFT 优于同构），KV offload 持久化缓存修复 auto dtype 命名空间冲突（FP16/BF16 互读静默错误输出）。核心侧三项修复：MRV2 dummy 请求 token 数超 max_model_len 导致 FA3 OOB（解锁 #49364 piecewise cudagraph 重落地）、XPU sparse-MLA kernel NaN poisoning（全 mask chunk 用 -inf 导致 rescale NaN 永久污染）、CuMem wake 前 gc+empty_cache 防止瞬态内存致 OOM。MRV2 新增 encoder-only attention 为 BERT/RoBERTa pooling 铺路。FlashInfer 通信器增加 process-checkpoint 生命周期钩子。macOS wheel 构建修复 tag 刷新。",
+  "sig_summaries": {
+    "sig-core": "MRV2 三项修复：dummy 请求 token 均匀分配，此前最后一个 dummy 请求 token 数可达 `num_tokens - num_reqs + 1` 远超 `max_model_len`，FA3 paged mainlab 越界读垃圾页 ID（1g.18gb H200 MIG 必崩），修复后解锁 #49364 piecewise cudagraph 重落地；XPU sparse-MLA kernel 修复 NaN poisoning——首 chunk 全 mask 时 `-inf - -inf = NaN` 永久污染 acc，改用有限 sentinel `-1.0e30`；CuMem wake 前 `gc.collect() + empty_cache()` 释放瞬态 CUDA 缓存，防止 weight-update 后 wake remap OOM。MRV2 新增 encoder-only attention 支持（`encoder_only.py` model state），为 BERT/RoBERTa pooling 模型铺路。",
+    "sig-large-scale-serving": "MoRIIO 实现异构 TP<->DP prefill/decode 读路由——此前假设 prefill/decode 共享同一并行布局，本 PR 支持 `P_DP8EP->D_TP8` 和 `P_TP8->D_DP8EP` 两种混合并行配置：读路径从请求实际所属的 prefill DP rank 读取（非硬编码 DP0）、eager pre-forward handshake 防止 TP worker 握手分歧导致 NCCL 超时、mirror 配置支持 TP-replicated prefill + MLA 读。KV offload 持久化缓存修复 auto dtype 命名空间冲突——FP16/BF16 引擎共享 `cache_dtype=auto` 命名空间但 KV 字节不兼容，BF16 可接受 FP16 页并静默返回错误输出，现解析 auto 为实际 dtype 纳入指纹。FlashInfer 通信器增加 process-checkpoint 生命周期钩子——prepare/restore 调用经分布式状态转发到注册的 device communicator，独立转换 all-reduce workspace 和 all-to-all manager。",
+    "sig-ci": "macOS arm64 wheel 构建修复——持久 Mac mini checkout 未刷新 tag refs，`setuptools-scm` 使用陈旧 `v0.23.1rc0` 生成错误版本号，添加 `git fetch --tags --force origin` 修复。"
+  },
+  "commits": [
+    {
+      "sha": "ffc4f08c8ee130d4ea6347c1bf31ffd4f8af28ab",
+      "comment": "**背景**：MoRIIO 此前假设 prefill 和 decode 引擎共享同一并行布局，无法支持异构并行 PD（如 DP+EP prefill + TP decode），限制了 MI300X 上高并发场景的吞吐和 TTFT 优化空间。\n**方法**：三项改动：①读路径从请求实际所属的 prefill DP rank 读取（proxy 转发 `remote_dp_rank`），不再硬编码 DP0；②eager pre-forward handshake——在 `start_load_kv` 中一次性对所有引用的远程 rank 握手，CPU `all_reduce(MIN)` 屏障保证所有 worker 同时完成，防止 TP worker 握手分歧导致 all-gather/NCCL 超时；③mirror 配置 `P_TP8->D_DP8EP` 支持从 TP-replicated prefill + MLA 读。\n**效果**：MI300X (gfx942) 上异构并行 PD 在高并发下吞吐和 TTFT 优于同构；`remote_dp_rank == 0` 的单 DP 场景与原行为字节一致。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "异构并行 PD 的 KV transfer 路由，大规模分布式推理核心。",
+      "tags": ["feature", "high-risk", "kv-transfer", "disaggregated-pd"],
+      "pr_number": 46116
+    },
+    {
+      "sha": "50aa83048219b70a3a68adf2fc8cd860ccc3e238",
+      "comment": "**背景**：`InputBatch.make_dummy` 将 `num_tokens // num_reqs` 分配给每个 dummy 请求，余数全部堆到最后一个请求，使其 `seq_len` 可达 `num_tokens - num_reqs + 1`，远超 `max_model_len`。block table 宽度按 `cdiv(max_model_len, block_size)` 分配，超长请求的 attention kernel 越界读垃圾页 ID——#49364 piecewise cudagraph capture 在 dummy batch 上 eager 运行 attention 时触发 IMA（16GB MIG CI 必崩，大 GPU 静默）。\n**方法**：余数均匀分配——前 `num_tokens % num_reqs` 个请求各多一个 token，每个 dummy 请求最多 `ceil(num_tokens / num_reqs) <= max_model_len`。\n**效果**：dummy batch 构造合法；#49364 可不变更重新落地；CI 环境（1g.18gb H200 MIG）5 项此前崩溃测试全部通过。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 dummy batch 构造正确性修复，解锁 cudagraph capture。",
+      "tags": ["bugfix", "high-risk", "mrv2", "cudagraph"],
+      "pr_number": 49751
+    },
+    {
+      "sha": "f0553889c04ae5bf3df48245302ba5ac19fe3432",
+      "comment": "**背景**：`_bf16_mla_sparse_kernel`（XPU sparse-MLA，DeepSeek-V4 XPU prefill 和 fp8 decode wrapper）在首 `BLOCK_N=16` 个 topk index 全被 mask 时 NaN 污染输出——running max 从 `-inf` 开始，全 mask chunk 将所有 logit 设为 `-inf`，`re_scale = exp2(-inf - -inf) = NaN` 永久污染 `acc` 和 `e_sum`（`nan * 0 = nan`），后续有效 chunk 无法恢复。无有效 key 的行返回 `0/0 = NaN`，但参考实现定义返回零。\n**方法**：将 running-max 初始化和 masked logit 从 `-inf` 改为有限 sentinel `-1.0e30`（与 #47629 新 kernel 一致）。有效 chunk 不受影响（`exp2(-1e30 - m)` 在 fp32 恰为 `0.0`），全 mask 行在有效 chunk 到达后一次性 rescale。\n**效果**：无性能变化，全 mask 行返回零匹配参考语义；新增回归测试覆盖首尾 mask chunk 和全 mask 行。",
+      "sig": "sig-core",
+      "sig_reason": "XPU MLA sparse attention kernel 正确性修复。",
+      "tags": ["bugfix", "medium-risk", "xpu", "attention-kernel"],
+      "pr_number": 48366
+    },
+    {
+      "sha": "fdaa0d9e59238b6884f9515fa3245dea118edc66",
+      "comment": "**背景**：MRV2 缺少 encoder-only attention 支持，无法承载 BERT/RoBERTa 等纯编码器模型的 pooling 推理。\n**方法**：新增 `encoder_only.py` model state，将 encoder-only 相关变更隔离以最小化对非 pooling 代码路径的影响。\n**效果**：为 MRV2 上 BERT/RoBERTa pooling 模型支持铺平道路，非 pooling 路径不受影响。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 架构扩展，encoder-only 模型支持。",
+      "tags": ["feature", "medium-risk", "mrv2", "encoder-only"],
+      "pr_number": 49331
+    },
+    {
+      "sha": "0934b267906f8cd9459f287b31647c3ed5c58e01",
+      "comment": "**背景**：macOS arm64 wheel 构建在持久 Mac mini checkout 上运行，Buildkite 获取了请求的 commit 但未刷新 tag refs，`setuptools-scm` 使用陈旧 `v0.23.1rc0` 标签生成 `0.23.1rc1.dev1290+gf2654939e.cpu`，而实际 commit 已标记 `v0.26.0`。Linux wheel 使用全新 autoscaled checkout 不受影响。\n**方法**：在 `.buildkite/scripts/build-macos-wheel.sh` 开头添加 `git fetch --tags --force origin`，与现有 ROCm release-wheel 路径一致处理移动的 release tag。\n**效果**：macOS wheel 正确生成版本号；nightly 构建不受影响（不要求 HEAD 有精确 tag）。",
+      "sig": "sig-ci",
+      "sig_reason": "macOS wheel 发布管线修复。",
+      "tags": ["ci", "low-risk", "build", "macos"],
+      "pr_number": 49901
+    },
+    {
+      "sha": "9e50e1037e268b4488bbd472bd5dfee4cc08bb75",
+      "comment": "**背景**：weight-update 生命周期在张量转换/拷贝/后处理中创建临时 CUDA 张量，PyTorch caching allocator 保留为 `reserved` 但非 `allocated`。CuMem wake 需要重建物理映射，但 cached blocks 不自动可用于 CuMem mapping path，导致 wake OOM。该失败是时序相关的——内存压力在 weight update 中积累，在 wake 边界暴露。\n**方法**：在 `CuMemAllocator.wake_up()` 开头 remap 任何 sleeping allocation 之前执行 `gc.collect()` + `torch.accelerator.empty_cache()`，释放不可达 Python 对象持有的 CUDA 张量并将未使用 cached blocks 归还 accelerator runtime。\n**效果**：防止 weight-update 后 wake 边界的 OOM；不涉及模型层逻辑，仅释放瞬态内存。",
+      "sig": "sig-core",
+      "sig_reason": "CuMem 内存管理生命周期修复。",
+      "tags": ["bugfix", "medium-risk", "cumem", "weight-update"],
+      "pr_number": 49857
+    },
+    {
+      "sha": "b5b61c622c941426cf78a83672e878b5b829fe90",
+      "comment": "**背景**：FlashInfer 拥有的通信资源（all-reduce workspace、all-to-all manager）在 process checkpoint（sleep/wake）期间缺少专门的生命周期管理，可能导致资源状态不一致或内存泄漏。\n**方法**：将 V1 GPU worker 的 prepare/restore 调用经分布式状态转发到注册的 device communicator，每次转换加 accelerator 同步；CUDA communicator 独立转换 FlashInfer all-reduce workspace（normal/quant 按 identity 去重），每个 workspace 用 fresh `TorchDistBackend` 恢复；TP CPU process group 在创建 standalone/compiled-fusion/eager-fusion workspace 时一致使用；一侧 NVLink MoE 通过 workspace API prepare 并用 fresh `CustomCommunicator` 恢复。\n**效果**：FlashInfer 通信资源在 checkpoint 期间正确保存/恢复；不影响普通 sleep/wake、communicator 销毁或 serving 数据路径。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "分布式通信器 checkpoint 生命周期管理。",
+      "tags": ["feature", "medium-risk", "distributed", "flashinfer"],
+      "pr_number": 46877
+    },
+    {
+      "sha": "b68d7ef2622d2d22e964dd842381021865e942b8",
+      "comment": "**背景**：持久化 native KV-offload tier 对未解析的 `cache_dtype` 参数做指纹。默认 `cache_dtype=auto` 下 FP16 和 BF16 引擎共享同一文件系统/对象存储命名空间，尽管 KV 字节不兼容。两者 page size 相同，BF16 引擎可接受 FP16 页并在 restart 后静默返回错误输出。\n**方法**：仅对 `auto` case 解析为 `model_config.dtype` 后再构造 `OffloadingModelConfig`；显式格式（如 FP8）不变，因为可能共享 `torch.dtype` 但使用不兼容的表示。\n**效果**：消除 FP16/BF16 跨格式静默缓存损坏；388 项 KV-offload 测试全部通过，focused factory/mapper 测试 40 项通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 持久化缓存 dtype 命名空间隔离修复。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "cache-dtype"],
+      "pr_number": 49438
+    }
+  ]
+}

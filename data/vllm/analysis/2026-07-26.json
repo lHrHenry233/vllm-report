@@ -2,13 +2,13 @@
   "date": "2026-07-26",
   "repo": "vllm-project/vllm",
   "generated_at": "2026-07-26T20:00:00+08:00",
-  "daily_summary": "当日 19 条变更，KV offloading 是绝对主线。三项核心改进协同推进多级 KV offload 生产化：共享 CPU 区域对 MLA 模型的复制 KV 去重（TP=N 时内存容量提升 N 倍）、持久化缓存按 model runner 命名空间隔离（修复 V1/V2 布局不兼容的静默缓存损坏）、请求终结延后到最终 store 完成（修复 EngineCore KeyError 崩溃）。性能方向，MoE reduce_scatter 移除冗余通信找回 5% 端到端吞吐，XPU MoE GEMM 引入 TD 操作数加载恢复 XMX 硬件加速。多模态方向，DeepSeek-OCR-2 TTFT 优化 1.84×、Gemma-4 ViT 支持 CUDA Graph 实现全静态编译。核心侧修复 layerwise 在线处理与 bias 加载的时序竞争，DCP 拓扑校验从 assert 升级为可操作 ValueError。",
+  "daily_summary": "当日 26 条变更，KV offload 是绝对主线。六项核心改进协同推进多级 KV offload 生产化：共享 CPU 区域 MLA KV 去重（TP=N 内存 N 倍提升）、持久化缓存按 runner 命名空间隔离、请求终结延后至 store 完成修复崩溃、P2P 二级层通用框架实现引擎双向 fetch/serve KV 块、5D KV cache 接收布局修复、SWA 非对齐加载边界修复。性能方向 MoE reduce_scatter 找回 5% 吞吐、XPU MoE GEMM TD 加载恢复 XMX 加速。多模态方向 DeepSeek-OCR-2 TTFT 1.84×、Gemma-4 ViT CUDA Graph、DiffusionGemma 支持 top_k/top_p 采样、MM 预处理独立 executor 消除 tokenization 阻塞。核心侧修复 layerwise 时序竞争、custom-op 矛盾指令校验、DCP 拓扑 ValueError 升级。",
   "sig_summaries": {
-    "sig-core": "新增 VaultGemma 模型（Transformers 后端，修复全注意力模型在 `sliding_window` 存在时被误判为 sliding 的 bug）。修复 layerwise 在线处理时序竞争——#49586 将 bias 加入 SKIP_TENSORS 后 load_numel_total 只计 weight，OPT 检查点交错排列导致提前一轮处理，FP8 Marlin 重写 bias 后触发 AssertionError。DCP 拓扑校验从 assert 升级为 ValueError，`python -O` 下不再放行无效拓扑。",
-    "sig-large-scale-serving": "KV offload 三项核心改进：①共享 CPU 区域 MLA KV 去重，TP=N 时内存容量提升 N 倍、D2H 写入减少 N 倍，仅 TP rank 0 写入、所有 rank 共享读取；②持久化缓存按 model runner 命名空间隔离，V1 打包跨层表示与 V2 逐层张量字节数相同但布局不兼容，此前大小检查无法拦截导致静默缓存损坏；③请求终结延后至最终 store 完成，修复 manager 提前删除请求状态导致 prepare_store() KeyError 崩溃。DCP 拓扑校验升级为可操作 ValueError。",
+    "sig-core": "新增 VaultGemma 模型（Transformers 后端，修复全注意力模型在 `sliding_window` 存在时被误判为 sliding 的 bug）。修复 layerwise 在线处理时序竞争——#49586 将 bias 加入 SKIP_TENSORS 后 load_numel_total 只计 weight，OPT 检查点交错排列导致提前一轮处理，FP8 Marlin 重写 bias 后触发 AssertionError。DCP 拓扑校验从 assert 升级为 ValueError。custom-op 编译配置增加矛盾指令校验——同一 op 同时被 enable/disable 时不再静默接受，`python -O` 下不再放行无效配置。",
+    "sig-large-scale-serving": "KV offload 六项核心改进：①共享 CPU 区域 MLA KV 去重，TP=N 时内存容量提升 N 倍、D2H 写入减少 N 倍；②持久化缓存按 model runner 命名空间隔离，修复 V1/V2 布局不兼容的静默缓存损坏；③请求终结延后至最终 store 完成，修复 EngineCore KeyError 崩溃；④新增 P2P 二级层通用框架，引擎可通过 NIXL+ZMQ 双向 fetch/serve KV 块，将 PD 路径泛化为对称 P2P 模型；⑤修复 5D KV cache 接收布局——#42095 后非 MLA 后端使用 5D 缓存导致 kv_postprocess_layout_on_receive IndexError；⑥修复 SWA 非对齐加载边界——chunk 对齐 sanity check 低估有效 pending span 一个 block 导致生产环境 EngineCore 崩溃。aborted 请求 num_tokens_after_batch 改用 num_computed_tokens 避免存储无 KV 数据的 chunk。",
     "sig-model-performance": "MoE reduce_scatter 移除冗余的 all-gather(2H)+all-reduce(H)，改为对 local hidden 乘 P 后与 local residual 做 RMSNorm 再单次 all-gather(H)，GLM-5.2-FP8 TP=4 找回约 5% 端到端吞吐。XPU 批量 MoE GEMM 引入 Tensor-Descriptor 操作数加载，`tl.load` 喂入 `tl.dot` 绕过了 Xe XMX 2D-block-read 路径，改用 `tl.make_tensor_descriptor` 恢复硬件加速，Arc B70 kernel 延迟降低 89-91%，输出 bit-exact。",
     "sig-quantization": "per-token-head 量化（fp8/int8/int4）KV cache 与 OffloadingConnector 组合时，`prefer_cross_layer_blocks` 硬编码 True 导致跨层共享缓冲中各层 inline fp32 scale 视图在同一偏移碰撞，首次 forward 即损坏 KV cache。修复方式：per-token-head dtype 下返回 False 走逐层 offload 路径，正确布局 scale pad，仅跳过跨层传输优化。",
-    "sig-omni": "DeepSeek-OCR-2 TTFT 优化 1.84×：`create_custom_4d_mask` 利用 batch 不变性一次性计算并缓存 `[1,1,S,S]` 掩码，`_index_put_impl_` 调用从 22.9 万次降为 0，TTFT p50 从 4193ms 降至 2283ms。Gemma-4 ViT 支持 CUDA Graph：host 预计算 `gather_indices` 绕过 pooler 动态切片，实现 100% 静态编译。ColQwen3.5 修复注意力契约不匹配——#46108 无条件设为双向注意力改变了 VultronRetriever（causal 训练）的执行语义，现以检查点声明的契约为权威来源。",
+    "sig-omni": "DeepSeek-OCR-2 TTFT 优化 1.84×：`create_custom_4d_mask` 利用 batch 不变性一次性计算并缓存 `[1,1,S,S]` 掩码，TTFT p50 从 4193ms 降至 2283ms。Gemma-4 ViT 支持 CUDA Graph：host 预计算 `gather_indices` 绕过 pooler 动态切片，实现 100% 静态编译。ColQwen3.5 修复注意力契约不匹配。DiffusionGemma 支持 per-request top_k/top_p 采样，在 compiled denoise 步前过滤 logits。MM 预处理独立 executor——此前单张图片预处理阻塞所有并发请求的 tokenization（1s+），分离后 tokenization 等待降至 ~0.2ms 且 MM 吞吐不变。",
     "sig-ci": "语音 WER 两连修复：jiwer 替代 `evaluate.load(\"wer\")` 解决 HfFolder API 移除后的兼容性失败；对称 closeness 检查改单侧上界，避免 WER 改进（低于基线）反被判失败。DeepEP manylinux pidfd 系统调用兼容修复发布管线；XPU 异构 TP 用例、pooling rerank 测试容差稳定化、Mergify 取消任务不再发消息。",
     "other": "Docker 部署文档补充 `VLLM_CACHE_ROOT` 编译缓存卷挂载示例，实测 Qwen3-0.6B 冷启动从 79s 降至 48s（−40%），从第二个容器起生效。"
   },
@@ -164,6 +164,62 @@
       "sig_reason": "GitHub 机器人配置。",
       "tags": ["ci", "low-risk"],
       "pr_number": 45117
+    },
+    {
+      "sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+      "comment": "**背景**：`kv_postprocess_layout_on_receive()`（#30275 引入）在接收 KV cache 时将 HND 排列转置为 NHD，但假设缓存为 4D。#42095 合并后非 MLA 后端分配 5D 缓存 `(num_blocks, 2, block_size, H, D)`，导致 `IndexError: index_copy_(): Source dimensionality (4), destination dimensionality (5)`。\n**方法**：当缓存为 5D 时使用 5D 感知的 `inv_order`，4D 路径保持不变。\n**效果**：NHD 布局 + Triton attention 后端的 nixl 集成精度测试通过，此前直接 IndexError。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV cache 跨节点传输的布局兼容性修复。",
+      "tags": ["bugfix", "medium-risk", "kv-transfer"],
+      "pr_number": 47791
+    },
+    {
+      "sha": "3f1d40960fb79e6f1314755abf2d43d142e33363",
+      "comment": "**背景**：offloading 调度器对所有 finished 请求使用 `num_tokens` 计算 `num_tokens_after_batch`，但 aborted 请求的 `num_computed_tokens < num_tokens`（部分 KV 数据），使用 `num_tokens` 会尝试存储不存在的 KV chunk。\n**方法**：区分 aborted 与其他 finished 请求——aborted 使用 `num_computed_tokens`（实际 KV 数据量），EOS/长度上限/重复/错误等仍使用 `num_tokens` 处理异步调度延迟；`storable_chunks` 的 clamp 保持为防御性措施。\n**效果**：112 项 offloading 测试全部通过，aborted 请求不再产生无 KV 数据的存储任务。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 调度器对 aborted 请求的正确性修复。",
+      "tags": ["bugfix", "medium-risk", "kv-offload"],
+      "pr_number": 49285
+    },
+    {
+      "sha": "0da6e7f3d6ed50fe1262cc2cf44066989a6b4cdd",
+      "comment": "**背景**：`CompilationConfig.custom_ops` 接受同一 op 同时被 enable 和 disable 的指令，冲突推迟到运行时 `assert`；`all`/`none` 冲突检查也是 `assert`，`python -O` 下两者均消失，无效配置静默以 disable 指令运行。fusion 设置还可能在校验后追加 enable 指令重新制造冲突。\n**方法**：在 init 完成后校验最终指令列表，对矛盾指令抛出显式 `ValueError`；运行时 config 变更保留同样的显式校验。\n**效果**：矛盾指令在配置阶段即被拒绝，`python -O` 下不再放行无效配置。",
+      "sig": "sig-core",
+      "sig_reason": "编译配置校验强化。",
+      "tags": ["bugfix", "low-risk", "compilation"],
+      "pr_number": 49134
+    },
+    {
+      "sha": "5559679229bc961848b121ccdeaa8fa5d79bec98",
+      "comment": "**背景**：CPU KV offload 在合法的非对齐 sliding-window 外部加载时致命终止 EngineCore——调度器用 chunk 对齐的占用估算 sanity check pending GPU blocks，生产配置（SW=4096, block=32, chunk=256, prefix=98012 tokens）下有效 span 为 129 blocks 但旧上界为 128。\n**方法**：在 sliding-window sanity assertion 中允许额外一个 physical GPU block（`+1`），不改变分配、加载/存储所有权、取消、准入、传输尺寸或缓存策略。\n**效果**：两台 TP=2 × 2x RTX PRO 6000 Blackwell 生产主机上 DeepSeek V4 agent 流量不再崩溃。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload sliding-window 边界修复。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "sliding-window"],
+      "pr_number": 49052
+    },
+    {
+      "sha": "da3a252fd13f51c22657bfc8650936f2fbb5b6f3",
+      "comment": "**背景**：KV offload 此前仅支持 prefill/decode 单向 PD 路径，缺乏引擎间对称的 P2P KV 共享能力。\n**方法**：新增通用 P2P 二级层——双向 `P2PSession`（client+server 角色）经 NIXL 数据通道 + ZMQ 控制通道连接；server 端 per-LookupMsg 聚合 HIT/MISS/HIT_PENDING（有界 deadline），按 wire order 回复；入站 peer 查找通过 tiering 层的 `ParentManager` 句柄在每个调度步 `serve_external_requests(parent)` 处理。\n**效果**：vLLM 引擎可同时从远程 peer fetch KV 块并向远程 peer serve KV 块，将 PD 路径泛化为对称 P2P 模型。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "P2P KV offload 框架，大规模分布式 KV 共享。",
+      "tags": ["feature", "high-risk", "kv-offload", "p2p"],
+      "pr_number": 48021
+    },
+    {
+      "sha": "21fd9e85a04f3a97da00eceddce91d8c6966b954",
+      "comment": "**背景**：DiffusionGemma 缺少 per-request `top_k`/`top_p` 采样支持，无法在 denoise 步前过滤 logits。\n**方法**：在 compiled denoise 步前对 logits 做 top_k/top_p 过滤（镜像 AR sampler），masked token 置为 `-inf`；padding 从 `* 0` 改为 `masked_fill_` 避免 `-inf * 0 = NaN`。\n**效果**：per-request 过滤正常工作，top-1 argmax 不受影响，截断 canvas 无 NaN。",
+      "sig": "sig-omni",
+      "sig_reason": "扩散模型采样能力扩展。",
+      "tags": ["feature", "low-risk", "diffusion-model"],
+      "pr_number": 45429
+    },
+    {
+      "sha": "8d28b48d01b2ba56e962c7c57b894c6b4fcf8a35",
+      "comment": "**背景**：多模态图片/视频预处理与 tokenization 共享单 worker executor，一张大图（2048px）的预处理耗时 1s+，阻塞所有并发请求的 tokenization。\n**方法**：为 MM 预处理分配独立 executor，两者不再竞争；将 #38418 guard 收窄到 pooling 模型（其预处理仍在 renderer worker 上运行）；与 #44786 组合使用。\n**效果**：tokenization 等待从 1218ms（2048px）降至 ~0.2ms（p50），p99 从 1235ms 降至 0.41ms；MM 吞吐不变。16 项测试通过。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态预处理并发性能优化。",
+      "tags": ["performance", "medium-risk", "multimodal", "executor"],
+      "pr_number": 49524
     }
   ]
 }
