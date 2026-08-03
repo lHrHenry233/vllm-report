@@ -1,0 +1,70 @@
+{
+  "date": "2026-08-02",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-02T20:00:00+08:00",
+  "daily_summary": "当日 7 条变更，核心侧实现 DeepSeek V4 序列并行、统一多路径编码器 CUDA graph 支持，并为 GPT-OSS Harmony 模型实现全程约束解码的工具调用。Elastic EP 修复非连续权重传输导致扩容时新 worker 接收错误权重的问题。Qwen3.5-MoE 修复 transformers 5.x config 类型兼容性。文档修复 FusedMoE 引用。新增 AMD ROCm CODEOWNERS。",
+  "sig_summaries": {
+    "sig-core": "实现 DeepSeek V4 序列并行（SP），复用 Kimi K3 的 collective path，在 attention 前后执行 all-gather/reduce-scatter 对，SP 在 PP=1、EP 启用、TP>1 时激活（#46789）。统一多路径编码器 CUDA graph 路径管理，消除 global/local 特殊感知（#49934）。GPT-OSS Harmony 模型实现全程约束解码——将 `json_object`/`json_schema` response_format 重写为 Harmony 感知 structural_tag，约束覆盖整个生成过程而非仅 final channel（#45560）。修复 Qwen3.5-MoE 在 transformers 5.x 下的 config 类型兼容性（#50704）。",
+    "sig-large-scale-serving": "Elastic EP 权重传输修复——PyNccl 以 flat contiguous 内存传输不感知 tensor strides，非连续视图（如 DeepSeek-V3 部分权重）导致扩容时新 worker 接收错误权重。修复将非连续权重打包到临时连续缓冲再发送，逐个传输限制临时 HBM 占用（#50641）。",
+    "sig-ci": "新增 AMD 特定模型文件和 ROCm 文档的 CODEOWNERS（#50608）。",
+    "other": "修复文档中 `FusedMoE` -> `FusedMoEFactory` 重命名后的引用（#50701）。"
+  },
+  "commits": [
+    {
+      "sha": "96add737ff022430b17034ce50dc55504c04094f",
+      "comment": "**背景**：Elastic EP 权重传输将每个权重张量直接传给 PyNccl send API，但 PyNccl 以 flat contiguous 内存传输不感知 tensor strides。非连续视图（如 DeepSeek-V3 部分权重）导致新 worker 扩容时接收错误权重。\n**方法**：将非连续权重打包到临时连续缓冲再发送，接收后拷贝回原始 tensor 视图。非连续张量逐个传输而非批量，限制临时 HBM 占用。\n**效果**：10 次 DeepSeek V3 16->24 扩容对比中权重传输性能无退化（均值和中位数略优）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Elastic EP 专家并行扩容权重传输正确性修复。",
+      "tags": ["bugfix", "high-risk", "elastic-ep", "weight-transfer"],
+      "pr_number": 50641
+    },
+    {
+      "sha": "0601850791155003afbe5a0d5d086350cada8deb",
+      "comment": "**背景**：transformers 5.x 将 Qwen3.5-MoE text-only 模型顶层 config 类从 `Qwen3_5MoeConfig` 重命名为 `Qwen3_5MoeTextConfig`。`Qwen3_5MoeProcessingInfo.get_hf_config()` 硬编码 wrapper 类型，`isinstance` 检查失败导致 `TypeError: Invalid type of HuggingFace config`。\n**方法**：将 `get_hf_config()` 的类型参数从单个 `Qwen3_5MoeConfig` 改为元组 `(Qwen3_5MoeConfig, Qwen3_5MoeTextConfig)`，覆盖两个 transformers 版本。\n**效果**：Qwen3.5-MoE text-only 模型在 transformers 4.x 和 5.x 下均可正常加载。",
+      "sig": "sig-core",
+      "sig_reason": "模型 config 加载 transformers 5.x 兼容性修复。",
+      "tags": ["bugfix", "low-risk", "model-config", "qwen3.5"],
+      "pr_number": 50704
+    },
+    {
+      "sha": "e2fa28594f7baad142a426b0b6a2cfe2c79201c7",
+      "comment": "**背景**：多路径编码器（如 deepseek-ocr）的 CUDA graph 管理器感知 global/local 特殊路径，设计不够通用。\n**方法**：统一路径管理，消除 encoder cg manager 对 global/local 路径的特殊感知，使路径管理更通用化。\n**效果**：为后续多路径编码器 CUDA graph 扩展奠定基础，减少特殊 case 处理。",
+      "sig": "sig-core",
+      "sig_reason": "编码器 CUDA graph 多路径管理统一重构。",
+      "tags": ["refactor", "medium-risk", "cudagraph", "encoder"],
+      "pr_number": 49934
+    },
+    {
+      "sha": "c67fe497a25d5af10a6ca0be9d18bcdd42cac4f1",
+      "comment": "**背景**：`FusedMoE` 重命名为 `FusedMoEFactory` 后文档中的引用未更新。\n**方法**：将文档中大部分 `FusedMoE` 替换为 `fused MoE` 泛称，特定代码链接替换为 `MoERunner`。\n**效果**：文档引用修正。",
+      "sig": "other",
+      "sig_reason": "纯文档引用修复，非 SIG 变更。",
+      "tags": ["docs", "low-risk"],
+      "pr_number": 50701
+    },
+    {
+      "sha": "38a466e7b6e087d67c35e7f924c04c245423c99f",
+      "comment": "**背景**：DeepSeek V4 缺少序列并行（SP）支持，无法在 TP>1 下高效分割序列维度。\n**方法**：将 Kimi K3 SP helpers 移入共享 model-ops 模块，使用 TP device communicator 的 `custom_all_gather` 和 `custom_reduce_scatter`（fallback 到通用 collectives）。token padding/sharding/padding-mask propagation 和 output trimming 保留在 DSV4 model code 中。MoE/MLP 激活序列分片，仅在 attention 前后执行一对 all-gather/reduce-scatter。SP 在 PP=1、EP 启用、TP>1 且 DeepGEMM MegaMoE 或 DP>1 时激活。MTP 和 DSpark 路径同步适配。\n**效果**：15 项 sequence parallel 测试通过；DSV4 可在 TP>1 下使用序列并行。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4 模型序列并行实现，复用 Kimi K3 collective path。",
+      "tags": ["feature", "high-risk", "sequence-parallelism", "deepseek-v4"],
+      "pr_number": 46789
+    },
+    {
+      "sha": "dc818c198d3ff50a16f38eba567da006478239c8",
+      "comment": "**背景**：vLLM 的约束解码在 Harmony 模型上延迟到 `<|channel|>final...<|message|>` 后才执行 `response_format` 约束，对 structural-tag 工具调用造成不匹配——约束应在 commentary/tool-call 阶段生效而非仅 final-message channel。\n**方法**：将 `json_object`/`json_schema` response_format 重写为 Harmony 感知 structural_tag，将 analysis 和 final-message 边界直接编码到 grammar中，约束由 structural tag 全程控制。覆盖 `HarmonyParser.adjust_request` 使 JSON response_format 包装为全程 structural tag；CC 和 Responses API 调用 `adjust_request`；清理 `GptReasoningParser` 的 reasoning_end 方法和测试。\n**效果**：无内置工具时约束确保生成函数 100% 格式正确；有内置工具时 fallback 路径确保调用了某个工具。",
+      "sig": "sig-core",
+      "sig_reason": "GPT-OSS Harmony 约束解码与工具调用全流程重构。",
+      "tags": ["feature", "high-risk", "gpt-oss", "constrained-decoding", "parser"],
+      "pr_number": 45560
+    },
+    {
+      "sha": "127a7cebc9e3b76b7558fe96b4156a55a5905375",
+      "comment": "**背景**：需新增 AMD 特定模型文件和 ROCm 文档的 code owner。\n**方法**：在 CODEOWNERS 中添加 @hongxiayang 覆盖 AMD 相关模型文件和 ROCm 文档。\n**效果**：代码审查治理更新。",
+      "sig": "sig-ci",
+      "sig_reason": "CODEOWNERS AMD ROCm 治理更新。",
+      "tags": ["chore", "low-risk"],
+      "pr_number": 50608
+    }
+  ]
+}

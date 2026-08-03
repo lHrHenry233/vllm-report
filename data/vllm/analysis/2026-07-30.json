@@ -1,0 +1,363 @@
+{
+  "date": "2026-07-30",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-30T20:00:00+08:00",
+  "daily_summary": "当日共43个提交，主要方向包括：CI/测试稳定性改进（13个提交，涵盖ROCm、XPU、Buildkite授权与重试机制等），模型性能优化（10个提交，涉及DSv4内核优化、RMSNorm改进、torch.compile融合、CPU内核升级等），大规模服务基础设施（7个提交，包含P/D disaggregation多节点时钟修复、KV connector mamba状态配对修复、Rubin SM107 NVLink支持等）。此外新增Kimi K3模型支持，统一了Mistral解析器，并为AutoRound量化在XPU上新增W4A16/MXFP4支持。",
+  "sig_summaries": {
+    "sig-model-performance": "当日有多个内核性能优化提交。DSv4方面移除了冗余的`torch.full`内核调用并修复了pp buffer的冗余内存分配，分别带来1.88x内核性能提升和448MiB显存节省。FlexAttention优化了编码器block-mask编译路径，将MI355冷缓存测试从300秒降至38秒。编译方面将Residual Add+RMSNorm融合为FusedAddRMSNorm，ROCm上吞吐量提升2.6%。RMSNorm增加了非连续张量支持，性能提升1.2~3.1x。torch.compile为ReLU^2启用了forward_native编译，将两个独立内核融合为单个Triton内核。CPU内核同步至sglang最新版本，修复了activation_kernels.cu的整数溢出问题。ROCm Triton prefix-prefill支持了cached K/V（key/value=None）路径，修复了IQuest LoopCoder等模型的崩溃。新增AITER FP8 ViT编码器注意力路径，支持gfx942/gfx950上的多模态视觉编码器FP8量化注意力。",
+    "sig-ci": "当日CI改进密集，涵盖多个平台。ROCm方面修复了AMD nightly分布式回归（回退过早添加的custom all-gather测试、调整shutdown测试阈值），避免了Ray worker启动环境变量竞争（升级至Ray 2.55.1），并稳定了speculator内存teardown和LLM GC teardown检查。XPU方面跳过了不支持的kimi-k3测试并恢复了sliding window V1测试。Buildkite方面改进了评论触发授权和重试机制，支持跨PR commit重试失败步骤，限制了wheel大小检查至CUDA 13。还添加了FlashMLA H100测试到CI，修复了gfx950 FP8 RMSNorm舍入测试容差，临时禁用了Humming wNa8 INT8 H100测试，以及修复了tests/目录下的mypy错误并启用了follow-imports=silent。",
+    "sig-large-scale-serving": "当日重点修复了P/D disaggregation中的多个关键问题。KV lease期限被重新基于worker时钟，修复了多节点部署中因进程本地时钟差异导致的TTL几乎为零的静默精度损坏。P/D抢占竞争条件被修复，当预填充请求在最后一步被抢占时，会丢弃最后一个token以便重新排队计算。NIXL mamba状态配对修复了多槽位块表在投机解码场景下的状态损坏问题。多进程RPC截止时间修复防止了过期deadline变为ZMQ无限等待。Rubin SM107启用了NVLink all-reduce路径。新增gRPC KV事件源发现端点。为disaggregated serving添加了detokenization流式derender支持。",
+    "sig-core": "新增Kimi K3模型支持，包含SITU trtllmgen MOE和MLA优化。Mistral解析器统一为基于引擎的reasoning和tool call解析器，支持所有Mistral格式tokenizer。ROCm将DeepSeek V3.2迁移至`vllm/models/deepseek_v32/`目录。前端方面延迟初始化chat media连接器，避免纯文本请求时重复初始化多模态共享缓存。",
+    "sig-rl": "IPC后端迁移至新的有状态trainer权重传输抽象，引入`IPCTrainerWeightTransferEngine`，支持无参数`send_weights()`，为多rank trainer提供IPC handle全聚合，是三PR拆分计划的第二步。",
+    "sig-quantization": "AutoRound量化在XPU上新增W4A16（dense/MoE）和MXFP4（linear/MoE）支持。修复了Quark量化模型在投机解码下FusedMoE的AssertionError，在exclude分支中检查RoutedExperts以返回正确的FusedMoE方法。",
+    "sig-omni": "为MOSS-Transcribe-Diarize模型添加OpenAI兼容的diarized_json响应格式，解析MOSS的`[start][Sxx]text[end]`格式并返回说话人归属的语音转录段。回退了Minimax-M3默认video_processor的添加，因其破坏了CI测试。",
+    "sig-spec-decode": "修复了Step-3.7-Flash MTP在量化模型上的加载崩溃，通过将SharedHead的完全限定前缀传入`ParallelLMHead`，使量化排除逻辑能正确处理MTP头。",
+    "other": "新增Ray集群信任模型和环境变量传播的安全文档。移除了CPU文档中已过时的tcmalloc警告。添加了pynvvideocodec视频解码后端的文档。"
+  },
+  "commits": [
+    {
+      "sha": "837eae64580c885101ee95b073aafb27a485e7ce",
+      "comment": "**背景**：DSv4的`combine_topk_swa_indices`操作中存在冗余的`torch.full`内核调用。**方法**：通过传入out tensor避免额外的`torch.full`内核调用。**效果**：内核性能提升1.88x，已覆盖在单元测试中。",
+      "sig": "sig-model-performance",
+      "sig_reason": "优化DSv4的Triton内核，移除冗余的CUDA内核调用以提升性能。",
+      "tags": ["performance", "medium-risk", "dsv4"],
+      "pr_number": 50298
+    },
+    {
+      "sha": "904fae8be12f1592b8e489fc0f1004fa49460a89",
+      "comment": "**背景**：DSv4 pp last rank在未启用MTP时仍执行`torch.empty`和`copy`操作。**方法**：在未启用MTP时跳过冗余的内存分配和拷贝。**效果**：节省448 MiB GPU显存，消除了不必要的拷贝延迟。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修复DSv4 pipeline parallel buffer的冗余GPU内存分配和拷贝。",
+      "tags": ["performance", "medium-risk", "dsv4"],
+      "pr_number": 50312
+    },
+    {
+      "sha": "f388dd6592a3873636a3b5325e9db4849eb9e70f",
+      "comment": "跳过XPU不支持的kimi-k3模型测试以修复CI。",
+      "sig": "sig-ci",
+      "sig_reason": "在XPU CI中跳过不支持的kimi-k3模型测试。",
+      "tags": ["test", "low-risk", "xpu"],
+      "pr_number": 50447
+    },
+    {
+      "sha": "5b958907420e3e4dcbccd47ce912218475c885cc",
+      "comment": "**背景**：FlexAttention编码器block-mask在不同shape下触发Triton编译爆炸，MI355冷缓存测试耗时300秒。**方法**：将编码器专用FlexAttention mask默认为128-token Q/KV块，同时保留paged KV attention的小块默认值并尊重显式块大小覆盖。长文本fixture使用本地seeded生成器确保可复现。**效果**：MI355冷缓存测试从300.31秒降至37.99秒，全部长文本模块测试5/5通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "优化FlexAttention编码器block-mask编译路径以避免Triton编译爆炸。",
+      "tags": ["performance", "medium-risk", "flex-attention"],
+      "pr_number": 50339
+    },
+    {
+      "sha": "30b4e7f479674a9c4d8889d4857294d3bd5e6849",
+      "comment": "**背景**：trainer侧权重传输重构的第二步，需要将IPC后端迁移到新的`WeightSource`/`ModuleSource`抽象上。**方法**：引入`IPCTrainerWeightTransferEngine`，由无参数`send_weights()`驱动的有状态引擎；多rank trainer中所有rank迭代source并参与IPC handle全聚合，仅rank 0发送合并handle并驱动推理侧RPC。移除了`IPCWeightTransferUpdateInfo`中的`packed`字段，worker从init handshake读取`packed`配置。**效果**：首个具有新trainer路径端到端正确性测试的PR，NCCL和sparse NCCL路径不受影响。",
+      "sig": "sig-rl",
+      "sig_reason": "将IPC权重传输后端迁移至新的有状态trainer抽象。",
+      "tags": ["refactor", "medium-risk", "rl"],
+      "pr_number": 48981
+    },
+    {
+      "sha": "59e831c09a22bdd2732b86a158ff771584b14793",
+      "comment": "**背景**：Transformers模型分别发射residual add和RMSNorm，阻止了FusedAddRMSNorm内核的使用，且中间的reshape操作阻止了部分融合模式的发现。**方法**：在编译pass中将residual add和RMSNorm规范化为`fused_add_rms_norm`并处理中间的reshape操作。**效果**：Qwen3-0.6B-FP8在ROCm MI355x上输出吞吐量提升2.60%，平均TTFT降低3.14%，平均TPOT降低1.82%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "在编译pass中融合Residual Add和RMSNorm以启用FusedAddRMSNorm内核。",
+      "tags": ["performance", "medium-risk", "torch-compile"],
+      "pr_number": 48757
+    },
+    {
+      "sha": "1a20d23dab6eef0ce6ab97b7e03c944683cdf90b",
+      "comment": "**背景**：Mistral的tool call和reasoning解析器此前分散实现，需要统一为基于引擎的解析器。**方法**：实现统一的引擎解析器，支持所有Mistral格式tokenizer（pre-v11/v11+、文本或特殊token reasoning、mistral-common guidance语法），v11+允许空tool-call名称。**效果**：替换了此前分离的解析器实现，新增单元测试覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "统一Mistral的reasoning和tool call解析器为基于引擎的实现。",
+      "tags": ["feature", "medium-risk", "parser"],
+      "pr_number": 48947
+    },
+    {
+      "sha": "e2efe79695e0f92395c029a6a7907c02a0374678",
+      "comment": "**背景**：DeepSeek V3.2的AMD特定需求分散在各处，需要按其他模型的模式迁移到独立目录。**方法**：将deepseek_v32迁移至`vllm/models/deepseek_v32/`，将公共元素移入common，更新NVIDIA依赖以反映迁移。新增融合norm/rope内核测试。**效果**：GSM8k正确性验证通过（exact_match 0.9515），MTP也可正常工作。",
+      "sig": "sig-core",
+      "sig_reason": "将DeepSeek V3.2模型代码迁移至独立目录结构。",
+      "tags": ["refactor", "medium-risk", "rocm"],
+      "pr_number": 47207
+    },
+    {
+      "sha": "38a267cdd5b30841bb2e2913d67ba18544098c3a",
+      "comment": "**背景**：MyPy以`--follow-imports skip`检查`tests/*`，隐藏了真实的类型错误。**方法**：新增`SILENT_GROUPS`在`SEPARATE_GROUPS`之前匹配，使已修复目录路由到默认组。修复了21个`tests/`目录中约25个mypy错误并移入`SILENT_GROUPS`。**效果**：mypy通过，已修复的类型错误在后续PR中不再静默回归。",
+      "sig": "sig-ci",
+      "sig_reason": "修复tests/目录下的mypy错误并启用follow-imports=silent。",
+      "tags": ["chore", "low-risk", "mypy"],
+      "pr_number": 49570
+    },
+    {
+      "sha": "89d97d9a165a7fb2c84ffb77c8da816093bba0ed",
+      "comment": "在安全指南中新增Ray集群信任模型和环境变量传播的说明，包含对仅限driver凭据的运营加固建议。",
+      "sig": "other",
+      "sig_reason": "纯文档变更，记录Ray集群安全模型。",
+      "tags": ["docs", "low-risk"],
+      "pr_number": 50397
+    },
+    {
+      "sha": "072a4727820732fb9e1480dd3deffb9070520b41",
+      "comment": "**背景**：vLLM的CPU内核自上次同步(#41924)后已落后于sglang上游main。**方法**：同步`csrc/cpu/sgl-kernels/`至sglang最新上游，调和vLLM特有的补丁（MXFP4 W4A16 MoE、AMX GDN dispatch、ISA可移植BLAS fallback、RISC-V支持等）。采用SGLang新的pooled-state-indexing `chunk_gated_delta_rule_cpu`签名，CPU GDN路径直接读写pooled `ssm_state` buffer。**效果**：12个模型（AWQ/GPTQ/compressed-tensors W4A16, FP8 W8A16 dense/MoE, MXFP4, INT8 W8A8 MoE）离线推理正确性验证通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "同步CPU内核至sglang最新版本并修复GDN prefill路径。",
+      "tags": ["feature", "high-risk", "cpu"],
+      "pr_number": 50387
+    },
+    {
+      "sha": "aeeb36b1f17145975c6713242f2447bb8b98782b",
+      "comment": "**背景**：需要为vLLM添加`moonshotai/Kimi-K3`模型支持。**方法**：添加Kimi K3模型文件、SITU trtllmgen MOE和MLA内核依赖、Python/Rust前端支持。需要安装flashinfer v0.6.16rc5运行。支持DSpark投机解码。**效果**：Kimi K3可在vLLM中运行，提供专用docker镜像`vllm/vllm-openai:kimi-k3`。",
+      "sig": "sig-core",
+      "sig_reason": "新增Kimi K3模型架构支持。",
+      "tags": ["feature", "high-risk", "new-model"],
+      "pr_number": 50000
+    },
+    {
+      "sha": "0c64be8873307c8db5901178f00945ce41866f2d",
+      "comment": "**背景**：gfx950融合RMSNorm的FP8舍入在测试容差边界上选择相邻码，导致测试失败。**方法**：仅对gfx950融合RMSNorm的测量值使用共享FP8 `allclose`契约，将每个接受差异限制在一个FP8 ULP内。**效果**：不改变任何生产内核，仅修复测试容差。",
+      "sig": "sig-ci",
+      "sig_reason": "修复ROCm gfx950 FP8 RMSNorm舍入的测试容差。",
+      "tags": ["test", "low-risk", "rocm"],
+      "pr_number": 49839
+    },
+    {
+      "sha": "61c1d098e5124f3566b22a3178ef46551a4bd8e3",
+      "comment": "使用managed runner运行speculator和reference engine，确保ROCm teardown在下个engine启动前完成，稳定speculator内存teardown测试。",
+      "sig": "sig-ci",
+      "sig_reason": "稳定speculator内存teardown测试以修复ROCm CI间歇性失败。",
+      "tags": ["ci", "low-risk", "rocm"],
+      "pr_number": 50284
+    },
+    {
+      "sha": "165ed33327c04db3e26c6e433f721a1f68754558",
+      "comment": "在ROCm fixture cleanup后仅重试间歇性的weakref断言，不强制循环收集以保持周期检测能力。",
+      "sig": "sig-ci",
+      "sig_reason": "稳定ROCm LLM GC teardown检查的间歇性weakref断言失败。",
+      "tags": ["ci", "low-risk", "rocm"],
+      "pr_number": 50340
+    },
+    {
+      "sha": "48a077e4cfaa5425ac5df67ce95f07a99c6d26d5",
+      "comment": "**背景**：`/ci run`和`/ci retry`的授权和重试机制需要改进，使CI访问更显式、可审查。**方法**：具有write/maintain/admin权限的用户可始终运行CI；配置的`CI_TRUSTED_USERS`也可运行；其他贡献者仅能在自己的非draft PR上、有ready标签或trusted approval后运行。重试行为支持在build仍在运行时重试failed/timed_out/expired作业。使用两阶段workflow确保安全。**效果**：CI授权更显式、可审查，重试行为更智能。",
+      "sig": "sig-ci",
+      "sig_reason": "改进Buildkite评论触发授权和重试机制。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 50414
+    },
+    {
+      "sha": "e04a30a77cb17d5a9753c53c51ee30bba887053c",
+      "comment": "**背景**：chat media连接器在每次请求时都构造，纯文本聊天解析时重复初始化共享缓存。**方法**：延迟media connector构造至请求包含多模态输入时，覆盖同步和异步路径。**效果**：避免纯文本聊天解析时的重复共享缓存初始化。",
+      "sig": "sig-core",
+      "sig_reason": "延迟初始化chat media连接器以优化纯文本请求性能。",
+      "tags": ["performance", "low-risk", "frontend"],
+      "pr_number": 49914
+    },
+    {
+      "sha": "445d3aac0a0720f38e80c256c884f4aa45cb8ab8",
+      "comment": "**背景**：`/ci retry`仅能在同一commit的重试失败作业，新commit无法继承上一次构建的失败步骤。**方法**：若当前PR head无build，查找同一PR最近的命令触发build，获取其failed/timed-out/expired的script作业，去重稳定`step_key`后创建filtered build。记录源build和commit到Buildkite metadata。**效果**：支持跨PR commit重试失败步骤，fail-closed在无稳定key时请求`/ci run`。",
+      "sig": "sig-ci",
+      "sig_reason": "扩展`/ci retry`支持跨PR commit重试失败步骤。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 50318
+    },
+    {
+      "sha": "8122a105361600b2c634824b09d96ff9176ee73e",
+      "comment": "移除CPU文档中已过时的tcmalloc警告，因tcmalloc现已默认打包进CPU wheel并通过ld preload加载。",
+      "sig": "other",
+      "sig_reason": "纯文档变更，移除过时的tcmalloc警告。",
+      "tags": ["docs", "low-risk"],
+      "pr_number": 50308
+    },
+    {
+      "sha": "f1e8fd27aea5563172a9b2559c42188419a100b2",
+      "comment": "**背景**：FP8 ViT编码器注意力此前仅支持FlashInfer/cuDNN，ROCm上缺少AITER FP8路径。**方法**：启用AITER per-tensor FP8 attention用于多模态视觉编码器（gfx942/gfx950），通过`ROCM_AITER_FA`将量化packed tensor分派到`flash_attn_varlen_fp8_pertensor_func`，恢复activation dtype并移除临时head-dim padding。添加compile-safe custom-op wrapping、架构/符号验证、正确性测试和benchmark。**效果**：Qwen3-VL-2B视觉评估正确性一致，BF16/FP16多head dim正确性测试通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为ROCm添加AITER FP8 ViT编码器注意力路径。",
+      "tags": ["feature", "medium-risk", "rocm"],
+      "pr_number": 49937
+    },
+    {
+      "sha": "0028fc8d8dd6e2d12a4e07240b948819ebc2eca8",
+      "comment": "恢复XPU CI中被跳过的sliding window V1测试用例`test_sliding_window_retrieval[True-1-5-google/gemma-3-1b-it]`。",
+      "sig": "sig-ci",
+      "sig_reason": "在XPU CI中恢复被跳过的sliding window V1测试。",
+      "tags": ["ci", "low-risk", "xpu"],
+      "pr_number": 50207
+    },
+    {
+      "sha": "a7a204cc6ec99b375985e564f4f271e68ee8f5b8",
+      "comment": "**背景**：FlashMLA H100测试在#32810接口变更后失效，且未纳入CI。**方法**：修复三个FlashMLA测试文件（`test_flashmla.py`、`test_flashmla_sparse.py`、`test_mla_cross_layer_kernel_equivalence.py`）并将其添加到Buildkite kernels测试区域。**效果**：所有测试本地通过，防止进一步回归。",
+      "sig": "sig-ci",
+      "sig_reason": "修复FlashMLA H100测试并添加到CI防止回归。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 50322
+    },
+    {
+      "sha": "b88916617d3d2249bff0dae5cecb6b727c980a20",
+      "comment": "**背景**：某些模型（如IQuest LoopCoder）在已缓存序列上仅用query重新调用attention，传入`key=None`/`value=None`，但ROCm Triton prefix-prefill内核假设当前chunk的K/V始终为dense tensor并解引用`k.shape`导致崩溃。**方法**：当`key`/`value`为`None`时，从paged KV cache推导head dim和KV head count，用query token的绝对序列位置从cache中读取当前chunk的K/V。通过`KV_FROM_CACHE`内核`tl.constexpr` flag门控，默认为`False`以保持其他模型不变。**效果**：IQuest LoopCoder等模型在ROCm上不再崩溃，新增专用内核测试作为回归守卫。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修复ROCm Triton prefix-prefill内核对cached K/V（key/value=None）的支持。",
+      "tags": ["bugfix", "medium-risk", "rocm"],
+      "pr_number": 48257
+    },
+    {
+      "sha": "1ad5182ba95a6f1de23b537d57b860082912b28e",
+      "comment": "限制wheel大小检查至CUDA 13，修复wheel大小检查配置。",
+      "sig": "sig-ci",
+      "sig_reason": "限制wheel大小检查至CUDA 13以修复构建配置。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 50357
+    },
+    {
+      "sha": "e5f48dfda2b53090f539a2b3988e075e8ac0eba8",
+      "comment": "**背景**：AutoRound格式量化模型此前在XPU上不支持W4A16和MXFP4方案。**方法**：为XPU添加W4A16（dense和MoE）及MXFP4（linear和MoE）量化支持，覆盖`vllm/model_executor/layers`中的相关层实现。**效果**：Qwen3-8B W4A16、Qwen3-30B-A3B W4A16 MoE、Qwen3-8B MXFP4等模型在XPU上正确性验证通过（piqa exact_match 0.76-0.80）。",
+      "sig": "sig-quantization",
+      "sig_reason": "为XPU添加AutoRound W4A16和MXFP4量化方案支持。",
+      "tags": ["feature", "high-risk", "xpu"],
+      "pr_number": 47124
+    },
+    {
+      "sha": "4e582c5b54b866a2cc0d44c8f8bbedb52cf5c605",
+      "comment": "**背景**：`pull_scheduler.request_finished`用scheduler进程的`time.perf_counter()`戳记deadline，而`base_worker`用每个worker自己的`perf_counter`过期检查。`perf_counter`的epoch是进程本地的，跨节点差异由启动时间delta决定，导致多节点P/D部署中第二个节点的有效TTL可能接近零甚至为负，造成静默精度损坏。**方法**：在`NixlConnectorMetadata.scheduler_clock`中传递scheduler时钟，worker在注册时将剩余TTL重新基于自己的时钟（广播延迟只会延长lease，是安全方向）。**效果**：修复了多节点P/D部署中的KV lease过早释放和静默精度损坏。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修复P/D disaggregation中KV lease期限的多节点时钟不一致问题。",
+      "tags": ["bugfix", "high-risk", "pd-disagg"],
+      "pr_number": 50326
+    },
+    {
+      "sha": "437e0b7f8eb787e1cd7bdf090e47a015b54fd22c",
+      "comment": "**背景**：P/D和async scheduling下，预填充请求在最后一步可能被抢占，其KV blocks已被清除，导致async kv-consuming connectors在`request_finished()`时看到空的blocks列表。**方法**：当存在`requires_kv_delivery`的connector时，在抢占发生时丢弃最后一个token使请求重新排队/计算。新增`requires_kv_delivery`属性，仅对producing connectors默认为`True`，offloading connectors为`False`。**效果**：修复了P/D preemption竞争条件，避免KV blocks为空时的静默数据丢失。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修复P/D disaggregation中预填充请求在最后一步被抢占的竞争条件。",
+      "tags": ["bugfix", "high-risk", "pd-disagg"],
+      "pr_number": 50297
+    },
+    {
+      "sha": "0a31372e5fe7cc8bbaf96df0a3e88db9040cf8d5",
+      "comment": "**背景**：RFC #47161的Part 1，需要为disaggregated serving添加流式derender模式以支持llm-d和Dynamo等平台的交互式服务。**方法**：在`derender/`端点添加流式模式，镜像producer的每chunk SSE形状。状态保持client-carried且server无状态，响应为plain JSON而非SSE。Detokenization通过`detokenize_incrementally`逐chunk重建decode窗口，解决多字节字符跨chunk边界的问题。**效果**：所有流式derender测试通过，chat路径的reasoning/tool call解析暂存待后续PR。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "为disaggregated serving添加detokenization流式derender支持。",
+      "tags": ["feature", "medium-risk", "disagg-serving"],
+      "pr_number": 47301
+    },
+    {
+      "sha": "451227cb3ff07989698fed982c2d3e4300257924",
+      "comment": "**背景**：`activation_kernels.cu`中多个内核使用`blockIdx.x * d`等32位算术计算指针偏移，在处理大量token和hidden dim时可能溢出。**方法**：将`blockIdx.x`转换为`int64_t`后再执行偏移计算，应用于`act_and_mul_kernel`、`act_and_mul_kernel_with_param`和`activation_kernel`。**效果**：保留正常工作负载的现有行为，确保大工作负载的指针偏移使用64位算术。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修复activation_kernels.cu中blockIdx.x指针偏移的32位整数溢出。",
+      "tags": ["bugfix", "medium-risk", "cuda-kernel"],
+      "pr_number": 49660
+    },
+    {
+      "sha": "b28c178ffd50cbdff1da87bfb8b786c514e0efaf",
+      "comment": "**背景**：Quark量化MoE模型（如`amd/DeepSeek-R1-MXFP4`）配合投机解码MTP使用时，MTP drafter的MoE层前缀不匹配Quark的exclude pattern，`get_quant_method()`返回`UnquantizedLinearMethod`触发FusedMoE的AssertionError。**方法**：在`QuarkConfig.get_quant_method()`的exclude分支中检查`RoutedExperts`，排除的MoE层返回`UnquantizedFusedMoEMethod`而非`UnquantizedLinearMethod`。**效果**：Quark量化模型配合投机解码不再崩溃。",
+      "sig": "sig-quantization",
+      "sig_reason": "修复Quark量化模型在投机解码下FusedMoE的AssertionError。",
+      "tags": ["bugfix", "medium-risk", "quark"],
+      "pr_number": 38293
+    },
+    {
+      "sha": "48aa8d8d7529d2314858d8487cc0a21789fc7ec1",
+      "comment": "**背景**：`MultiprocExecutor.collective_rpc()`在enqueue时计算绝对deadline，但同步RPC先排空pending async futures后时间可能已过期，剩余时间计算为负值传入ZMQ被解释为无限等待。**方法**：新增`_remaining_timeout()` helper将剩余时间clamp到`max(0.0, deadline - time.monotonic())`；同步RPC绕过FutureWrapper直接调用`get_response()`；`MessageQueue.recv()`添加millisecond timeout下限guard。**效果**：过期deadline产生立即timeout(0.0)而非负值的未定义行为，新增25个测试覆盖。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修复多进程RPC过期deadline变为ZMQ无限等待的问题。",
+      "tags": ["bugfix", "medium-risk", "multiproc"],
+      "pr_number": 41357
+    },
+    {
+      "sha": "9d1aa4dda85a58c74b23ff79aa4a20594ee6f359",
+      "comment": "**背景**：需要为`OpenMOSS-Team/MOSS-Transcribe-Diarize`模型添加OpenAI兼容的`diarized_json`响应格式。**方法**：在`/v1/audio/transcriptions`端点添加`diarized_json`响应，解析MOSS的`[start][Sxx]text[end]`格式并返回OpenAI风格的说话人归属段。解析器为线性、fail-closed，仅对`diarized_json`运行，不影响`json`/`text`/`verbose_json`路径。**效果**：MOSS-Transcribe-Diarize模型支持diarized转录，解析测试覆盖重叠段、噪声、空段等边缘情况。",
+      "sig": "sig-omni",
+      "sig_reason": "为MOSS-Transcribe-Diarize语音转录模型添加diarized_json响应格式。",
+      "tags": ["feature", "medium-risk", "speech-to-text"],
+      "pr_number": 48543
+    },
+    {
+      "sha": "1cb3fe5844592696e9a428f0239f0508462a56f7",
+      "comment": "临时禁用Humming wNa8 INT8在H100上的CI测试，因已知失败待修复。",
+      "sig": "sig-ci",
+      "sig_reason": "临时禁用Humming wNa8 INT8 H100 CI测试。",
+      "tags": ["ci", "low-risk"],
+      "pr_number": 50329
+    },
+    {
+      "sha": "fa2a2589bd2a1fce0851df7fd42ffb54b6195f04",
+      "comment": "**背景**：PR #50089添加的custom all-gather/reduce-scatter测试在ROCm上全部失败（缺少对应Python API），PR #49270的2 GiB shutdown阈值在MI300上过于严格。**方法**：回退117行过早添加的AG/RS测试，保留4个已有的ROCm custom-all-reduce用例。shutdown测试使用ROCm 4 GiB idle-runtime floor和60秒内部timeout，CUDA保持2 GiB阈值。**效果**：7/7 custom-all-reduce失败用例修复，shutdown teardown不再超时。",
+      "sig": "sig-ci",
+      "sig_reason": "修复ROCm AMD nightly分布式测试回归（custom all-reduce和shutdown阈值）。",
+      "tags": ["ci", "low-risk", "rocm"],
+      "pr_number": 50304
+    },
+    {
+      "sha": "435c4dad97f90d7f1f72523be9d03dab2663bcd0",
+      "comment": "**背景**：Ray 2.54.0中async metrics-exporter初始化存在`getenv`/`setenv`竞争，导致ROCm CI中一个Ray actor在导入类时崩溃。**方法**：将ROCm CI的Ray pin从2.54.0升级至2.55.1 patch release，包含Ray #61034和#61281的修复。**效果**：PP=4测试在AMD CI build 11413中已通过，确认失败为间歇性而非确定性源码回归。",
+      "sig": "sig-ci",
+      "sig_reason": "升级Ray至2.55.1以避免ROCm CI中Ray worker启动环境变量竞争。",
+      "tags": ["ci", "low-risk", "rocm"],
+      "pr_number": 50311
+    },
+    {
+      "sha": "5fa01544480b60275edf913e1a620d229e40553d",
+      "comment": "**背景**：Rubin（sm_107）在vLLM的集合通信选择表中没有条目，优化的NVLink all-reduce路径被跳过，流量静默回退到NCCL。**方法**：将sm_107（10.7/107）添加到`CUSTOM_ALL_REDUCE_MAX_SIZES`、`SYMM_MEM_ALL_REDUCE_MAX_SIZES`、`SymmMemCommunicator._WORLD_SIZES_MULTIMEM`、FlashInfer all-reduce fusion size thresholds。sm_107复用已为10.3验证的size阈值。**效果**：Rubin GPU上启用custom all-reduce、PyTorch symmetric-memory all-reduce和FlashInfer all-reduce+RMSNorm融合路径。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "为Rubin SM107启用NVLink all-reduce路径。",
+      "tags": ["feature", "medium-risk", "rubin"],
+      "pr_number": 49647
+    },
+    {
+      "sha": "48fc2e2797ec3f35605c3ff399bbaab7938b0459",
+      "comment": "**背景**：Rust前端需要发现已配置的ZMQ KV-event publisher以正确连接数据并行rank的事件源。**方法**：添加`Control.GetKvEventSources` gRPC端点，返回每个数据并行rank的事件源（含resolved event/replay endpoints、topic、encoding、schema version、queue settings）。将publisher的resolved runtime configuration通过EngineCore ready handshake暴露，避免Rust前端重复rank-based endpoint resolution。**效果**：Rust和Python间的MessagePack兼容性测试通过，gRPC源映射测试通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "为Rust前端添加gRPC KV事件源发现端点。",
+      "tags": ["feature", "medium-risk", "kv-events"],
+      "pr_number": 50033
+    },
+    {
+      "sha": "2ecd8645d87e7c0716e5bc4347620e91e137619d",
+      "comment": "回退PR #50092添加的Minimax-M3默认video_processor，因其破坏了CI测试（`rms_norm_static_fp8_quant`算子未找到）。",
+      "sig": "sig-omni",
+      "sig_reason": "回退Minimax-M3默认video_processor因破坏CI测试。",
+      "tags": ["chore", "low-risk", "revert"],
+      "pr_number": 50313
+    },
+    {
+      "sha": "82642d7d6c332fefdec06b260a246bd1a4ebf5ff",
+      "comment": "**背景**：RMSNorm内核不支持非连续（strided）张量，需要先`.contiguous()`拷贝，在GLM5.2等模型中造成性能损失。**方法**：使RMSNorm内核直接支持非连续张量，避免额外的contiguous拷贝。同时修复了多个其他模型中类似的问题。**效果**：在strided场景下性能提升1.2~3.1x，在contiguous场景下性能持平。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为RMSNorm内核添加非连续张量支持以避免contiguous拷贝开销。",
+      "tags": ["performance", "medium-risk", "rmsnorm"],
+      "pr_number": 49750
+    },
+    {
+      "sha": "93477454f9155d4f74352e3d725c83f91c6894bf",
+      "comment": "**背景**：ReLU^2激活的`CustomOp.forward_native`未启用torch.compile编译，导致在opaquecustom op内部使用raw torch ops（clamp scalar + pow tensor scalar两个独立内核）。**方法**：为ReLU^2激活启用`forward_native`编译flag，使torch.compile将两个独立内核融合为单个Triton内核（pow + ReLU）。**效果**：Nemotron-3-Nano-30B-A3B-NVFP4在H100上延迟略降、吞吐量提升（25.75 vs 25.35 req/s）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为ReLU^2激活启用torch.compile的forward_native编译以融合内核。",
+      "tags": ["performance", "low-risk", "torch-compile"],
+      "pr_number": 50244
+    },
+    {
+      "sha": "5c7a7f9462c97ff8b2f63e6458488b820f2bbd86",
+      "comment": "为pynvvideocodec视频解码后端添加用户文档，说明如何调用该后端，补充v0.25.0中已合并但缺少文档的功能。",
+      "sig": "other",
+      "sig_reason": "纯文档变更，添加pynvvideocodec视频解码后端文档。",
+      "tags": ["docs", "low-risk"],
+      "pr_number": 49066
+    },
+    {
+      "sha": "f98061ce6cb0326978363fb6c0489fe75a9aac5d",
+      "comment": "**背景**：Step-3.7-Flash-NVFP4的MTP头未被正确排除量化，`SharedHead`的`ParallelLMHead`没有传入prefix（默认为空字符串），导致量化排除逻辑无法匹配，在量化主模型上head被NVFP4量化（4096压缩为2048）无法加载BF16权重。**方法**：将head的完全限定前缀`{layer_prefix}.shared_head.head`传入`ParallelLMHead`，使量化排除逻辑能正确判断。**效果**：head的量化状态与checkpoint一致——排除时为BF16，未排除时为量化，MTP=3在8xB200和8xH100上验证通过。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "修复Step-3.7-Flash MTP在量化模型上的加载崩溃。",
+      "tags": ["bugfix", "medium-risk", "mtp"],
+      "pr_number": 48883
+    },
+    {
+      "sha": "82553692b899059d2ec967ece7677a76bf2daab2",
+      "comment": "**背景**：NIXL P/D传输按位置配对SSM state blocks，假设请求的mamba group解析为单个local state block。但这仅在不使用投机解码的默认`mamba_block_size = max_model_len`下成立。使用投机配置时，mamba managers在每个请求上额外分配`num_speculative_blocks`个scratch slots，且mamba prefix caching的block list是多槽位表。placeholders和scratch slots不持有可传输状态但都参与了配对，导致静默状态损坏。**方法**：Scheduler层在每个block-id交换点剥离trailing speculative slots，在单状态cache模式（none/align）中将group reduce到运行状态槽位。Worker层将`_apply_prefix_caching`中的single-local-block断言替换为min count对齐。**效果**：P和D间的交换列表为1:1，修复了spec+align模式下的状态损坏。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修复NIXL KV connector在多槽位块表下的mamba状态配对问题。",
+      "tags": ["bugfix", "high-risk", "kv-connector"],
+      "pr_number": 50153
+    }
+  ]
+}

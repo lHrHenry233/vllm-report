@@ -1,0 +1,272 @@
+{
+  "date": "2026-08-01",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-01T20:00:00+08:00",
+  "daily_summary": "当日 32 条变更，覆盖前端 API、量化、ROCm 内核、CI 基础设施等多个方向。前端新增 Cohere Chat v2 API 和 Anthropic Messages API cache_salt 支持，修复 Responses API 渲染一致性；量化侧推进 ModelOpt FP8 SM80 仿真、MoE WNA16 Marlin 方法合并、TurboQuant KV cache 模式修复及 MXFP4 线性内核抽象统一；ROCm 修复 MLA 小头验证因果掩码和 ViT Triton-AMD 内核检测路径。CI 重组投机解码 E2E 测试、更新 FA2 ABI 稳定构建 pin。核心侧将原始 prompt 预处理卸载到渲染线程池，修复 HTTP server 优雅关停竞态。",
+  "sig_summaries": {
+    "sig-core": "前端新增 Cohere Chat v2 API（#47189）和 Anthropic Messages API cache_salt 支持（#49498），修复 Responses API 与 Chat Completions 渲染一致性（#50334）及嵌套 reasoning parser 的 model_config 透传。MRV2 启用 encoder token embedding pooling 任务（#50574）。核心引擎将原始 prompt 预处理卸载到渲染线程池，避免多模态请求阻塞 asyncio 事件循环（#49608）；修复 HTTP server 优雅关停竞态（#49668）；降低启动日志噪声（#50590）；清理无用 `num_api_servers` 代码（#49424）；增强进程管理器关停日志（#49437）。Rust 基准工具修复无效 token ID 导致 panic（#50058）。模型注册表拼写修正（#50673）。",
+    "sig-model-performance": "新增 `vllm bench serve` 探测请求功能，用于测量多模态并发对延迟的影响（#49611）。修复 ROCm AITER MLA 小头投机验证的因果掩码缺陷——验证位置 t 错误地关注了其后的草稿 token（#50476）。Helion 基准脚本新增数值正确性检查（#48968）。修复 ROCm ViT Triton-AMD 内核在新 aiter 路径下的检测（#40289）。",
+    "sig-large-scale-serving": "MooncakeStoreConnector 新增 `enable_lookup` 标志，允许 PD decode 实例仅贡献容量段而不执行无用的 KV 查找，减少 DSV4 等场景的开销并支持异构 TP Mooncake PD 部署（#50498）。",
+    "sig-quantization": "ModelOpt FP8 仿真支持降至 SM80，A100 可加载 FP8 checkpoint 并以仿真模式运行（#50019）。合并 CompressedTensorsWNA16MarlinMoEMethod 与 CompressedTensorsWNA16MoEMethod，统一后端选择（#44570）。修复 TurboQuant KV cache 量化模式字符串设为 auto 导致的启动失败（#50533）。Quark OCP MX4 线性内核重构为共享 `linear` 内核抽象的 `EmulationMxfp4LinearKernel`（#48949）。Compressed-Tensors 支持 Kimi-K3 量化模型（#50500）。修复 AWQ gemm 内核中 `torch::stable::sum` 的悬空临时变量（#46805）。",
+    "sig-ci": "重组投机解码 E2E 测试按覆盖范围分目录，恢复 DFlash/DSpark nightly 覆盖（#50330）。修复 common ops 导入触发 CUDA 初始化导致 CI fork 子进程失败（#50639）。更新 FA2 构建 pin 为 ABI 稳定版本（#50474）。Bump Helion 至 1.4.0（#50307）。修复 MoE 路由回放测试缓冲区容量（#50640）。恢复 ROCm CI Mistral tool-parser 兼容性（#50515）。升级 tpu-inference 至 v0.26.0（#50522）。新增 CODEOWNERS（#50655）。",
+    "other": "新增延迟指标理解文档（#50600）。"
+  },
+  "commits": [
+    {
+      "sha": "03c782eb91f70ba990432aace77f94be66aaeb2e",
+      "comment": "**背景**：`inspect_model_cls` 的首个返回值是 model info 而非 model class，命名不够直观。\n**方法**：修正返回值语义使其更易理解，并修复若干拼写错误。\n**效果**：代码可读性提升，无功能变更。",
+      "sig": "sig-core",
+      "sig_reason": "模型注册表代码清理与拼写修复。",
+      "tags": ["refactor", "low-risk"],
+      "pr_number": 50673
+    },
+    {
+      "sha": "39f55ffdaacbf4f2ac06e395c3f9c6e55a54dbd0",
+      "comment": "**背景**：`AsyncLLM.add_request()` 在 asyncio 事件循环线程上同步调用 `InputProcessor.process_inputs()`，原始 prompt 包含分词和多模态预处理（图像 resize/patchify），在并发多模态请求时阻塞事件循环，GPU 空闲等待单个 CPU 线程处理图像。OpenAI server 路径不受影响（renderer 已卸载到线程池），但直接 `AsyncLLM.generate()` 调用方（RL 和评分框架）受影响。\n**方法**：`InputProcessor` 新增 `process_inputs_async`，基于 renderer 现有线程池的 `make_async` 构建异步变体，并发受 `renderer_num_workers` 限制。`AsyncLLM.add_request()` 对原始 prompt 改用异步变体；已渲染的 `EngineInput` dict 保持同步调用。\n**效果**：原始 prompt 预处理不再阻塞事件循环，多模态并发场景下 GPU 利用率提升。",
+      "sig": "sig-core",
+      "sig_reason": "AsyncLLM 引擎核心异步预处理路径优化。",
+      "tags": ["performance", "medium-risk", "async-llm"],
+      "pr_number": 49608
+    },
+    {
+      "sha": "63e78ce3652f4f94e9f484f40db71ca4cf019f21",
+      "comment": "**背景**：缺少衡量并发多模态请求如何相互影响的基准测试手段。\n**方法**：在 `vllm bench serve` 中新增 `--probe-request-rate` 选项，在主负载旁发送单 token 纯文本探测请求（绕过 `--max-concurrency`），独立报告其延迟。\n**效果**：可量化不同图像尺寸对无关请求延迟的影响——1024px 以下 probe p50 约 12ms，2048px 图像使无关请求中位延迟膨胀约 180 倍。",
+      "sig": "sig-model-performance",
+      "sig_reason": "基准测试工具新增多模态并发探测能力。",
+      "tags": ["feature", "low-risk", "benchmark"],
+      "pr_number": 49611
+    },
+    {
+      "sha": "ab06486175e833925be065438b067cec488029e8",
+      "comment": "**背景**：`awq_gemm` 内核末尾 `torch::stable::sum(_out_feats, 0)` 中标量 `0` 被包装为 `HeaderOnlyArrayRef`，其构造仅存储临时变量指针。当 `sum` 调用未被内联时，临时变量栈槽被相邻 CUDA launch 配置覆盖，导致序列化 `dim` 变为垃圾值，引发 `aten::sum.dim_IntList` 越界和 EngineDeadError。主流工具链（GCC 10）恰好内联该调用所以不触发，GCC 11.4 复现。\n**方法**：通过命名且生命周期稳定的 `std::vector<int64_t>` 和显式 `IntHeaderOnlyArrayRef` 传递 reduction dim，正确性不再依赖编译器内联决策。\n**效果**：GCC 11.4 等非内联工具链下 AWQ 不再崩溃，已内联工具链行为不变。",
+      "sig": "sig-quantization",
+      "sig_reason": "AWQ 量化 GEMM 内核 C++ 临时变量生命周期修复。",
+      "tags": ["bugfix", "medium-risk", "awq", "kernel"],
+      "pr_number": 46805
+    },
+    {
+      "sha": "652ba59229499eb65fc4115b7feadeddf9bcb75d",
+      "comment": "**背景**：MRV2 缺少 `token_embed` pooling 任务支持，无法承载 ColBERT 式 late-interaction 评分。\n**方法**：在 MRV2 上启用 `token_embed` pooling 任务，将现有 `LateInteractionRunner` 接入 V2 pooling 路径。这是 MRV2 pooling 系列第三步（`embed`/`classify` 和 `token_classify` 已合并）。\n**效果**：ColBERT token embeddings 与 HuggingFace 参考实现精度匹配（rtol=1e-2, atol=1e-2），late-interaction 评分和重排 API 全部通过。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 pooling 任务扩展，encoder token embedding 支持。",
+      "tags": ["feature", "medium-risk", "mrv2", "pooling"],
+      "pr_number": 50574
+    },
+    {
+      "sha": "3986b967b249468fc1bd052f89a1eeeada6377b4",
+      "comment": "**背景**：PD 架构中 decode 实例的 MooncakeStoreConnector 执行无用 KV lookup 查找（如 DSV4），带来不必要开销；同时阻止了 K3 等未兼容模型的异构 TP Mooncake PD 部署。\n**方法**：新增 `enable_lookup` 标志配置于 `kv_connector_extra_config`，设为 false 时 decode 实例仅贡献容量段扩展 prefill worker KV cache，不执行读写。\n**效果**：消除无用 lookup 开销；Kimi-K3 1P1D 6x GB300/24 GPU 异构 TP PD 部署正常工作，Mooncake 池利用率达 90%。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Mooncake KV connector PD 架构 lookup 优化。",
+      "tags": ["feature", "medium-risk", "kv-connector", "pd"],
+      "pr_number": 50498
+    },
+    {
+      "sha": "81a42d37b1d76a34ce75b6871bba57a30cddc812",
+      "comment": "**背景**：OpenAI 兼容 API 接受 `cache_salt` 用于显式 prefix-cache 隔离，但 Anthropic Messages API（`/v1/messages`）未暴露该字段，基于 Anthropic schema 的客户端必须切换 API 格式才能获得确定性前缀缓存隔离。\n**方法**：在 `AnthropicMessagesRequest` 中添加 `cache_salt: str | None`，通过 `_build_base_request` 透传到内部 `ChatCompletionRequest`，复用现有 `check_cache_salt_support` 验证器。\n**效果**：Anthropic Messages API 现支持 `cache_salt` 前缀缓存隔离，省略时行为不变。",
+      "sig": "sig-core",
+      "sig_reason": "Anthropic API 前端新增 cache_salt 前缀缓存隔离支持。",
+      "tags": ["feature", "low-risk", "api-frontend"],
+      "pr_number": 49498
+    },
+    {
+      "sha": "77469c9057bec3212a64877dbbf3b9c48c22d786",
+      "comment": "**背景**：ROCm AITER MLA 在多 token 投机验证时，少于 16 query heads/rank 的 block 被 flatten 为单 token decode 且无因果检查，每行获得该请求整个 paged-KV 范围，导致验证位置 t 关注其后的草稿 token（应被检查的 token）。输出看似合理但基于未验证 token，表现为吞吐量虚高。DeepSeek 家族（128 MLA heads，TP=16 时 8 heads/rank）此前走正确掩码路径，此 PR 引入了回归。\n**方法**：为行 `r*qlen + t` 分配 `seq_len_r - (qlen - 1) + t` 个条目而非 `seq_len_r`，每行的因果窗口是该请求 slice 的前缀。\n**效果**：修复投机验证因果性，消除基于未验证 token 的错误接受。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm MLA attention 后端投机验证因果掩码修复。",
+      "tags": ["bugfix", "high-risk", "rocm", "attention", "spec-decode"],
+      "pr_number": 50476
+    },
+    {
+      "sha": "4ee9702bee668a447e9983a6aefc16ebbc3ad32e",
+      "comment": "**背景**：缺少延迟指标理解文档。\n**方法**：新增 Understanding the Latency Metrics 文档及配套图表。\n**效果**：补充基准测试文档覆盖。",
+      "sig": "other",
+      "sig_reason": "纯文档新增，非 SIG 变更。",
+      "tags": ["docs", "low-risk"],
+      "pr_number": 50600
+    },
+    {
+      "sha": "9c110fa522f0bdd1ab3df34727b71ce2c9454d7d",
+      "comment": "**背景**：vLLM 缺少 Cohere Chat v2 API 支持（RFC #43015）。\n**方法**：实现 Cohere Chat v2 API，包含协议定义、API 路由、serving 转换、渲染器适配和完整测试套件（231 项测试通过）。\n**效果**：客户端可直接使用 Cohere Chat v2 API 格式与 vLLM 交互。",
+      "sig": "sig-core",
+      "sig_reason": "前端 API 新增 Cohere Chat v2 协议支持。",
+      "tags": ["feature", "medium-risk", "api-frontend"],
+      "pr_number": 47189
+    },
+    {
+      "sha": "6c91de36897932ba9b5adb11992235a2a789e009",
+      "comment": "**背景**：嵌套 reasoning parser 未将 `model_config` 透传到内部解析器。\n**方法**：一行修复——将 `model_config` 参数转发到嵌套 reasoning parser 构造调用。\n**效果**：嵌套 reasoning parser 可正确访问 model config。",
+      "sig": "sig-core",
+      "sig_reason": "推理 parser 嵌套调用 model_config 透传修复。",
+      "tags": ["bugfix", "low-risk", "parser"],
+      "pr_number": 50642
+    },
+    {
+      "sha": "124154a8843d1f8e4d4e2d5d466e2d3ebc3716da",
+      "comment": "**背景**：新增 committer 需更新 CODEOWNERS。\n**方法**：将 @shen-shanshan 添加到 CODEOWNERS，覆盖硬件可移植性和上游集成方向。\n**效果**：代码审查治理更新。",
+      "sig": "sig-ci",
+      "sig_reason": "CODEOWNERS 治理更新。",
+      "tags": ["chore", "low-risk"],
+      "pr_number": 50655
+    },
+    {
+      "sha": "f7097a92fd5374ff8a44167b7bc16eec42393559",
+      "comment": "**背景**：`git bisect` 定位 #50242 引入的包级 re-export 使轻量 common-op 导入拉入 model/config 依赖并在 EngineCore 进程创建前初始化 CUDA，导致 PyTorch Fullgraph job `Cannot re-initialize CUDA in forked subprocess` 和 Extra Initialization job Kimi 初始化测试意外运行 model profile。\n**方法**：移除 common-ops 包中 `fused_allreduce_rms_norm` 的 eager re-export，在三个使用该 helper 的 model 文件中直接导入；将 `can_initialize` 的 EngineCore 改为 in-process 运行以保留 KV-cache patch。\n**效果**：CI fork 子进程不再因导入时 CUDA 初始化失败。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 导入时 CUDA 初始化回归修复。",
+      "tags": ["bugfix", "medium-risk", "ci", "cuda-init"],
+      "pr_number": 50639
+    },
+    {
+      "sha": "62195e9784ebec1ece42b88a861734e0702cc2d5",
+      "comment": "**背景**：Rust 随机基准生成将 `0..vocab_size` 范围内每个 ID 视为有效，但 `o200k_base` 有 275 个未分配 ID、`cl100k_base` 有 16 个。采样到无效 ID 时 decode panic，release 构建 abort-on-panic 终止整个基准进程。\n**方法**：从连续可解码 token 范围加注册的特殊 token ID 构建 allowed-token 池，移除未分配 ID 同时保留有效特殊 token。\n**效果**：随机基准不再因无效 token ID panic。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 基准工具 token 有效性修复。",
+      "tags": ["bugfix", "low-risk", "benchmark", "rust"],
+      "pr_number": 50058
+    },
+    {
+      "sha": "eb6453d95b6d47d7e877f96992c68f0da81424dd",
+      "comment": "**背景**：作为 #26946 的一部分，完成 FA2 ABI 稳定构建。\n**方法**：更新 `vllm_flash_attn.cmake` pin 至 ABI 稳定版本，`torch-abi-audit` 确认 `.so` 无不稳定 API（stable_shim=67, unstable=0）。\n**效果**：FA2 扩展达到 ABI 稳定标准，可跨 torch 版本复用。",
+      "sig": "sig-ci",
+      "sig_reason": "Flash-Attention 2 构建系统 ABI 稳定化。",
+      "tags": ["ci", "medium-risk", "build", "flash-attn"],
+      "pr_number": 50474
+    },
+    {
+      "sha": "c4a4a42d80a50901baec34c39e7c3e8c68e7890b",
+      "comment": "**背景**：MoE 路由回放测试 fixture 为 8 token 分配缓冲区，但部分 case 使用最多 16 token，导致假失败。\n**方法**：将所有三个 fixture 的 `max_num_tokens` 设为 16 以匹配最大 case。\n**效果**：28 项测试全部通过，无假失败。",
+      "sig": "sig-ci",
+      "sig_reason": "MoE 路由回放测试缓冲区容量修复。",
+      "tags": ["test", "low-risk", "moe"],
+      "pr_number": 50640
+    },
+    {
+      "sha": "fcdc7c2e9c9b75c923751ea7d2dd79ef66572c81",
+      "comment": "**背景**：投机解码 E2E 测试套件为单体结构，不符合 CI 所有权划分；DFlash 和 DSpark nightly 覆盖已移除。\n**方法**：将测试按功能目录拆分匹配 CI 所有权；Buildkite 改为运行目录 scope 而非关键词/文件白名单；恢复 DFlash 和 DSpark nightly 验收/精度覆盖；修复 Gemma4 DSpark 因果元数据并隔离 draft 量化配置。\n**效果**：测试新增到现有目录自动发现；DFlash/DSpark 精度和验收长度达标。",
+      "sig": "sig-ci",
+      "sig_reason": "投机解码 E2E 测试 CI 组织重组。",
+      "tags": ["ci", "medium-risk", "spec-decode", "test-infra"],
+      "pr_number": 50330
+    },
+    {
+      "sha": "b40d859c7b07ae244bcd8c6eecdcdbd9a3afaa07",
+      "comment": "**背景**：Helion 内核基准脚本缺少数值正确性验证，基准计时可能基于错误输出。\n**方法**：为每个 shape 在基准前运行数值检查，默认与 eager baseline 对比（可选与 perf baseline 对比 `--numerics_with_perf_baseline`）；使用独立输入副本进行正确性和计时，避免验证影响基准状态。\n**效果**：42 个 shape 全部通过数值检查（CUDA baseline、torch.compile baseline、CUDA graph 开/关）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Helion 内核基准脚本数值正确性验证。",
+      "tags": ["test", "low-risk", "benchmark", "helion"],
+      "pr_number": 48968
+    },
+    {
+      "sha": "e3be89673db6143c1f9c8689d853b9c7c7a5eb29",
+      "comment": "**背景**：ModelOpt FP8 checkpoint 在 A100（SM80）上被拒绝加载——`ModelOptFp8Config` 最低 CUDA capability 设为 SM89。\n**方法**：将最低 capability 从 SM89 降至 SM80，SM80-SM88 发出模型级警告说明 FP8 以仿真模式运行。SM89+ 行为不变。\n**效果**：A100 可加载 ModelOpt `quant_algo=FP8` checkpoint；带宽受限 GEMM 模型仿真 FP8 性能优于 BF16。",
+      "sig": "sig-quantization",
+      "sig_reason": "ModelOpt FP8 量化在 SM80 上的仿真支持。",
+      "tags": ["feature", "medium-risk", "fp8", "modelopt"],
+      "pr_number": 50019
+    },
+    {
+      "sha": "454ea5b52611c933e00581723e2db56f0144cea7",
+      "comment": "**背景**：`CompressedTensorsWNA16MarlinMoEMethod` 和 `CompressedTensorsWNA16MoEMethod` 存在重复逻辑——`int_wna16.py` 已处理后端选择，Marlin 方法可合并。\n**方法**：将 `CompressedTensorsWNA16MarlinMoEMethod` 合并入 `CompressedTensorsWNA16MoEMethod`，统一后端选择逻辑。\n**效果**：净减 310 行代码，Marlin 后端仍正确选择；Kimi 和 Qwen1.5-MoE 测试通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "WNA16 MoE 量化方法合并重构。",
+      "tags": ["refactor", "medium-risk", "moe", "quantization"],
+      "pr_number": 44570
+    },
+    {
+      "sha": "0c4dc7c488754e6c895ff785b86b76b9c26923c4",
+      "comment": "**背景**：`server.serve` 与 app signal SIGINT/SIGTERM handler 注册存在竞态——`server.serve` 先调用 `capture_signals` 覆写信号 handler，若 `server.serve` 协程延迟到 app signal handler 注册之后，app 优雅关停程序被覆盖失效。\n**方法**：确保 HTTP server 先启动再注册 app signal handler，添加 12 行启动顺序保障。\n**效果**：消除信号 handler 注册竞态，优雅关停可靠执行。",
+      "sig": "sig-core",
+      "sig_reason": "HTTP server 优雅关停信号 handler 竞态修复。",
+      "tags": ["bugfix", "medium-risk", "shutdown"],
+      "pr_number": 49668
+    },
+    {
+      "sha": "90329913e945cb3ed515bd8e1712094cecb76a0c",
+      "comment": "**背景**：启动时配置和 warmup 消息按 rank 重复输出，后端选择和注册等例行细节在 INFO 级别产生噪声。\n**方法**：移除默认异步调度状态日志；配置和 warmup 消息每进程输出一次；例行后端选择/注册/无操作细节降至 DEBUG；保留可能因 rank 不同而异的警告。\n**效果**：启动日志更简洁，serving 行为和模型输出不变。",
+      "sig": "sig-core",
+      "sig_reason": "引擎启动日志噪声治理。",
+      "tags": ["refactor", "low-risk", "logging"],
+      "pr_number": 50590
+    },
+    {
+      "sha": "e8b358b4c0df5cf136072747c97a95526bd59df1",
+      "comment": "**背景**：Chat Completions 和 Responses API 渲染不一致——`FunctionTool` 与 `ChatCompletionToolsParam` 渲染不同；Responses API `tool_choice=none` 未像 Chat Completions 那样尊重 `--exclude-tools-when-tool-choice-none`。\n**方法**：新增渲染一致性测试覆盖多轮对话、工具、`tool_choice`、`reasoning_effort` 等；修复 `FunctionTool` 渲染与 `ChatCompletionToolsParam` 一致；`tool_choice=none` 在 Responses API 上默认将工具放入 prompt；`extra` 字段被忽略。\n**效果**：15 项测试通过，两 API 渲染行为一致。",
+      "sig": "sig-core",
+      "sig_reason": "Responses API 与 Chat Completions 渲染一致性修复。",
+      "tags": ["bugfix", "low-risk", "api-frontend", "responses-api"],
+      "pr_number": 50334
+    },
+    {
+      "sha": "4fdd3e0b74ab5bfcf86341a304cc894c09705d5b",
+      "comment": "**背景**：`flash_attn_triton_available()` 在 `rocm.py` 中检查 `flash_attn.flash_attn_triton_amd`，但 ROCm/flash-attention 迁移到 aiter 后该子包被移除，导致 ViT 在所有当前 ROCm wheel 上静默回退到 `TORCH_SDPA`。gfx1151 上 SDPA 路径产生 NaN/Inf 图像嵌入，LM 输出无限 `!` 流。\n**方法**：扩展检测同时接受旧子包路径或新 aiter 路径 `aiter.ops.triton._triton_kernels.flash_attn_triton_amd`，两者皆缺失时才返回 False。\n**效果**：当前 ROCm wheel 上 ViT 正确选择 Triton-AMD 后端。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm ViT attention 后端 Triton-AMD 内核检测修复。",
+      "tags": ["bugfix", "low-risk", "rocm", "vit", "attention"],
+      "pr_number": 40289
+    },
+    {
+      "sha": "9a7ae4b80866a322678ece31ca2854d9a174ab8d",
+      "comment": "**背景**：进程管理器关停日志缺少进程名和类型，难以诊断哪个进程管理器触发关停。\n**方法**：在关停日志中添加进程名和 PID 等元信息。\n**效果**：关停诊断信息更充分。",
+      "sig": "sig-core",
+      "sig_reason": "进程管理器关停日志增强。",
+      "tags": ["chore", "low-risk", "logging"],
+      "pr_number": 49437
+    },
+    {
+      "sha": "726ef437a160798c4312586fdbf38d1d112c5c9a",
+      "comment": "**背景**：`launch_core_engines` 中 `num_api_servers` 变量无用。\n**方法**：删除该无用变量及相关代码。\n**效果**：代码清理，无功能影响。",
+      "sig": "sig-core",
+      "sig_reason": "引擎核心无用代码清理。",
+      "tags": ["chore", "low-risk", "cleanup"],
+      "pr_number": 49424
+    },
+    {
+      "sha": "963a658674045d460ef370214d7d73575efffb98",
+      "comment": "**背景**：Helion 需更新至 1.4.0 以包含 `fused_qk_norm_rope` 内核数值修复（pytorch/helion#3081）。\n**方法**：更新 Helion commit pin 和相关 CI 配置。\n**效果**：Helion fused_qk_norm_rope 内核数值正确。",
+      "sig": "sig-ci",
+      "sig_reason": "Helion 依赖版本升级。",
+      "tags": ["ci", "low-risk", "helion", "deps"],
+      "pr_number": 50307
+    },
+    {
+      "sha": "aef85aed5d8970052fa14407b716cdac1a8164ac",
+      "comment": "**背景**：TurboQuant KV cache 量化模式下 `kv_cache_dtype` 字符串被设为 `auto`，导致 `TurboQuantConfig.from_cache_dtype` 解析失败并崩溃。\n**方法**：为 TurboQuant 添加 KV 量化模式，正确设置 KV cache dtype 字符串而非 `auto`。\n**效果**：`vllm serve --kv-cache-dtype turboquant_4bit_nc` 正常启动。",
+      "sig": "sig-quantization",
+      "sig_reason": "TurboQuant KV cache 量化模式修复。",
+      "tags": ["bugfix", "medium-risk", "kv-cache", "turboquant"],
+      "pr_number": 50533
+    },
+    {
+      "sha": "e67a2e0a56b7ba535bae8bfd98c1c4e4fa742e63",
+      "comment": "**背景**：`QuarkOCP_MX` 硬编码自有 `emulate` 布尔值并直接注册/分发 AITER `gemm_with_dynamic_quant` 自定义操作，与其他量化方案（FP8、NVFP4、MXFP8）已使用的共享内核选择框架逻辑重复。\n**方法**：引入 `EmulationMxfp4LinearKernel` 作为 `MxFp4LinearKernel` 实现经 `init_mxfp4_linear_kernel` 选择，同时引入 `EmulationMxfp6LinearKernel`；扩展 mxfp4 kernel config 增加 `activation_quant_key`。\n**效果**：纯重构，无新硬件后端或数值行为变化；标准化 mxfp4 线性后端选择。",
+      "sig": "sig-quantization",
+      "sig_reason": "Quark MXFP4 量化线性内核抽象统一重构。",
+      "tags": ["refactor", "medium-risk", "mxfp4", "rocm"],
+      "pr_number": 48949
+    },
+    {
+      "sha": "d87d2ca74791fe23ca2a0ba68c997de1618b33b6",
+      "comment": "**背景**：Kimi-K3 缺少 Compressed-Tensors 量化配置支持。\n**方法**：为 `KimiLinearModel` 添加 `SupportsQuant` 和 `packed_modules_mapping`，`SupportsQuant` 读取 `packed_modules_mapping` 更新量化配置，使 fused modules（shared expert 的 fused gate up modules）被正确忽略。\n**效果**：`RedHatAI/Kimi-K3-NVFP4` serve 和 eval 通过；`moonshotai/Kimi-K3` serve 正常。",
+      "sig": "sig-quantization",
+      "sig_reason": "Compressed-Tensors 量化支持 Kimi-K3 模型。",
+      "tags": ["feature", "low-risk", "compressed-tensors", "kimi-k3"],
+      "pr_number": 50500
+    },
+    {
+      "sha": "8d8a4e0f2b118dc975bbba930aeb7c6cbd623c2a",
+      "comment": "**背景**：统一 parser PR #48947 将 `bot_token` 和 `bot_token_id` 移至嵌套 engine，旧调用方在 adapter 上访问这些属性失败；`_legacy_extract_tool_calls` 直接访问 `request.tool_choice` 和 `request.tools`，但 parser API 允许 `request=None`。\n**方法**：在 adapter 上恢复 `bot_token` 和 `bot_token_id` 属性；`_legacy_extract_tool_calls` 容忍 `request=None`。\n**效果**：ROCm CI Language Models Test (Extended Generation) 恢复通过。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI Mistral tool-parser 兼容性修复。",
+      "tags": ["bugfix", "low-risk", "rocm", "parser"],
+      "pr_number": 50515
+    },
+    {
+      "sha": "7c08664f5c628ade14d2bf28f764ee1cfbbcedb1",
+      "comment": "**背景**：tpu-inference 需升级至最新稳定版 v0.26.0。\n**方法**：更新 `requirements/tpu.txt` 版本 pin。\n**效果**：TPU 推理依赖升级完成。",
+      "sig": "sig-ci",
+      "sig_reason": "TPU 推理依赖版本升级。",
+      "tags": ["chore", "low-risk", "tpu", "deps"],
+      "pr_number": 50522
+    }
+  ]
+}

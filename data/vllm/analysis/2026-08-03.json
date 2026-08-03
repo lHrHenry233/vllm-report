@@ -1,0 +1,71 @@
+{
+  "date": "2026-08-03",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-03T20:00:00+08:00",
+  "daily_summary": "当日 7 条变更，KV connector 修复 DeepSeek-V4 SWA+MTP EAGLE 状态在合并 Mooncake store 组间传播不一致导致外部前缀缓存命中归零。MRV2 完成 encoder-only pooling 全任务覆盖（BGE-M3 embed&token_classify）。新增 jina-embeddings-v5-text-nano 模型支持。MiniMax-M3 新增 MSA CUTLASS 稀疏解码路径用于投机验证。修复 ROCm Kimi-K3 MoE correction bias 精度丢失。新增混合 GDN 模型 sleep/wake 正确性回归测试。修复性能基准测试 TP 配置缺失。",
+  "sig_summaries": {
+    "sig-core": "MRV2 启用 BGE-M3 的 `embed&token_classify` 组合 pooling 任务，至此 encoder-only pooling 在 MRV2 上全任务覆盖（#50661）。新增 jina-embeddings-v5-text-nano 模型支持，基于 EuroBERT 编码器骨干，通过 `is_decoder` 分发到编码器路径（#50688）。修复 ROCm Kimi-K3 MoE correction bias 在 BF16 存储下丢失 FP32 checkpoint 精度（#50761）。",
+    "sig-large-scale-serving": "Mooncake store connector 修复 EAGLE 状态在合并 cache group 间传播不一致——DeepSeek-V4 仅标注 MTP 层所在组为 EAGLE，coordinator 合并同 spec 组后 save 侧 mask 仅偏移被标注成员，lookup 侧因其他成员缺少 hash 导致外部前缀缓存命中归零。修复将 EAGLE bit 传播到合并 spec 组的所有成员（#49069）。",
+    "sig-rl": "新增混合 GDN（gated-delta-net）模型 sleep/wake 正确性回归测试——amdgpu 驱动在释放 VRAM 时不可靠清零，wake 后 remap 的页面可能包含陈旧数据，GDN 状态缓存读取未清零内存导致 NaN 传播和生成退化。修复在 ROCm 路径 `create_and_map` 中清零新映射区域（#44972）。",
+    "sig-model-performance": "MiniMax-M3 新增 MSA/CUTLASS 稀疏解码路径用于投机解码验证，在 SM100/SM103 GPU 上 opt-in 启用，限制为 FP8 E4M3 KV cache、page size 128、top-k 16 等特定配置（#50032）。",
+    "sig-ci": "修复 `serving_llama70B_tp4` 性能基准测试配置缺失 `tensor_parallel_size` 字段，实际以 TP=1 静默运行（#50766）。"
+  },
+  "commits": [
+    {
+      "sha": "5c4fe4b17eaf42eda9698d9dccb4b2f2e0561641",
+      "comment": "**背景**：DeepSeek-V4 仅标注 MTP 层所在 cache group 为 EAGLE 组。coordinator 合并相同 spec 的 cache group 后对合并组应用 EAGLE last-block drop，但 save 侧 mask 仅偏移被标注的单个成员。外部 lookup 要求合并组每个成员都存在 hash，不一致的 mask 使其他 SWA 组缺少 proof-run chunk，外部前缀缓存命中降至零。\n**方法**：将 EAGLE bit 传播到合并 spec 组的所有成员，匹配 `HybridKVCacheCoordinator` 语义，保持 save 和 lookup mask 一致。复用 core coordinator 的 `SpecGroup` 表示。新增 DeepSeek-V4 形状 SWA 回归测试覆盖 store-to-lookup 往返。\n**效果**：恢复 DeepSeek-V4 SWA+MTP P/D serving 的外部前缀缓存命中；非 EAGLE 配置行为不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Mooncake KV connector EAGLE 状态跨合并组传播修复。",
+      "tags": ["bugfix", "high-risk", "kv-connector", "eagle", "mooncake"],
+      "pr_number": 49069
+    },
+    {
+      "sha": "e42c230e4ff4e3b44b100ced7d731a5190948d2e",
+      "comment": "**背景**：`serving_llama70B_tp4` 基准测试配置的 `server_parameters` 未设置 `tensor_parallel_size`，静默继承文件 defaults 块的 TP=1，实际以单 GPU 运行而非 4 GPU。\n**方法**：在 `serving_llama70B_tp4_random_128_128` 的 `server_parameters` 中添加 `tensor_parallel_size: 4`。\n**效果**：基准测试正确以 TP=4 运行。",
+      "sig": "sig-ci",
+      "sig_reason": "性能基准测试 TP 配置缺失修复。",
+      "tags": ["bugfix", "low-risk", "benchmark", "config"],
+      "pr_number": 50766
+    },
+    {
+      "sha": "9a4fd57cac19b334b420ae24226c1d2151566799",
+      "comment": "**背景**：jina-embeddings-v5 家族使用两种骨干——`-text-small` 用 Qwen3 decoder，`-text-nano` 用 bidirectional EuroBERT encoder（`is_decoder=false`）。缺少 `-text-nano` 支持。\n**方法**：更新 `JinaEmbeddingsV5ModelConfig` 对 encoder checkpoint 设 `is_causal=False` 而非拒绝；重构 Jina v5 实现为共享 adapter/pooler helpers 和独立 decoder/encoder 路径；`JinaEmbeddingsV5Model.__new__` 按 `is_decoder` 分发；新增 `-text-nano` 作为 `encoder_only` 模型测试。\n**效果**：三个 Jina v5 变体测试通过，vLLM 与 HuggingFace 参考余弦相似度 >= 0.99999。",
+      "sig": "sig-core",
+      "sig_reason": "新增 jina-embeddings-v5-text-nano 模型架构支持。",
+      "tags": ["feature", "low-risk", "model", "embedding"],
+      "pr_number": 50688
+    },
+    {
+      "sha": "0033211c0bcf3d42d3b1f27059922c30e664b8e7",
+      "comment": "**背景**：混合 Mamba/GDN 模型（如 Qwen3-Next）保持 persisted conv+recurrent state cache。sleep 模式下 state-cache tag 被丢弃，wake 时重新创建设备内存。若新序列在 reset 前消费该 slot，gated-delta-rule kernel 传播未清零内存；当其包含 NaN/Inf 时输出变为 NaN，argmax 折叠每个 token 为 id 0，在 RL 训练中产生 reward=0/NaN log-probs。根因是 amdgpu 驱动在释放 VRAM 时不可靠清零。\n**方法**：在 ROCm 路径 `create_and_map` 中清零新映射区域（`#ifdef USE_ROCM`），CUDA 路径和共享 `cumem.py` 不变。新增混合 GDN 模型 sleep/wake 正确性回归测试，assert 后 wake 生成既非退化也非 NaN。\n**效果**：sleep/wake 后生成正确；ROCm 上不依赖驱动清零行为。",
+      "sig": "sig-rl",
+      "sig_reason": "混合 GDN 模型 sleep/wake 正确性修复与回归测试。",
+      "tags": ["bugfix", "high-risk", "sleep-wake", "gdn", "rocm"],
+      "pr_number": 44972
+    },
+    {
+      "sha": "0055b8bfa3a2c7c49c51ff5962c162ba85f6de38",
+      "comment": "**背景**：MiniMax-M3 投机解码验证缺少 MSA/CUTLASS 稀疏解码路径，在 SM100/SM103 GPU 上仅能使用 Triton decode 路径。\n**方法**：新增 opt-in MSA/CUTLASS sparse decode 路径（`VLLM_MINIMAX_M3_MSA_DECODE_BACKEND=cutlass`），MSA planning 和 metadata保持 NVIDIA 后端特有。限制为 FP8 E4M3 KV cache、page size 128、top-k 16、query length 2-32、至少 16 请求、支持 GQA head geometry、最多 65536 query-head rows。batch threshold 为 TP1/TP4 内核 crossover 点。不支持的配置回退到现有 Triton decode 路径。\n**效果**：17 项 B300 内核测试通过；TP4 长上下文 15 case 全通过（8K/100K/200K）；TP4 E2E 32 请求完成 4096 token，acceptance length 2.81。",
+      "sig": "sig-model-performance",
+      "sig_reason": "MiniMax-M3 MSA attention 后端投机解码验证 CUTLASS 内核新增。",
+      "tags": ["feature", "medium-risk", "attention", "cutlass", "minimax-m3", "spec-decode"],
+      "pr_number": 50032
+    },
+    {
+      "sha": "c6668106760e1f8222abd19a6ee9e93fc060cb19",
+      "comment": "**背景**：Kimi-K3 checkpoint 以 FP32 存储 `e_score_correction_bias`，AMD router 以 FP32 输出 logits。但 AMD 模型在 ambient BF16 model dtype 下构造 correction-bias 参数，标准 weight loader 将 FP32 checkpoint 拷入 BF16 存储，后续 AITER runtime upcast 无法恢复丢弃的低位。\n**方法**：在 weight loading 前以 FP32 构造 correction-bias 参数，保留 checkpoint 精度，匹配 router-logit 合约。镜像 Kimi-K3 NVIDIA 实现和 DeepSeek #23640 修复。\n**效果**：GSM8K TP8 MI355X 全量评测通过；correction bias 精度保留。",
+      "sig": "sig-core",
+      "sig_reason": "ROCm Kimi-K3 MoE correction bias 权重加载精度修复。",
+      "tags": ["bugfix", "medium-risk", "rocm", "kimi-k3", "moe"],
+      "pr_number": 50761
+    },
+    {
+      "sha": "55c98e370aa058f567a9e682dc0652bdfba6b0bb",
+      "comment": "**背景**：BGE-M3 声明 `embed&token_classify` 组合 pooling 任务，`get_pooling_task()` 将其排为首选，但 MRV2 不支持该任务导致启动失败（`ValueError: Model Runner V2 supports pooling tasks [...] but this model selects 'embed&token_classify'`）。\n**方法**：在 MRV2 上启用 `embed&token_classify` 组合 pooling 任务，这是 MRV2 pooling 系列第四步（`embed`/`classify`、`token_classify`、`token_embed` 已合并）。\n**效果**：BGE-M3 在 MRV2 上 V1 vs V2 dense embedding 和 sparse weights max abs diff 均为 0；5 项 V1 和 V2 e2e 测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 pooling 任务扩展，BGE-M3 embed&token_classify 支持。",
+      "tags": ["feature", "low-risk", "mrv2", "pooling", "bge-m3"],
+      "pr_number": 50661
+    }
+  ]
+}

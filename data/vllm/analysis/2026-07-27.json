@@ -2,11 +2,16 @@
   "date": "2026-07-27",
   "repo": "vllm-project/vllm",
   "generated_at": "2026-07-27T20:00:00+08:00",
-  "daily_summary": "当日 8 条变更，KV transfer 与分布式通信为重点。MoRIIO 实现异构 TP<->DP prefill/decode 读路由（MI300X 上异构并行 PD 吞吐/TTFT 优于同构），KV offload 持久化缓存修复 auto dtype 命名空间冲突（FP16/BF16 互读静默错误输出）。核心侧三项修复：MRV2 dummy 请求 token 数超 max_model_len 导致 FA3 OOB（解锁 #49364 piecewise cudagraph 重落地）、XPU sparse-MLA kernel NaN poisoning（全 mask chunk 用 -inf 导致 rescale NaN 永久污染）、CuMem wake 前 gc+empty_cache 防止瞬态内存致 OOM。MRV2 新增 encoder-only attention 为 BERT/RoBERTa pooling 铺路。FlashInfer 通信器增加 process-checkpoint 生命周期钩子。macOS wheel 构建修复 tag 刷新。",
+  "daily_summary": "当日 50 条变更，覆盖核心引擎、大规模服务、模型性能内核、量化、推测解码、CI 与多模态等多方向。核心侧：MRV2 dummy batch 越界修复（解锁 piecewise cudagraph）、XPU sparse-MLA NaN poisoning 修复、CuMem wake 内存清理、encoder-only attention 铺路、FP32 logits no-op 跳过、mamba GPU<->CPU 同步修复、内部 LB 负载均衡修复、mHC prenorm GEMM 跨行累加修复、Jina rerank 截断回归修复、DiffusionGemma PP 拒绝、HF tokenizer 解析时序修正、Rust 前端 max-model-len 归属修正、stream_interval 请求级暴露、fx tracer meta tensor 改进。大规模服务侧：MoRIIO 异构 TP<->DP KV transfer 路由、KV offload dtype 命名空间隔离、per-request tier filtering、partial-tail sub-block KV offload、P2P peer 重连崩溃修复、ROCm CPU KV batch DMA、FlashInfer MNNVL workspace 校验、FlashInfer 通信器 checkpoint 生命周期。模型性能侧：LL BF16 router GEMM 调优与非 MoE warmup 跳过、merge attn context count 运行时参数化、Arm INT8 fused MoE、Power VSX FAST_EXP、ROCm RMSNorm 连续输出、XPU QK Norm+RoPE 融合、quickreduce cudagraph 修复、CPU MoE zero-pad、sparse MLA warmup 归一化。另含 MXFP8 量化支持、CPU GDN 推测解码优化、多模态视频哈希优化、Qwen3.5 EVS、inkling ROCm 启用，以及多项 CI 优化与文档更新。",
   "sig_summaries": {
-    "sig-core": "MRV2 三项修复：dummy 请求 token 均匀分配，此前最后一个 dummy 请求 token 数可达 `num_tokens - num_reqs + 1` 远超 `max_model_len`，FA3 paged mainlab 越界读垃圾页 ID（1g.18gb H200 MIG 必崩），修复后解锁 #49364 piecewise cudagraph 重落地；XPU sparse-MLA kernel 修复 NaN poisoning——首 chunk 全 mask 时 `-inf - -inf = NaN` 永久污染 acc，改用有限 sentinel `-1.0e30`；CuMem wake 前 `gc.collect() + empty_cache()` 释放瞬态 CUDA 缓存，防止 weight-update 后 wake remap OOM。MRV2 新增 encoder-only attention 支持（`encoder_only.py` model state），为 BERT/RoBERTa pooling 模型铺路。",
-    "sig-large-scale-serving": "MoRIIO 实现异构 TP<->DP prefill/decode 读路由——此前假设 prefill/decode 共享同一并行布局，本 PR 支持 `P_DP8EP->D_TP8` 和 `P_TP8->D_DP8EP` 两种混合并行配置：读路径从请求实际所属的 prefill DP rank 读取（非硬编码 DP0）、eager pre-forward handshake 防止 TP worker 握手分歧导致 NCCL 超时、mirror 配置支持 TP-replicated prefill + MLA 读。KV offload 持久化缓存修复 auto dtype 命名空间冲突——FP16/BF16 引擎共享 `cache_dtype=auto` 命名空间但 KV 字节不兼容，BF16 可接受 FP16 页并静默返回错误输出，现解析 auto 为实际 dtype 纳入指纹。FlashInfer 通信器增加 process-checkpoint 生命周期钩子——prepare/restore 调用经分布式状态转发到注册的 device communicator，独立转换 all-reduce workspace 和 all-to-all manager。",
-    "sig-ci": "macOS arm64 wheel 构建修复——持久 Mac mini checkout 未刷新 tag refs，`setuptools-scm` 使用陈旧 `v0.23.1rc0` 生成错误版本号，添加 `git fetch --tags --force origin` 修复。"
+    "sig-core": "MRV2 多项修复与扩展：dummy batch token 均匀分配（解锁 #49364 piecewise cudagraph）、XPU sparse-MLA NaN poisoning（`-inf` 改有限 sentinel）、CuMem wake 前 `gc+empty_cache` 防瞬态 OOM、encoder-only attention 铺路、FP32 logits no-op fast path 跳过、mamba_hybrid GPU<->CPU 同步修复。内部 LB 负载均衡修复——DP 无 EP 场景引擎队列 stats 未发布，Python 侧 KV cache usage 纳入队列权重。mHC block-M prenorm GEMM 跨行累加修复——`T.alloc_var` 在 unrolled i_m 循环内提升仅初始化一次，奇数行混入相邻行。Jina rerank `truncate_prompt_tokens` 回归修复（#49153 proxy 模式遗漏）。DiffusionGemma 拒绝 PP。HF tokenizer backend 先解析再加载 config。Rust 前端 `--max-model-len` 从 `SharedRuntimeArgs` 移至 `ManagedEngineArgs`。`stream_interval` 暴露为请求级参数。fx tracer 改用 meta tensor 追踪、attention 记为 opaque leaf、`QKVFuser` 按 return value 识别 `o_proj`。Inkling ROCm mxfp4 enablement。",
+    "sig-large-scale-serving": "MoRIIO 异构 TP<->DP KV transfer 读路由——支持 `P_DP8EP->D_TP8` 和 `P_TP8->D_DP8EP` 混合并行，eager pre-forward handshake 防死锁。KV offload auto dtype 命名空间隔离——FP16/BF16 共享 `auto` 命名空间但 KV 字节不兼容。FlashInfer 通信器 process-checkpoint 生命周期钩子。新增 per-request tier filtering（TierFilter/TierMatcher 按 medium/locality 过滤 secondary tier）。partial-tail sub-block KV offload——flush 即时 handoff 修复 `max_tokens=1` 场景、pin Mamba CoW 块、压力下 fail closed。P2P peer 重连崩溃修复——三重缺陷（dead connection 残留 transport、`mark_dead`/`close` 共享 flag 泄漏 socket、announce 消息丢失）。FlashInfer MNNVL workspace `mc_ptr` null 校验回退 TRTLLM。ROCm CPU KV cache batch DMA 替代裸 mmap pointer。",
+    "sig-model-performance": "LL BF16 router GEMM 调优——为 SM100F/SM90 添加架构级调优表覆盖 GLM5.2/DSv3.2/DSv4-Flash/DSv4-Pro；非 MoE 模型跳过 router GEMM warmup（dense model 70.87s->0.32s）。`merge_attn_states_kernel` 的 `prefill_tokens_with_context` 从 `tl.constexpr` 改运行时参数（消除 per-value Triton 重编译）。Arm INT8 fused MoE kernel（AdvSIMD `smmla`，~1.9x bf16）。Power VSX `FAST_EXP`（attention 1.21x、e2e +4.5%）。ROCm vllm_c RMSNorm 输出连续化（transposed strides 场景）。XPU QK Norm+RoPE 融合 pass 启用（+11.7% 吞吐）。quickreduce cudagraph 累加错误修复（`flag_color` 固定致轮间混淆）。CPU MoE intermediate zero-pad 对齐 32（解锁 grouped-gemm fast kernel）。sparse MLA warmup 压缩比归一化（`COMPRESS_RATIO=0` 除零致 Triton 编译失败）。",
+    "sig-ci": "macOS arm64 wheel 构建修复 tag 刷新。多项 ROCm CI 优化：ReplaySSM dot precision 后端默认、torchao gfx950 测试跳过（torchao<0.18）、hf-xet NFS 安全、kernel 测试运行时缩减（三路分片+并行度提升）、V1 attention 测试缩减（MI300/MI355 拆分 shard）、global GPU memory cleanup 改 opt-in、native datasets cache 离 NFS。Intel GPU CI 扩展 5 个配置测试用例。XPU InputBatch V2 test 改用 platform device。推测解码测试 runner 显式 teardown。kimi/k3 自动标签规则（全路径模式匹配）。",
+    "sig-omni": "多模态视频哈希改用源字节——取源字节与解码帧较小者加采样元数据，短 clip 哈希从 43ms 降至 0.24ms，长 clip 自动选 decoded 路径避免 source-only 回退。",
+    "sig-quantization": "INC（AutoRound）添加 MXFP8 线性层支持——per-token 输入、channelwise 权重的 MXFP8 量化 scheme，经 `test_auto_round.py` 验证。",
+    "sig-spec-decode": "CPU Qwen3.5 GDN 推测解码优化——AMX 可用时用 cpp conv1d 替代 fallback torch 路径，MTP 场景性能提升。",
+    "other": "NVFP4 GEMM kernel 选择与 Marlin weight-only fallback 文档——说明 load time 自动选择、无原生 FP4 GPU 回退 Marlin（W4A16）并 log warning、`--linear-backend` 覆盖 deprecated `VLLM_NVFP4_GEMM_BACKEND`。"
   },
   "commits": [
     {
@@ -72,6 +77,342 @@
       "sig_reason": "KV offload 持久化缓存 dtype 命名空间隔离修复。",
       "tags": ["bugfix", "high-risk", "kv-offload", "cache-dtype"],
       "pr_number": 49438
+    },
+    {
+      "sha": "04502deca2f66b874d0fceae446c668c987413c0",
+      "comment": "**背景**：视频请求此前对完整解码帧缓冲做哈希，而图像已对压缩源字节哈希。长视频解码帧可达数百 MB，哈希开销显著。\n**方法**：取源字节与解码帧的较小者加采样元数据做哈希，按字节数比较选择更小缓冲区，与硬件无关。\n**效果**：8 帧 854x480 哈希从 2.3ms 降至 0.08ms；32 帧 1080p 从 43ms 降至 0.24ms；长视频自动选 decoded 路径避免 source-only 回退。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态视频哈希性能优化。",
+      "tags": ["performance", "low-risk", "multimodal", "video-hash"],
+      "pr_number": 49607
+    },
+    {
+      "sha": "d2ca3002d93314a08bbddf9c6eb6ee78b1343407",
+      "comment": "**背景**：MRV2 在所有活跃请求均为 no-op 采样（temperature 0 或 1、top-k 等于 vocab 大小、top-p 为 1、无 penalties/biases）时仍将 logits materialize 为 FP32，batch=128 vocab=152K 时每步浪费 74.2MB。\n**方法**：添加 no-op fast path 直接返回原始 logits 张量，保留现有 FP32 路径供需要处理的请求使用。\n**效果**：避免 no-op 场景下 FP32 张量 materialization 及相关拷贝内核和内存流量。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 采样路径性能优化。",
+      "tags": ["performance", "low-risk", "mrv2", "sampling"],
+      "pr_number": 47711
+    },
+    {
+      "sha": "27d7061ef62b3d853b4d335baf8ea9b3c56d9bf3",
+      "comment": "**背景**：#49153 重构后 `JinaRankingIOProcessor.get_request_factory_online` 将 `ctx.request` 替换为仅含 `task` 和 `input` 的 proxy，`truncate_prompt_tokens`/`truncation_side` 默认 None，真实请求的截断值从未被读取，超长 Jina prompt 被拒为 HTTP 400。\n**方法**：在 Jina scoring proxy 中补传 `truncate_prompt_tokens`/`truncation_side`，与同一 PR 中 embed proxy 一致。\n**效果**：恢复 Jina rerank/score 在线路径的 prompt 截断功能。",
+      "sig": "sig-core",
+      "sig_reason": "Jina rerank/score 在线路径截断参数回归修复。",
+      "tags": ["bugfix", "medium-risk", "pooling", "jina"],
+      "pr_number": 49963
+    },
+    {
+      "sha": "ef9975d021448b99a5408e8c78a4c4f6b63443c7",
+      "comment": "**背景**：DiffusionGemma 的 canvas state 仅由末 PP rank 的 sampler 推进，但所有 rank 均读取它做 forward 输入，而 generic PP 路径仅广播 token id，导致非末 rank 读到陈旧 canvas。\n**方法**：移除 `SupportsPP` 接口使 DiffusionGemma 在 PP>1 时启动即 fast fail。\n**效果**：PP=2 快速 `ValueError` 不再 warmup 崩溃；PP=1 不变。",
+      "sig": "sig-core",
+      "sig_reason": "DiffusionGemma PP 不兼容的 fail-fast 防护。",
+      "tags": ["bugfix", "low-risk", "diffusion", "pipeline-parallel"],
+      "pr_number": 45828
+    },
+    {
+      "sha": "56c96b0d91f05140b61a2005c222d83e9ec042db",
+      "comment": "**背景**：Router GEMM 是 MoE 推理中昂贵的 kernel，#42562 引入了 cuteDSL 通用实现，但默认配置未针对关键模型调优。\n**方法**：为 SM100F 和 SM90 添加架构级调优表，覆盖 DSv4-Flash `(4096,256)`、GLM5.2 `(6144,256)`、DSv3.2 `(7168,256)`、DSv4-Pro `(7168,384)` 四种 router shape，使用模型推导的 warmup shape 替代静态列表。\n**效果**：关键 router shape 上 e2e 性能提升。",
+      "sig": "sig-model-performance",
+      "sig_reason": "MoE router GEMM 内核调优。",
+      "tags": ["performance", "low-risk", "router-gemm", "moe"],
+      "pr_number": 48774
+    },
+    {
+      "sha": "59a6b0411d1817c712728a17fa8c2e0cdb4cf1f9",
+      "comment": "**背景**：#30739 添加了无 EP 的 DP 支持，但 coordinator 的引擎队列 stats 未实际发布，导致 rank 间严重负载不均衡。\n**方法**：在 `EngineCoreProc` 超类中也调用 `_maybe_publish_request_counts`；Python 侧将 KV cache usage 纳入等待/运行队列计数权重。\n**效果**：修复 #48808 负载不均衡问题。",
+      "sig": "sig-core",
+      "sig_reason": "内部负载均衡器 stats 发布与权重修复。",
+      "tags": ["bugfix", "medium-risk", "load-balancing", "dp"],
+      "pr_number": 49204
+    },
+    {
+      "sha": "dbccc5ae328d7b9168bc33b278a9125cfd89cc69",
+      "comment": "**背景**：Qwen3.5 此前硬编码禁用 EVS（Efficient Video Sampling）。\n**方法**：移除硬编码禁用，启用 Qwen3.5 EVS。\n**效果**：75% 视频剪枝率下精度仅降 0.9%，TTFT 降低 31.8%，与 Qwen3-VL-8B 表现相当。",
+      "sig": "sig-core",
+      "sig_reason": "Qwen3.5 模型 EVS 视频采样启用。",
+      "tags": ["feature", "low-risk", "qwen3.5", "evs"],
+      "pr_number": 48912
+    },
+    {
+      "sha": "a89015c6df8eeb37a843b717c97a5be1355de83d",
+      "comment": "**背景**：`merge_attn_states_kernel` 的 `prefill_tokens_with_context` 为 `tl.constexpr`，该值随 chunked-prefill batch 变化，每个不同值触发新的 Triton JIT 特化编译。\n**方法**：将 `prefill_tokens_with_context` 从 `tl.constexpr` 改为运行时参数，该值仅用于 `prefix_mask = token_idx < prefill_tokens_with_context` 不影响张量形状。\n**效果**：消除 per-value Triton 重编译；gfx1100 上 12 个不同值的正确性验证通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Triton kernel 编译特化减少。",
+      "tags": ["performance", "low-risk", "triton", "merge-attn"],
+      "pr_number": 48739
+    },
+    {
+      "sha": "96fa3f42c95acc75f40a8fddbc3a621c2355a30d",
+      "comment": "**背景**：`_warmup_ll_bf16_router_gemm()` 初始化仅 MoE 模型使用的 router GEMM kernel，但此前在所有 Hopper/Blackwell GPU 上对任意模型类型执行，dense 模型引入不必要启动开销。\n**方法**：添加 `is_moe` 检查，仅当加载的模型为 MoE 时执行 router GEMM warmup。\n**效果**：Qwen3-0.6B kernel warmup 时间从 70.87s 降至 0.32s；MoE 模型行为不变。",
+      "sig": "sig-model-performance",
+      "sig_reason": "非 MoE 模型跳过不必要 router GEMM warmup。",
+      "tags": ["performance", "low-risk", "warmup", "moe"],
+      "pr_number": 49659
+    },
+    {
+      "sha": "81962bb6995eaebd1e49998c2a91c9e01e24da27",
+      "comment": "**背景**：在无对称内存 multicast 支持的拓扑上，FlashInfer 可构造 `mc_ptr` 为 null 的 MNNVL allreduce workspace，vLLM 将其视为已初始化并传入 fused allreduce kernel，解引用 null multicast 映射导致 CUDA illegal memory access。\n**方法**：workspace 创建后立即校验 `mc_ptr`，销毁无效 workspace 返回 None，使现有 backend 选择回退 TRTLLM 或安全禁用 fusion。\n**效果**：修复 #49041 CUDA 非法内存访问。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "FlashInfer MNNVL workspace null 指针防护。",
+      "tags": ["bugfix", "high-risk", "flashinfer", "mnnvl"],
+      "pr_number": 49043
+    },
+    {
+      "sha": "92e8518d376c3c9a6979da4d56ee6263ef6af630",
+      "comment": "**背景**：Transformers modelling backend 的 `fx` tracer 此前用手工规则推断 `len`/`rank`，`vllm_attention_forward` 会提前终止 trace 使图无法到达模块输出，`QKVFuser` 无法可靠识别 `o_proj`。\n**方法**：改用 meta tensor 追踪（`len`/迭代/`.shape` 来自 PyTorch meta kernel）、attention 接口记为 opaque leaf call、`past_key_values=None` 无 `**kwargs`、`QKVFuser` 按返回值识别 `o_proj`、fuser cache 以 child names + class 为键、匹配 fuser 无法 rewrite 时尝试下一个。新增 `fx_utils` 辅助函数。\n**效果**：trace 可到达模块输出，fuser 识别更准确。",
+      "sig": "sig-core",
+      "sig_reason": "模型融合 tracer 基础设施改进。",
+      "tags": ["refactor", "medium-risk", "fx-tracer", "fusion"],
+      "pr_number": 49957
+    },
+    {
+      "sha": "77cba0259f21dfc6f4f6298f54f3e43c9cc824c3",
+      "comment": "**背景**：KV cache offloading 此前无法按请求指定从哪些 secondary tier 加载。\n**方法**：新增 `Medium` 枚举（CPU/STORAGE）、`TierMatcher`（optional medium + locality）、`TierFilter` 的 `allows()` 仅过滤 secondary tier（primary 始终参与）、`_parse_tier_filter()` 校验请求参数。`MEDIUM_STORAGE` 线常量替代 `MEDIUM_FS`/`MEDIUM_OBJ`，`Locality` 枚举加入 `SecondaryTierManager` 基类。\n**效果**：437 项 tiering/offload/connector 测试全部通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload per-request tier 过滤机制。",
+      "tags": ["feature", "medium-risk", "kv-offload", "tiering"],
+      "pr_number": 48123
+    },
+    {
+      "sha": "30fbd055379ce4c5f26fcece6cfc90c5d8596f59",
+      "comment": "**背景**：ROCm Triton 的 ReplaySSM kernel 传入了 CUDA-only 的 `tf32x3` dot precision，ROCm 不支持该值。\n**方法**：让 ROCm 使用 backend 默认 dot precision，CUDA 保留 tf32x3；将 ROCm Mamba kernel 组从 MI250 移至 MI300 以确保默认 ROCm 路径被执行。\n**效果**：ROCm ReplaySSM 使用原生 dot precision，CI 覆盖 MI300 路径。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm Triton dot precision 修正与 CI 覆盖调整。",
+      "tags": ["bugfix", "low-risk", "rocm", "triton"],
+      "pr_number": 49909
+    },
+    {
+      "sha": "0906123953a5a253cc0cc4f26e548ca08ece102a",
+      "comment": "**背景**：Inkling 模型此前未在 ROCm 上启用，且 mxfp4 高效变体无加载路径。\n**方法**：首个 ROCm inkling enablement PR，支持 mxfp4 权重（`lightseekorg/Inkling-MXFP4`），使用 AITER + `inkling` tokenizer mode，支持 tokenspeed kernel。\n**效果**：GSM8K 95.83%（page 128），BFCL 78.76%（与 vLLM blog 78.61% 相当），benchmark 时间 -22.47%。",
+      "sig": "sig-core",
+      "sig_reason": "Inkling 模型 ROCm mxfp4 enablement。",
+      "tags": ["feature", "medium-risk", "inkling", "rocm", "mxfp4"],
+      "pr_number": 48841
+    },
+    {
+      "sha": "bc3629b1c4760f7260d41a67e38ff460edbe22d7",
+      "comment": "**背景**：MI350/gfx950 上 torchao <=0.17.0 的 `Float8DynamicActivationFloat8WeightConfig` 仅允许 `is_sm_at_least_89()` 或 `is_MI300()`，gfx950 均不满足，三项 torchao 测试失败。torchao 0.18.0 添加了 `is_MI350()` 但尚未发布。\n**方法**：在 gfx950 上当 torchao <0.18.0 时跳过这三项测试。\n**效果**：gfx950 CI 不再因 torchao 版本限制失败；MI300 CI 不受影响。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm gfx950 torchao 版本兼容性测试跳过。",
+      "tags": ["test", "low-risk", "rocm", "torchao"],
+      "pr_number": 49732
+    },
+    {
+      "sha": "312ea82e758a27a333e4254cc7669ae1a5d7c69e",
+      "comment": "**背景**：ROCm CI 的 hf-xet 高性能 vectored reconstruction 在共享 NFS 上导致 POSIX lock 失败。\n**方法**：保持 Xet 和持久 Hub cache 启用，将临时 Xet state 移至本地存储；仅当 `HF_HOME` 为 NFS 挂载时禁用 vectored reconstruction。\n**效果**：NFS 环境下 hf-xet reconstruction 安全运行。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI hf-xet NFS 兼容性修复。",
+      "tags": ["ci", "low-risk", "rocm", "nfs"],
+      "pr_number": 49837
+    },
+    {
+      "sha": "394beb633b0b5b5d68aed3d2f2b5c1477e756d80",
+      "comment": "**背景**：ROCm Triton 路径直接加载裸 shared-mmap host pointer 做 CPU-to-GPU KV 传输，在 Triton descriptor 阈值之上的首个 case 触发 fault，故障地址匹配 mmap base + block offset。\n**方法**：将 ROCm 加入现有 XPU batch-DMA fallback 路径，CUDA/XPU 及其他 dispatch path 不变。\n**效果**：ROCm CPU KV cache 加载使用 batch DMA 避免 raw pointer 解引用。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "ROCm CPU KV cache 传输 batch DMA 修复。",
+      "tags": ["bugfix", "medium-risk", "rocm", "kv-offload"],
+      "pr_number": 49843
+    },
+    {
+      "sha": "7f599d78546819948c32f2b23d913507bbb38875",
+      "comment": "**背景**：cudagraph 模式下 `flag_color` 被 graph 固定，每轮写入的 flag 值重复，等待方误将残值视为当前轮信号提前获取，此时数据尚未传输完毕，读到旧数据导致错误。\n**方法**：修复 `flag_color` 在 cudagraph 模式下的累加错误，确保每轮 flag 值可区分。\n**效果**：cudagraph 模式下 quickreduce 不再因 flag 混淆读到旧数据。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm quickreduce cudagraph 模式累加正确性修复。",
+      "tags": ["bugfix", "high-risk", "rocm", "quickreduce", "cudagraph"],
+      "pr_number": 46913
+    },
+    {
+      "sha": "eb290ab673c8f3ff87648cd8e4cd60f50fe7b301",
+      "comment": "**背景**：CPU AMX grouped-gemm MoE kernel 以 32 宽 block tile expert intermediate 维度，`moe_intermediate_size // tp_size` 非 32 倍数时静默回退到 per-expert Python 循环（`cpu_fused_moe_torch`），`tp=4` 吞吐反而低于 `tp=2`。\n**方法**：在 prepacking 前 zero-pad per-partition MoE intermediate 到 32 倍数，padding 插入 gate/up 块之间（非末尾），swigluoai 交错布局跳过。\n**效果**：`tp=4` 不再静默回退；gemma-4-26B-A4B `tp=4` 性能正确高于 `tp=2`。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CPU MoE grouped-gemm TP 对齐修复。",
+      "tags": ["bugfix", "medium-risk", "cpu", "moe"],
+      "pr_number": 49591
+    },
+    {
+      "sha": "cbc3a872005d595493b546acf46f94a9c9f68cbb",
+      "comment": "**背景**：tokenizer backend 解析在 config 加载之后，双格式仓库可能选错 tokenizer 类。\n**方法**：在加载 config 前解析 tokenizer backend，对 HF-backed tokenizer 请求 HF config；保留 Mistral auto-detection。\n**效果**：防止双格式仓库选择错误 tokenizer 类。",
+      "sig": "sig-core",
+      "sig_reason": "tokenizer backend 解析时序修正。",
+      "tags": ["bugfix", "low-risk", "tokenizer"],
+      "pr_number": 49907
+    },
+    {
+      "sha": "afc94523c965a61bd6869287c798b2a45f2c205e",
+      "comment": "**背景**：InputBatch V2 测试硬编码 CUDA device，XPU 平台无法运行。\n**方法**：改用 `platform.current_device()` 替代硬编码 CUDA。\n**效果**：XPU CI 可运行该测试。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU 测试 device 硬编码修复。",
+      "tags": ["test", "low-risk", "xpu"],
+      "pr_number": 49939
+    },
+    {
+      "sha": "8061dc26bd0b37a2ad58068b99d072be5a0e5f47",
+      "comment": "**背景**：DeepSeek V4 config 用 `0` 表示未压缩/SWA-only 层，runtime attention 用 `max(1, ratio)` 转换，但 `BuildPrefillChunkMetadataKernel.get_warmup_keys()` 使用原始 config 值，生成 `COMPRESS_RATIO=0` 特化导致整数除零，Triton 编译失败。\n**方法**：warmup key 生成时同样应用 `max(1, ratio)` 归一化。\n**效果**：Intel GPU 上 DeepSeek-V4-Flash FP8 TP8 不再 `PassManager::run failed`；新增 `[0,0,4,128,0]` 回归测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "sparse MLA warmup 压缩比归一化修复。",
+      "tags": ["bugfix", "medium-risk", "sparse-mla", "deepseek-v4"],
+      "pr_number": 49392
+    },
+    {
+      "sha": "fd9d2ede6fa05313e4a7482c5edb88bf8c565230",
+      "comment": "**背景**：Python 解析 `--max-model-len auto` 为 `-1` 哨兵并传入 Rust 前端 JSON args，`SharedRuntimeArgs` 将该字段建模为 `Option<u32>`，serde 拒绝 `-1` 导致前端无法启动。\n**方法**：将 `max_model_len` 从 `SharedRuntimeArgs` 移至 `ManagedEngineArgs`（仅 `vllm-rs serve` 需要），转发原始字符串不做 Rust 侧校验。\n**效果**：`--max-model-len auto` 不再阻塞 Rust 前端启动。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 max-model-len 参数归属修正。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "args"],
+      "pr_number": 49944
+    },
+    {
+      "sha": "e09900436ca2c531e980827cea2e6eaad625ae00",
+      "comment": "**背景**：ROCm kernel 测试运行时间长。\n**方法**：收集时过滤不支持的 fused RMSNorm 参数、GPU setup 前跳过不支持的 FP8 scaling module；MI300 kernel-core 覆盖三路分片，Transformers Processing 并行度从 4 增至 8。\n**效果**：ROCm kernel 测试运行时缩减。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm kernel 测试运行时优化。",
+      "tags": ["ci", "low-risk", "rocm", "test-runtime"],
+      "pr_number": 49915
+    },
+    {
+      "sha": "5d07e268b11ae0240d3af2582516861dfe52e86a",
+      "comment": "**背景**：INC（AutoRound）此前不支持 MXFP8 线性层。\n**方法**：添加 MXFP8（per-token 输入、channelwise 权重）量化 scheme，经 `test_auto_round.py` 验证 config 接受/拒绝逻辑和 scheme 解析委托。\n**效果**：Qwen3-8B-MXFP8-AR 可正常推理。",
+      "sig": "sig-quantization",
+      "sig_reason": "INC MXFP8 线性层量化支持。",
+      "tags": ["feature", "medium-risk", "mxfp8", "auto-round"],
+      "pr_number": 47514
+    },
+    {
+      "sha": "d74285661064541f12be14e49a16defa27de67c6",
+      "comment": "**背景**：prompt 在 shared block 边界前结束时，partial-tail marker 仅在后续分配触发 CoW 时才成为 offload handoff；`max_tokens=1` 的请求不再分配，marker 被丢弃，后续 consumer 必须重算可共享的 tail。\n**方法**：在创建 partial-tail handoff 的调度步即时 flush，携带精确快照边界；pin off-table Mamba CoW 块直到 connector 延迟 free 完成；从 durable offset 到 boundary 持久化每个 cache group。producer-only work 受 connector 可用性 gating，压力下 fail closed。\n**效果**：sub-block prompt 可复用缓存状态不触发无效远程加载；`max_tokens=1` 场景正确 offload。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "sub-block prompt partial-tail KV offload 可靠性修复。",
+      "tags": ["feature", "high-risk", "kv-offload", "partial-tail"],
+      "pr_number": 49502
+    },
+    {
+      "sha": "544cb724c888dda1eff06a02cb0baca783c3dd86",
+      "comment": "**背景**：CPU 上 Qwen3.5 GDN 推测解码使用 fallback torch conv1d 路径，性能不佳。\n**方法**：AMX 可用时用 cpp conv1d 实现替代 fallback torch 路径。\n**效果**：MTP 推测解码场景 CPU 性能提升。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "CPU 推测解码 GDN conv 路径优化。",
+      "tags": ["performance", "low-risk", "cpu", "spec-decode", "gdn"],
+      "pr_number": 48577
+    },
+    {
+      "sha": "c314af1abfddff7b6cce9af578be72c496c6a5e4",
+      "comment": "**背景**：Arm CPU 上此前无 INT8 fused MoE kernel，W8A8 MoE checkpoint 无法高效运行。\n**方法**：新增 INT8 grouped-gemm MoE kernel（复用 bf16 kernel 结构），添加 AdvSIMD `smmla` GEMM micro kernel。\n**效果**：gpt-oss/qwen3-30b-a3b/gemma4-26b-a4b 上 ~1.9x 快于 bf16 kernel。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Arm CPU INT8 fused MoE kernel 新增。",
+      "tags": ["feature", "medium-risk", "cpu", "arm", "int8-moe"],
+      "pr_number": 48637
+    },
+    {
+      "sha": "f19ee27e39b20564109c124c40d8544cc1df24cc",
+      "comment": "**背景**：PowerPC CPU 上 `expf` 计算未向量化，attention kernel 性能受限。\n**方法**：通过 VSX 向量化实现 `DEFINE_FAST_EXP`（`FAST_EXP`）。\n**效果**：CPU attention 微基准 1.21x（17.4% 更快），granite-3.1-8b e2e 吞吐 +4.5%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "PowerPC VSX 向量化 exp 优化。",
+      "tags": ["performance", "low-risk", "powerpc", "vsx"],
+      "pr_number": 49571
+    },
+    {
+      "sha": "5f89a03dcb52702a62644e15b93f766765d06b28",
+      "comment": "**背景**：推测解码测试中多个参数化引擎未在下一个启动前关闭，导致资源泄漏。\n**方法**：通过 `VllmRunner` context 运行 speculative max-length cases 确保每个参数化引擎在下一个启动前关闭；显式保留 direct LLM settings。\n**效果**：推测解码测试资源泄漏修复。",
+      "sig": "sig-ci",
+      "sig_reason": "推测解码测试 runner teardown 修复。",
+      "tags": ["test", "low-risk", "spec-decode", "test-teardown"],
+      "pr_number": 49910
+    },
+    {
+      "sha": "53397fbfac4dcd421b9d467199068518b135bc34",
+      "comment": "**背景**：`OffloadingConnector` P2P secondary tier 下，请求重连到刚被 reaped 的 peer 时 `EngineCore` 崩溃（`AssertionError: ZmqConnection to <peer>:7777 already exists`）。三重缺陷在同一路径上：①dead connection 残留在 `ZmqTransport._connections`；②`mark_dead()` 和 `close()` 共享 `_closed` flag，`close()` 泄漏 DEALER+monitor socket；③`attach_connection()` announce 在 dead connection 被清扫前入队丢失。\n**方法**：分别修复三个缺陷——`_reap_dead_sessions` 清理 transport 条目、`mark_dead` 使用独立 flag、poll 顺序调整使 `attach` 消息不丢失。\n**效果**：P2P peer 重连不再崩溃；修复 #49809。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "P2P KV offload peer 重连三重缺陷修复。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "p2p"],
+      "pr_number": 49823
+    },
+    {
+      "sha": "49f31d7cee425a6d38f8c5bc76877986daf832ed",
+      "comment": "**背景**：ROCm vllm_c RMSNorm 在输入有 transposed strides 时输出不连续，VibeVoice singleton-batch 布局受影响。\n**方法**：输入有 transposed strides 时分配连续输出。\n**效果**：VibeVoice 布局正确；新增 IR 回归用例。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm vllm_c RMSNorm 输出连续性修复。",
+      "tags": ["bugfix", "low-risk", "rocm", "rmsnorm"],
+      "pr_number": 49913
+    },
+    {
+      "sha": "74d3b799e193756a8d42b59d223e38a39fc6be55",
+      "comment": "**背景**：`hc_prenorm_gemm_block_m_tilelang` 中 `T.alloc_var(init=0.0)` 在 unrolled i_m 循环内声明，被提升为仅初始化一次，跨行 reduction 累加器在 block 内行间串扰：每个奇数输出行（及 sqrsum）是两行之和。该 kernel 在 `num_tokens >= 1024` 时被选择，DeepSeek-V4 mHC prefill 在非 DeepGEMM 路径下对奇数 token 产生损坏。\n**方法**：改用 per-row locals 替代被提升的累加器。\n**效果**：B200 上验证奇数行修复前 = ref(even)+ref(odd)，修复后全部 `test_mhc_kernels.py` 用例通过。",
+      "sig": "sig-core",
+      "sig_reason": "mHC prenorm GEMM 跨行累加正确性修复。",
+      "tags": ["bugfix", "high-risk", "mhc", "prenorm-gemm"],
+      "pr_number": 49429
+    },
+    {
+      "sha": "29fdeab2548fdb5cd61ec3613e5e72200c695ef0",
+      "comment": "**背景**：Intel GPU CI 测试覆盖不足。\n**方法**：在 benchmarks、engine、model_executor、model_runner_v2、samplers 五个 Intel CI 配置中添加更多测试用例。\n**效果**：Intel GPU CI 测试覆盖扩大。",
+      "sig": "sig-ci",
+      "sig_reason": "Intel GPU CI 测试用例扩展。",
+      "tags": ["ci", "low-risk", "xpu", "intel"],
+      "pr_number": 49422
+    },
+    {
+      "sha": "ff6173997d54c5027971df8ecd1280f046a832b3",
+      "comment": "**背景**：Moonshot Kimi 模型在仓库中有 22 个文件覆盖但无标签覆盖，不同于 `gpt-oss`/`rocm`/`nvidia` 等。\n**方法**：在 `mergify.yml` 添加 `label-kimi` 和临时 `label-k3` 规则，在 `issue_autolabel.yml` 添加匹配条目；路径模式用 `(?i)kimi`/`(?i)moonshot` 全路径匹配（而非 dir-scoped `.py`-only，后者漏 7/22 文件）。\n**效果**：Kimi/K3 PR 和 issue 自动标签覆盖。",
+      "sig": "sig-ci",
+      "sig_reason": "Kimi/K3 模型自动标签规则。",
+      "tags": ["chore", "low-risk", "labeling", "kimi"],
+      "pr_number": 49895
+    },
+    {
+      "sha": "8de50e46d4a0a227db1888410cb6ac93058fb6cf",
+      "comment": "**背景**：用户遇到 NVFP4 慢性能时无文档解释 GEMM kernel 选择逻辑。\n**方法**：在 ModelOpt 量化文档中添加说明：load time 自动选择基于 GPU 支持、无原生 FP4 GPU 回退 Marlin（W4A16）并 log warning、`--linear-backend` 覆盖替代 deprecated `VLLM_NVFP4_GEMM_BACKEND`。\n**效果**：NVFP4 kernel 选择有文档参考。",
+      "sig": "other",
+      "sig_reason": "NVFP4 量化 kernel 选择文档。",
+      "tags": ["docs", "low-risk", "nvfp4", "quantization"],
+      "pr_number": 49376
+    },
+    {
+      "sha": "da99ffcc13362ab446a22a9bc6ed36c4c14942e3",
+      "comment": "**背景**：ROCm CI native datasets cache 在共享 NFS 上导致 POSIX lock 失败。\n**方法**：持久 Hub blobs 保留在 `HF_HOME`，处理后的 Datasets cache 放入 pod 本地存储。\n**效果**：避免 NFS POSIX lock 失败。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI datasets cache NFS 隔离。",
+      "tags": ["ci", "low-risk", "rocm", "nfs"],
+      "pr_number": 49516
+    },
+    {
+      "sha": "8040ef242662af2f07614d78862c53338f046878",
+      "comment": "**背景**：`stream_interval` 此前仅作为服务器启动参数配置，工作负载无法在请求级动态调整交互性与吞吐优先级。\n**方法**：将 `stream_interval` 暴露为请求级采样参数。\n**效果**：交互敏感工作负载可用更短 interval，吞吐/批处理工作负载可用更长 interval。",
+      "sig": "sig-core",
+      "sig_reason": "stream_interval 请求级参数暴露。",
+      "tags": ["feature", "low-risk", "streaming", "sampling-params"],
+      "pr_number": 49754
+    },
+    {
+      "sha": "bf4f633b4cb80e04ba28d2179efe1662d97a6fe0",
+      "comment": "**背景**：XPU 上 QK Norm + RoPE fusion pass 未启用。\n**方法**：在 XPU 平台启用 `enable_qk_norm_rope_fusion` 编译 pass。\n**效果**：Qwen3-8B 上 +11.7% 吞吐、-10.5% 时长 vs fusion_off，与 eager baseline 一致；GSM8K 精度无回归。",
+      "sig": "sig-model-performance",
+      "sig_reason": "XPU QK Norm+RoPE 融合 pass 启用。",
+      "tags": ["performance", "low-risk", "xpu", "fusion"],
+      "pr_number": 49394
+    },
+    {
+      "sha": "854c33f3801241574223644d25f80fbd735a44e5",
+      "comment": "**背景**：全局 GPU memory cleanup fixture 在 ROCm CI 中默认启用，但 function-scoped cleanup 无法释放更长生命周期的 fixture。\n**方法**：要求 `VLLM_TEST_CLEAN_GPU_MEMORY=1` 才启用全局 cleanup fixture；保留 #49242 的 Qwen-VL 和 Nixl 定向 teardown。\n**效果**：ROCm CI 不再因全局 cleanup 与 fixture 生命周期冲突而泄漏内存。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 全局 GPU memory cleanup 改为 opt-in。",
+      "tags": ["ci", "low-risk", "rocm", "test-cleanup"],
+      "pr_number": 49911
+    },
+    {
+      "sha": "ac87549cbdff37f06c93f96f94005331772f2297",
+      "comment": "**背景**：ROCm V1 attention 测试运行时间长。\n**方法**：将 V1 attention 从 MI250 移除，MI300 和 MI355 覆盖拆分为两个 pytest shard；收集时分类不支持的 MLA prefill 组合并包含 ROCm AITER FA prefill adapter。\n**效果**：ROCm V1 attention 测试运行时缩减。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm V1 attention 测试分片与运行时缩减。",
+      "tags": ["ci", "low-risk", "rocm", "test-runtime"],
+      "pr_number": 49916
+    },
+    {
+      "sha": "439f336212227833e126526d3c5f3ef3968dfbf5",
+      "comment": "**背景**：MRV2 `mamba_hybrid.py` 中存在不必要的 GPU<->CPU 同步。\n**方法**：修复四处 GPU<->CPU sync 点。\n**效果**：减少 MRV2 mamba hybrid 路径的同步开销。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 mamba hybrid GPU<->CPU 同步修复。",
+      "tags": ["performance", "low-risk", "mrv2", "mamba"],
+      "pr_number": 49736
     }
   ]
 }
