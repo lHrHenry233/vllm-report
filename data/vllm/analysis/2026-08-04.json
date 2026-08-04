@@ -1,0 +1,233 @@
+{
+  "date": "2026-08-04",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-04T20:00:00+08:00",
+  "daily_summary": "当日 27 条变更，覆盖 MRV2、前端、内核优化、ROCm 和 disaggregated serving 等方向。MRV2 进展显著：启用 routed-experts capture、修复 pipeline-parallel hybrid Mamba int32 映射、修复 Gemma3 pooling 路径。前端新增请求级 session_id 全链路贯通和 gRPC stop strings 校验。内核方面 CuTe DSL skinny GEMM 扩展至 GLM-5.2，Triton windowed prefill 从 O(seq^2) 降为 O(seq*window)。ROCm 方面启用 GFX120x AITER FP8/attention 路径、修复 AITER MoE routing memory access fault、清理 Kimi-K3 MoE 环境变量。disaggregated serving 方面 MoRI-IO 扩展至多 pod cross-pod Wide-EP，NIXL 新增 P/D speculative 配置兼容性校验。",
+  "sig_summaries": {
+    "sig-core": "MRV2 启用 routed-experts (R3) capture（#50721），修复 pipeline-parallel hybrid Mamba int32 mapping 导致 `index_fill_` 失败（#50327），修复 Gemma3 `intermediate_tensors` 无默认值导致 pooling 启动失败（#50777）。前端新增请求级 `session_id` 贯穿 Python/Rust 全链路（#48048），gRPC 层拒绝空 stop strings（#50746）。修复 kimi_k3 reasoning parser 未覆写 `is_reasoning_end_streaming` 导致每解码步 O(上下文长度) 扫描（#50886）。修复 MRv2 align prefix cache 中 `num_accepted` 跨层读写竞争（#50432）。重构 hybrid Mamba postprocess H→D staging 为单循环（#48120）。修复 `UniformTypeKVCacheSpecs` 未 DCP 分片 block table 宽度（#50823）。ROCm gfx12 启用 AITER FP8 和 attention 快速路径（#43615）。",
+    "sig-model-performance": "CuTe DSL skinny GEMM 扩展至 GLM-5.2，添加编译期 K 特化和 FP32 累加，`qkv_a`/`q_b`/MTP `eh` 在 decode M=1-3 时使用 CuTe DSL（#49791）。H20 新增 `E=256,N=512` tuned MoE kernel 配置用于 Qwen3.5-35B-A3B（#48825）。Triton windowed prefill 跳过完全 masked key block，从 O(seq_len^2) 降为 O(seq_len*window)（#50776）。ROCm AITER MoE routing hotfix 修复 padding 行 inf/nan 导致的 memory access fault（#50859）。Kimi-K3 AttnRes dispatch 强制 packed rows 和 op 存在性检查（#50567）。Kimi-K3 AITER MoE 环境变量重命名并缓存，消除 per-forward env 读取（#50582）。",
+    "sig-large-scale-serving": "MoRI-IO KV connector 从单 pod 1P1D 扩展到多 pod 2P2D cross-pod Wide-EP（DP=EP=16, TP=1），修复跨 pod engine-id 碰撞和 EP all2all 挂起（#45043）。NIXL connector 在 handshake 阶段验证 P/D speculative 配置兼容性，拒绝仅一方启用 model-based spec decode 的情况，兼容性版本升至 6（#49230）。",
+    "sig-ci": "修复 `test_store_orders_after_compute_write` flaky 测试——排空 compute stream 残留 kernel（#50926）。ROCm Jina v5 nano MTEB 测试改用 BF16 避免 FP16 数值漂移（#50917）。FlashKDA 迁移到 PyTorch stable ABI（#50818）。修复 AITER MXFP4 oracle 测试的激活配置和权重重用问题（#50728）。ROCm CI 导出 Helion benchmark 脚本到 test artifacts（#50726）。",
+    "sig-omni": "修复 Qwen3-Omni 无音轨视频在 `use_audio_in_video=True` 时崩溃——回退为 `False` 避免 HF processor `StopIteration`（#48420）。修复 `encode_{audio,image,video}_url` 在未注册格式扩展名时生成无效裸顶级 media type，改为 `<kind>/<format>`（#49056）。",
+    "sig-spec-decode": "ModelRunner V2 恢复 multimodal draft capability detection——添加 `SupportsMultiModalEmbeddings` protocol 分离 target model 产生 multimodal embedding 的能力与 drafter 消费能力，移除 Inkling model-type hack（#50417）。",
+    "sig-quantization": "修复 NVFP4 (ModelOpt FP4) 量化 linear 方法 `out_dtype` 使用 `torch.get_default_dtype()`（默认 float32）而非模型配置 dtype，导致 LoRA `lora_shrink` kernel dtype 断言失败（#48861）。"
+  },
+  "commits": [
+    {
+      "sha": "adbf08d977fb3fa26c4f19826745a02abd6dd7ca",
+      "comment": "**背景**：`KimiK3ReasoningParser` 未覆写 `is_reasoning_end_streaming`，继承基类实现——丢弃 `delta_ids` 并从整个序列重新推导。`is_reasoning_end` 对 `request.all_token_ids` 执行两次反向子序列扫描，每个探测位置分配两个列表且不提前退出。调度器在每个解码步对每个仍在 think channel 中的结构化输出请求调用一次，位于 `execute_model(N)` 和 `sample_tokens(N)` 之间的 EngineCore 主线程中，GPU 空闲时间随上下文增长。\n**方法**：覆写 `is_reasoning_end_streaming` 仅检查步新增 token 加 `len(marker) - 1` 个 carry-over token；将 `is_reasoning_end` 两次完整扫描合并为一次反向遍历，在遇到首个 marker 时停止，不再为每个探测位置分配列表。\n**效果**：将 reasoning-end 检查从 O(上下文长度) 降为 O(delta)，消除长 agentic 回合中的主机瓶颈。",
+      "sig": "sig-core",
+      "sig_reason": "kimi_k3 reasoning parser 在 EngineCore 主线程的解码路径性能修复。",
+      "tags": ["bugfix", "high-risk", "reasoning-parser", "kimi-k3"],
+      "pr_number": 50886
+    },
+    {
+      "sha": "385d4c084ef0c52fe0f7baf7dd2dc4bf86fbe548",
+      "comment": "**背景**：AITER 从 `0.1.16.post5` 升级到 `0.1.19` 后，triton MoE routing 开始错误处理包含 `inf`/`-inf`/`nan` 的 token 行——这在 vLLM HIP Graph padding 场景下出现（如 `tokens_unpadded=7`, `tokens_padded=8`，最后一行为无意义填充数据）。Graph replay 时 padding 行导致 `memory access fault`，`test_gpt_oss_attention_quantization` 测试失败。\n**方法**：在 vLLM 侧添加 hotfix 处理 AITER triton MoE routing 对 inf/nan 行的错误行为。companion AITER fix（ROCm/aiter#4530）合并后此修复将冗余。\n**效果**：恢复 ROCm gpt-oss MoE 量化测试通过；AITER pin 更新后可移除。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm AITER triton MoE routing kernel 在 padding 行的 memory access fault 修复。",
+      "tags": ["bugfix", "medium-risk", "rocm", "aiter", "moe"],
+      "pr_number": 50859
+    },
+    {
+      "sha": "74295e3bd47b64964fe6a51825079e75c84cc172",
+      "comment": "**背景**：`test_store_orders_after_compute_write` 中，no-barrier 控制阶段在 compute stream 上留下约 800ms 的 sleep+fill kernel 积压。这些残留 fill 与 barrier 阶段的 fill->copy 窗口在共享 GPU tensor 上竞争，偶发破坏一次迭代，触发断言失败。\n**方法**：在 `_drive_store` 返回前排空 compute stream，确保每个阶段自包含。\n**效果**：消除 flaky 测试失败。",
+      "sig": "sig-ci",
+      "sig_reason": "KV offload 测试 flaky 修复。",
+      "tags": ["bugfix", "low-risk", "test", "kv-offload"],
+      "pr_number": 50926
+    },
+    {
+      "sha": "413e70d52c3f2645b3c4bdf95458488f7d517217",
+      "comment": "**背景**：Qwen3.5-35B-A3B 在 TP=1 下使用 `E=256, N=512` 的 MoE 形状，但 vLLM 缺少 H20 GPU 的设备特定配置，回退到默认 MoE 配置。\n**方法**：使用 Triton 3.6.0 和 vLLM 官方 `benchmark_moe.py` tuner 生成 H20 上 `E=256, N=512` 的 tuned MoE kernel 配置，覆盖 batch size 1 至 4096。\n**效果**：H20 上 Qwen3.5-35B-A3B MoE kernel 使用优化配置，避免回退到默认配置。",
+      "sig": "sig-model-performance",
+      "sig_reason": "H20 GPU 新增 tuned MoE kernel 配置。",
+      "tags": ["feature", "low-risk", "moe", "h20", "triton"],
+      "pr_number": 48825
+    },
+    {
+      "sha": "8adc840c4553b8f70cda82e5e59a7f9977f64a11",
+      "comment": "**背景**：新增的 Jina nano 测试用例在 MI250 上暴露 FP16 长上下文数值漂移问题，导致 AMD Buildkite build 11591 失败。\n**方法**：在 ROCm 上以 BF16 运行 `jinaai/jina-embeddings-v5-text-nano`，保留 NVIDIA 上自动 FP16 选择。保留 HuggingFace FP32 baseline 和长上下文 embedding 比对。\n**效果**：ROCm CI 通过，NVIDIA FP16 覆盖不变，保留正确性 oracle。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm MTEB 测试数值漂移修复。",
+      "tags": ["test", "low-risk", "rocm", "embedding"],
+      "pr_number": 50917
+    },
+    {
+      "sha": "11f88260a240e6e8ee33410f9c65f00043c3e6f7",
+      "comment": "**背景**：FlashKDA 需要迁移到 PyTorch stable ABI 以保持兼容性。\n**方法**：更新 `flashkda.cmake`、`flashkda_registration.cpp` 和 `check-torch-abi.py`，将 FlashKDA 编译迁移到 PyTorch stable ABI。\n**效果**：FlashKDA 在 stable ABI 下编译通过；TP8 GSM8K 0.9674，OCRBench 89.2。",
+      "sig": "sig-ci",
+      "sig_reason": "FlashKDA 构建系统 ABI 迁移。",
+      "tags": ["chore", "low-risk", "build", "flashkda", "kimi-k3"],
+      "pr_number": 50818
+    },
+    {
+      "sha": "41ba11b8413cefc8b8f0c917d01594cbb26fdfa7",
+      "comment": "**背景**：Kimi-K3 AttnRes kernel 硬编码行 stride 为 `H`，但 dispatch 仅检查 `stride(-1) == 1` 而非 `stride(0) == hidden_size`。行填充输入静默损坏输出（`max|out - ref| = 6.66` vs 容差 8e-2）。此外 `torch.ops._C.kimi_k3_attn_res` 仅在 CUDA >= 13.0 下存在，但 dispatch guard 是设备检查而非 op 存在检查——CUDA 12.x Blackwell 构建会抛 `AttributeError`。\n**方法**：添加 `STD_TORCH_CHECK` 强制 packed rows 前置条件，行填充时显式报错。dispatch guard 增加 `hasattr(torch.ops._C, kimi_k3_attn_res)` 检查。\n**效果**：行填充输入显式失败而非静默损坏；CUDA 12.x Blackwell 不再误调度不存在的 op。19 项测试通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 AttnRes kernel dispatch 正确性修复。",
+      "tags": ["bugfix", "low-risk", "kimi-k3", "attn-res", "kernel"],
+      "pr_number": 50567
+    },
+    {
+      "sha": "f42761204fb508bc205418c77b80bd50d0d11774",
+      "comment": "**背景**：#44355 将 MoRI-IO KV connector 的单 pod intra-node Wide-EP（1P1D, DP=EP=8, TP=1）扩展到多 pod cross-pod Wide-EP（2P2D, DP=EP=16, TP=1），一个 DP world 跨两个 8-rank pod。跨 pod 后出现 Engine-id 碰撞、rank 0 在 EP all2all 集合通信启动时挂起等 100% 可复现问题。\n**方法**：继承 #44355 的八项原子修复（V1 disagg-DP 正确性、MoRI-IO connector 加固、ROCm-only gating），新增三组跨 pod bring-up 修复：修复 multi-pod DP core bring-up 中 remote handshake 表的 engine-id 碰撞；修复跨 pod EP all2all 挂起；修复 rank 不对称失败。所有 V1 共享编辑 gated behind `current_platform.is_rocm()`。\n**效果**：2P2D DP=EP=16 TP=1 跨 pod Wide-EP disaggregated serving 在 AMD MI300X 上可用。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MoRI-IO KV connector 多 pod cross-pod Wide-EP disaggregated serving 扩展。",
+      "tags": ["feature", "high-risk", "kv-connector", "mori-io", "wide-ep", "rocm"],
+      "pr_number": 45043
+    },
+    {
+      "sha": "c8109375733e6b788e73c7cc1ed2004234834392",
+      "comment": "**背景**：已有 CuTe DSL skinny GEMM 仅支持 Kimi-K3 的 dynamic-K 路径。GLM-5.2 的 `qkv_a`、`q_b` 和 MTP `eh` projection 在 decode（M=1-3）时使用 `nn.Linear` 回退，未利用 skinny GEMM 优化。\n**方法**：为 CuTe DSL skinny GEMM 添加可选编译期 `K` 特化，静态-K 路径使用编译期 K-tile 循环并预取前两个 B tile，每个加载的 A/B register tile 一次转换为 FP32 后累加。扩展 GLM-5.2 decode 选择逻辑：`qkv_a`/`q_b` 在 M=1-2 用 CuTe DSL、M=3-16 用 DSV3、其余用原始 linear；MTP `eh` 在 M=1-3 用 CuTe DSL。仅对 `glm_moe_dsa`、未量化 BF16、精确 SM103 启用。\n**效果**：241 项 kernel 测试通过；所有后端在 eager 和 CUDA Graph replay 下与 fp32 参考余弦相似度 0.999999。decode skinny GEMM 性能显著优于 cuBLAS。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CuTe DSL skinny GEMM CUDA kernel 扩展至 GLM-5.2。",
+      "tags": ["feature", "medium-risk", "kernel", "cute-dsl", "glm-5.2", "gemm"],
+      "pr_number": 49791
+    },
+    {
+      "sha": "6a9109d865d8abbfe70777ea52520425f1be6d3f",
+      "comment": "**背景**：`use_audio_in_video=True` 可由不知道视频是否有音轨的调用方请求。当视频无音频时，`_call_hf_processor` 仍将 `use_audio_in_video=True` 传给 HF `Qwen3OmniMoeProcessor`。HF processor 假设该标志意味着至少一个 audio item，从 `next(audio_lengths)` 抛出未捕获的 `StopIteration`，被 vLLM 包装为 `ValueError`。\n**方法**：在 `_call_hf_processor` 中，当未提取音频（`audios` 为空）但请求了 `use_audio_in_video=True` 时，回退为 `use_audio_in_video=False`——没有音频可交错，传递不匹配的标志只会导致崩溃。\n**效果**：无音轨视频不再崩溃，正确生成 `input_ids`、`pixel_values_videos` 等输出。",
+      "sig": "sig-omni",
+      "sig_reason": "Qwen3-Omni 多模态视频无音轨崩溃修复。",
+      "tags": ["bugfix", "medium-risk", "qwen3-omni", "video", "multimodal"],
+      "pr_number": 48420
+    },
+    {
+      "sha": "c2881ce60302b5455867d2c29cdfae5fbeddecac",
+      "comment": "**背景**：MRv2 align-mode 的 `run_fused_postprocess_align` 将 `num_accepted_tokens_gpu` 同时作为 Triton kernel 的读源和原地写目标。grid 为 `(num_reqs, num_layers * num_state_types)`，对同一 `req_idx` 仅 `state_idx == 0` 执行 store，但其余 `state_idx` 读取同一地址。多 wave 下后 wave 可能观察到已写入的值（1），计算 `accept_token_bias == 0` 命中 early return，而前 wave 已用原始 `num_accepted > 1` 执行了 state copy，导致 Mamba state 跨层不一致。正确性依赖 GPU launch timing 而非内存模型。\n**方法**：修复 kernel 中 `num_accepted` 的读写竞争，确保跨层状态一致性。\n**效果**：消除 MRv2 align prefix cache 中 Mamba state 跨层不一致的正确性问题。",
+      "sig": "sig-core",
+      "sig_reason": "MRv2 hybrid Mamba align prefix cache 跨层状态竞争修复。",
+      "tags": ["bugfix", "high-risk", "mrv2", "hybrid", "mamba", "race-condition"],
+      "pr_number": 50432
+    },
+    {
+      "sha": "0b37d8389f4b8378adab0d3dfa1beffbb152e303",
+      "comment": "**背景**：NVFP4（ModelOpt FP4）量化 linear 方法的 `self.out_dtype` 设置为 `torch.get_default_dtype()`，默认返回 `float32`。但 vLLM 模型通常以 `bfloat16` 运行。NVFP4 kernel 输出 `float32` tensor，与下游消费者 dtype 不匹配——LoRA adapter 的 `lora_shrink` Triton kernel 断言输入 dtype 匹配 LoRA 权重 dtype，收到 `float32` 时失败。\n**方法**：将三个 linear method 构造函数中的 `self.out_dtype = torch.get_default_dtype()` 替换为 `self.out_dtype = get_current_vllm_config().model_config.dtype`，匹配已有的 `input_dtype` 赋值模式。\n**效果**：NVFP4 量化层输出 dtype 与模型配置一致，LoRA adapter 不再因 dtype 不匹配崩溃。",
+      "sig": "sig-quantization",
+      "sig_reason": "NVFP4 量化层 out_dtype 与模型 dtype 对齐修复。",
+      "tags": ["bugfix", "medium-risk", "nvfp4", "quantization", "lora"],
+      "pr_number": 48861
+    },
+    {
+      "sha": "f57123aa2dbc1badb1865b18c724b308f90dceda",
+      "comment": "**背景**：vLLM 缺少请求级 `session_id`，相关请求（同一对话、agent run 或 session）无法携带稳定身份，只能重载 `request_id` 或存入 `SamplingParams.extra_args`。\n**方法**：添加一等公民 `session_id` 到请求中，贯穿 OpenAI 兼容请求体、HTTP `X-Session-ID` 头、临时兼容回退 `vllm_xargs`、Python engine API、`EngineCoreRequest.session_id`、内部 `Request.session_id`、parallel sampling、beam search 以及 Rust HTTP/OpenAI 和 engine-core client 路径。不添加 session-aware 调度或路由策略，仅使稳定 session 身份可用于引擎内部。\n**效果**：session 身份在 Python 和 Rust 前端全链路可用，为后续 session-aware 调度/路由奠定基础。",
+      "sig": "sig-core",
+      "sig_reason": "前端 API 新增请求级 session_id 全链路贯通。",
+      "tags": ["feature", "medium-risk", "frontend", "session-id", "api"],
+      "pr_number": 48048
+    },
+    {
+      "sha": "e578de311c2416e66c6a8b9819586bb91de10f9d",
+      "comment": "**背景**：ModelRunnerV2 在 pipeline-parallel hybrid Mamba 模型中，非最后 pipeline rank 处理请求时 `MambaHybridModelState.postprocess_state` 将 `InputBatch.idx_mapping`（int32 CUDA tensor）传给 `Tensor.index_fill_`，但后者仅接受 int64 索引，抛 `IndexError`。\n**方法**：添加专用 Triton scalar-fill kernel，直接消费 int32 mapping，避免 dtype 转换。\n**效果**：pipeline-parallel hybrid Mamba 模型在 MRV2 下非最后 rank 正常工作。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 hybrid Mamba pipeline-parallel 状态更新 dtype 修复。",
+      "tags": ["bugfix", "high-risk", "mrv2", "mamba", "pipeline-parallel"],
+      "pr_number": 50327
+    },
+    {
+      "sha": "f43e1d26e3e6b40398be27b218cf2f2786432028",
+      "comment": "**背景**：AMD RDNA4 / gfx12（R9700, RX 9070 XT）上多个 AITER gate 实际仅限 MI3xx，gfx12 即使 AITER Triton 支持可用也回退到通用 ROCm/Triton 路径。\n**方法**：扩展 `is_aiter_found_and_supported()` 识别 gfx120x；用可复用 `arch_only` 装饰器替换 MI3xx 硬编码检查；MI3xx-only gate 通过 `@arch_only(_on_mi3xx)` 保留。FP8 block-scaled linear 在 gfx12 上使用 Triton 线性而非不可用 CK；FP8 支持检查替换为 `current_platform.supports_fp8()`；gfx12 上 AITER RMSNorm 默认关闭（kernel 在此架构损坏）；优先选择 `ROCM_AITER_UNIFIED_ATTN` 注意力后端。\n**效果**：gfx12 利用 AITER Triton 优化路径（FP8、attention），不调度到不可用 CK kernel。",
+      "sig": "sig-core",
+      "sig_reason": "ROCm GFX120x 平台启用 AITER FP8 和 attention 优化路径。",
+      "tags": ["feature", "medium-risk", "rocm", "gfx12", "aiter", "fp8", "platform"],
+      "pr_number": 43615
+    },
+    {
+      "sha": "4a3447d200e5aa428d68d1a00aa00f1a19a1a729",
+      "comment": "**背景**：ModelRunner V2 中 multimodal draft capability detection 依赖模型类型 hack（Inkling），未将 target model 产生 multimodal embedding 的能力与 drafter 消费能力分离。\n**方法**：添加 `SupportsMultiModalEmbeddings` protocol 和类型化 capability helper；`SupportsMultiModal` 继承该 protocol；在支持的 Eagle 和 Inkling drafter 上显式实现；在 `DraftModelSpeculator.load_model()` 中集中化 capability 检测和回退警告；仅在加载的 drafter capability 已知后分配 embedding buffer；移除 Inkling model-type hack。\n**效果**：multimodal draft capability 检测从 model-type hack 改为显式 protocol，11 项测试通过。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "MRV2 投机解码 multimodal draft capability 检测重构。",
+      "tags": ["refactor", "low-risk", "spec-decode", "mrv2", "multimodal", "eagle"],
+      "pr_number": 50417
+    },
+    {
+      "sha": "42ab184ea74ee6cf2966529c77bb51fd825a5d0c",
+      "comment": "**背景**：routed-experts（R3）return path 已存在但未在 Model Runner V2（MRV2）上启用，仅支持 MRV1 协议。\n**方法**：在 MRV2 上启用现有 routed-experts（R3）return path，同时保留 MRV1 协议和行为不变。修改 config、model executor layers、worker 等模块。\n**效果**：MRV2 支持 routed-experts capture。GSM8K 1319 例 base MRV1 vs head MRV1 vs head MRV2 零 mismatch；MRV2 吞吐不低于 MRV1。Ray Compiled DAG 兼容。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 启用 routed-experts capture 功能。",
+      "tags": ["feature", "high-risk", "mrv2", "routed-experts", "moe"],
+      "pr_number": 50721
+    },
+    {
+      "sha": "e279f7158322d81f7b10ec9733fd7f9420d2fdc6",
+      "comment": "**背景**：#46298 将测试切换到 GPT-OSS MXFP4 converter 但保留 `SILU` 激活配置，且 reference 计算在 converter 原地修改 tensor layout 后重用 tensor。#49361 的新 AITER 版本暴露此不一致设置，导致 unsupported small-M kernel 配置失败。\n**方法**：`AITER_MXFP4_BF16` 测试用例改用 `SWIGLUOAI` 激活，匹配 GPT-OSS converter 期望的激活和 gate/up layout；在 conversion 前 clone checkpoint-format 权重和 scale，使 reference 反量化原始数据而非重排后的 tensor。\n**效果**：AITER MXFP4 测试 oracle contract 修复，ROCm CI 通过。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm AITER MXFP4 测试 oracle 修复。",
+      "tags": ["test", "low-risk", "rocm", "aiter", "mxfp4"],
+      "pr_number": 50728
+    },
+    {
+      "sha": "c4e9f09de74aa1bf885af8cafd949c3c4dca67db",
+      "comment": "**背景**：gRPC 请求转换中未拒绝空 `stopping.stop_strings`，空 stop 字符串到达 text decoder 后产生无效行为。\n**方法**：在 gRPC 请求转换阶段拒绝空 `stopping.stop_strings`，返回 `InvalidArgument` 错误，在无效 stop 字符串到达 text decoder 之前拦截。添加转换和 unary gRPC 回归测试。\n**效果**：空 stop 字符串在 gRPC 层被拒绝，不再到达 text decoder。",
+      "sig": "sig-core",
+      "sig_reason": "gRPC 前端请求校验修复。",
+      "tags": ["bugfix", "low-risk", "frontend", "grpc", "rust"],
+      "pr_number": 50746
+    },
+    {
+      "sha": "755513d9a24fb639a8985172e645c7fe5a263154",
+      "comment": "**背景**：`stage_postprocess_inputs_to_gpu` 遍历 `req_ids[:num_reqs]` 两次，将工作拆分为两个 helper（`stage_mamba_state_idx_to_gpu`、`stage_postprocess_metadata_to_gpu`），且这两个 helper 仅被 `stage_postprocess_inputs_to_gpu` 调用。\n**方法**：将两个 helper 内联为单次遍历，一次性填充所有四个 pinned numpy view 后再发起 H→D 拷贝。相同 GPU 可见行为，减少 47 行代码，一个循环代替两个。新增 `stage_postprocess_inputs_to_gpu` 的针对性单元测试。\n**效果**：代码简化，Mamba state copy 的 H→D staging 效率提升，新增测试覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "Hybrid Mamba postprocess H→D staging 重构为单循环。",
+      "tags": ["refactor", "low-risk", "hybrid", "mamba", "postprocess"],
+      "pr_number": 48120
+    },
+    {
+      "sha": "1c0d20791556861f4c1804b43b03d9cc03ffa6b8",
+      "comment": "**背景**：`Gemma3Model.forward` 将 `intermediate_tensors` 声明为必选位置参数（无默认值），而其他 pooling-capable 模型（如 `BertModel`）默认为 `None`。不产生 intermediate tensor 的调用方（如 pooling 路径）省略该参数时，编译 forward 绑定失败：`TypeError: missing a required argument: intermediate_tensors`。CI 在 #48290（将 encoder-only pooling 模型默认到 MRV2）上暴露此问题。\n**方法**：将 `intermediate_tensors` 默认值设为 `None`，与 BERT 等编码器模型约定一致。\n**效果**：Gemma3 可用于 pooling；MRV2 encoder-only pooling 路径不再在 engine init 时失败。",
+      "sig": "sig-core",
+      "sig_reason": "Gemma3 模型 forward 签名修复以支持 pooling。",
+      "tags": ["bugfix", "low-risk", "gemma3", "pooling", "mrv2"],
+      "pr_number": 50777
+    },
+    {
+      "sha": "7f2e78ba4df2f7091c247155fc5aeecaa73a486d",
+      "comment": "**背景**：`encode_audio_url`、`encode_image_url` 和 `encode_video_url` 在格式扩展名未注册于 `mimetypes.types_map` 时，回退为裸顶级类型（`image`、`audio`、`video`）。无子类型的 media type 不是 well-formed，如 `data:image;base64,...`。Pillow/soundfile 可编码但 `mimetypes` 未注册的格式（如 `TGA`/`PCX` 图像或 `CAF`/`W64` 音频）会触发此问题。\n**方法**：将回退改为 `<kind>/<format>`（如 `image/tga`），确保 media type 始终为 well-formed `type/subtype`。已注册格式不变（如 `PNG` 仍为 `image/png`）。\n**效果**：所有格式生成合法 data URL media type，不影响模型输出或精度。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态 URL 编码 media type 合法性修复。",
+      "tags": ["bugfix", "low-risk", "multimodal", "utils", "media-type"],
+      "pr_number": 49056
+    },
+    {
+      "sha": "8f50685c48d6bc88d199d9560ab67615e1b2c2a4",
+      "comment": "**背景**：Kimi-K3 AITER MoE 使用裸环境变量 `AITER_SITUV2_A8W4`，每次 forward 读取 env var，不符合 vLLM 命名约定且影响性能。\n**方法**：重命名为 `VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4`，在 `rocm_aiter_ops` 中缓存并提供 `is_fused_moe_situv2_a8w4_enabled()`。vLLM 在 MoE-method init 时设置 `AITER_BF16_FP8_MOE_BOUND=0`。K3 SiTU skip round-up 逻辑从 `Mxfp4MoEMethod` 移入 oracle。K3 setup 折入 `_setup_kernel`，删除单独的 early-return。\n**效果**：环境变量命名统一，消除 per-forward env 读取，代码结构简化。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm Kimi-K3 AITER MoE 环境变量重构与缓存优化。",
+      "tags": ["refactor", "low-risk", "rocm", "aiter", "moe", "kimi-k3"],
+      "pr_number": 50582
+    },
+    {
+      "sha": "952694e3843e478dd99cffd132c756d582fe8a94",
+      "comment": "**背景**：disaggregated serving 中，prefill 构建 KV cache 并通过 NIXL 传输到 decode。若 decode 启用 model-based speculative 方法（如 EAGLE3）而 prefill 未启用，handshake 仍可成功，短 prompt 可能正常但长 prompt 在 decode 上触发 CUDA illegal-memory-access 失败。\n**方法**：将 transfer 相关 speculative 设置纳入 NIXL 兼容性 hash（覆盖 `eagle`/`eagle3`/`mtp`/`dflash`/`dspark` 等 model-based 方法），拒绝 prefill/decode 仅一方启用的情况。NIXL connector 兼容性版本从 5 升至 6。pattern-based 方法（`ngram`/`suffix`）不纳入检查。添加兼容性文档。\n**效果**：不兼容的 P/D speculative 配置在 handshake 阶段早期失败，避免推理时崩溃。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL KV connector P/D speculative 配置兼容性校验。",
+      "tags": ["bugfix", "medium-risk", "nixl", "kv-connector", "spec-decode", "disaggregated"],
+      "pr_number": 49230
+    },
+    {
+       "sha": "65cf1276a25b5e7dbbed7d3febdd54a815ced8c8",
+      "comment": "**背景**：`triton_prefill_attention.py` 的 `_fwd_kernel` 从 0 到 `end_n` 遍历每个 key block，在加载后才 mask 掉窗口外的 key。masking 正确但工作未跳过，sliding window pass 仍为 O(seq_len^2)。\n**方法**：对覆盖 `[start_m * BLOCK_M, (start_m + 1) * BLOCK_M)` 的 query block，将 key 循环范围 clamp 到 `[start - SLIDING_WINDOW_Q, end + SLIDING_WINDOW_K]`——只有此范围内的 key 能通过 mask。非窗口路径保持不变。\n**效果**：sliding window prefill 从 O(seq_len^2) 降为 O(seq_len * window)。H100 上 16384 token 从 4.657ms 降至 0.172ms。20 项测试通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Triton windowed prefill attention kernel 跳过完全 masked key block。",
+      "tags": ["performance", "medium-risk", "triton", "attention", "prefill", "sliding-window"],
+      "pr_number": 50776
+    },
+    {
+      "sha": "76d995df2c80fd1f81901723fa05c992714693b2",
+      "comment": "**背景**：#48968 添加了 Helion 数值测试，import `scripts/benchmark_helion_kernels.py`。CUDA 从完整 checkout 运行测试，但 ROCm CI 从较小导出 artifact 重建 workspace，该脚本未在导出阶段声明，导致 AMD job 在 test collection 时失败。\n**方法**：将 `scripts/benchmark_helion_kernels.py` 复制到两个 ROCm wheel export 阶段；将该脚本添加到 AMD Helion job 的 source dependencies。\n**效果**：ROCm CI Helion 测试不再因缺失脚本而 collection 失败。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI test artifact 缺失脚本修复。",
+      "tags": ["bugfix", "low-risk", "ci", "rocm", "helion"],
+      "pr_number": 50726
+    },
+    {
+      "sha": "f0de1a604cad003379e5bb4dfc3cc5d2a1f25fa8",
+      "comment": "**背景**：`UniformTypeKVCacheSpecs` 未覆写 `max_num_blocks_per_req`，使用基类 `cdiv(max_len, block_size)`，而 `AttentionSpec` 除以 `decode_context_parallel_size`。runner 从 group spec（`UniformTypeKVCacheSpecs`——未 DCP 分片）sizing block table，metadata builder 从 per-layer spec（`MLAAttentionSpec`——DCP 分片）构造，导致 block table 比 indexer 的 `expanded_block_table_buffer` 宽 `dcp_world_size` 倍，decode 在 `mla/indexer.py` 崩溃。\n**方法**：`UniformTypeKVCacheSpecs` 覆写 `max_num_blocks_per_req`，委托给 merged specs 的 DCP 分片逻辑。\n**效果**：GLM-5.2 TP8/DCP2 `fp8_ds_mla` MTP 不再崩溃；block table 宽度正确，不浪费内存。",
+      "sig": "sig-core",
+      "sig_reason": "KV cache spec DCP 分片 block table 宽度修复。",
+      "tags": ["bugfix", "high-risk", "kv-cache", "dcp", "mla", "glm-5.2"],
+      "pr_number": 50823
+    }
+  ]
+}
