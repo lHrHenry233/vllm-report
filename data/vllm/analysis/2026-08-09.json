@@ -1,0 +1,158 @@
+{
+  "date": "2026-08-09",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-09T20:00:00+08:00",
+  "daily_summary": "当日 18 条变更，覆盖 KV Offload 可靠性、GPU sync 检查重构、Inkling parser 修复、构建系统升级和 MoE 迁移等方向。KV Offload 方面三项重要改进：为 partial recurrent block 发出自描述事件、修复 chunked local attention 在 offloading scheduler 中的断言失败、修复 failed-load livelock。核心方面将 GPU sync check 改为 thread-local 并修复 suppressors，避免进一步 GPU<->CPU sync 优化，修复 MRV2 spec-decode lookahead warmup。构建方面升级到 Ubuntu 24.04 和 ROCm CI 镜像复用，bitsandbytes 迁移到 OOT 插件。Inkling parser 修复两个 bug：reasoning end 确认和 block-end 泄露。",
+  "sig_summaries": {
+    "sig-core": "K3 TPU 允许 import `kimi_k3.common` 避免 GPU 模型 eager import（#51529）。bitsandbytes 量化迁移到 OOT 插件（#43529）。V1 离线路径 prefix-cache 统计在零输出 step 上不再丢失（#48668）。GPU sync check 改为 thread-local 并修复 suppressors——`torch.cuda.set_sync_debug_mode` 是 process-global 而非 thread-local，改为 warn 模式 + `warnings.showwarning` hook + `ContextVar` 跟踪（#51455）。消除多处不必要 GPU<->CPU sync（#51458）。MRV2 warmup 预留 spec-decode lookahead blocks（#51438）。Inkling parser 修复 reasoning end 确认——content block 开启时未 emit `REASONING_END` 导致 tool pass 不运行（#49876）。Inkling parser 修复 block-end 泄露——reasoning pass 转发 tool syntax 时 text closer 泄露到 content（#51391）。",
+    "sig-large-scale-serving": "KV Offload 为 partial recurrent block 发出自描述 CPU-offload KV 事件，full-attention cache group 包含 hash-aligned metadata，Mamba/SSM group 保持 legacy placeholder（#51243）。修复 offloading scheduler 中 `get_sliding_window_size_in_chunks()` 对 `ChunkedLocalAttentionSpec` 的断言失败——chunked local attention 的 reachable tail 按 `attention_chunk_size` 的 sliding window 报告（#51161）。修复 failed-load livelock——secondary-tier load 失败时 mark cache verdict 为 miss 而非保留 stale hit 导致 busy-loop（#49328）。",
+    "sig-model-performance": "Sparse MLA index remap 消除 atomic contention——将 16-tile column 的 per-row counter atomic-add 改为单 program in-register reduction + plain store，compaction base 静态为 0。GB200 CUDA graph 下 1 token 时 1.50x-3.18x 加速，78 层 index_topk=2048 模型每 decode step 节省 ~270us。Bit-exact 1728 配置验证（#50365）。",
+    "sig-ci": "修复 `throughput.py` 和 `video.py` 文档类型注解（#51539）。ROCm CI 镜像复用——拆分 base build 为独立可缓存依赖阶段，按 content identity 复用（#48646）。Flashinfer 升级到 0.6.16.post3，重新启用 autotuning persistent cache（#50892）。PyTorch 2.13 stable string memleak fix 从 2.14 backport（#51185）。运行时镜像升级到 Ubuntu 24.04 获取 rdma-core > 44 以支持 NCCL GIN（#51058）。ROCm AITER FP8 MLA prefill accuracy 测试新增（#51457）。"
+  },
+  "commits": [
+    {
+      "sha": "83ad767eed3be3ee7f2df63be693bfaca5c7c922",
+      "comment": "**背景**：`vllm/benchmarks/throughput.py` 的 `args` 参数和 `vllm/multimodal/video.py` 的 `frames` 参数及返回值缺少类型注解，griffe 报 WARNING。\n**方法**：为两个函数添加缺失的类型注解。\n**效果**：消除 griffe 文档构建 WARNING。",
+      "sig": "sig-ci",
+      "sig_reason": "文档类型注解修复。",
+      "tags": ["bugfix", "low-risk", "docs", "type-annotation"],
+      "pr_number": 51539
+    },
+    {
+      "sha": "04d13b5d653725651f7a750f0022f06d095881dc",
+      "comment": "**背景**：TPU platform plugin 需复用 Kimi K3 的 shared multimodal preprocessing 并注册自己的 model implementation。但 `kimi_k3.__init__` 在 import 时 eagerly import GPU 实现，TPU 设备类型下加载了不存在的 NVIDIA 或 AMD model package。\n**方法**：在 `kimi_k3.__init__` 中检查 active platform 的 device type，TPU 时不 eagerly import GPU 实现。CUDA 和 ROCm model selection 不变。\n**效果**：TPU 上可 import `kimi_k3.common` 的 shared preprocessing 而不加载 GPU 模型包。",
+      "sig": "sig-core",
+      "sig_reason": "Kimi K3 TPU 平台 import GPU model package 修复。",
+      "tags": ["bugfix", "high-risk", "kimi-k3", "tpu", "import"],
+      "pr_number": 51529
+    },
+    {
+      "sha": "c4239986427a40389fd79c1a4f6afd48aea6512e",
+      "comment": "**背景**：KV Offload 需为 full-attention cache group 发出自描述 CPU-offload KV 事件，包括 hash-aligned metadata 用于 partial recurrent tail。Mamba/SSM group 的 placeholder `BlockStored` 事件仅含 offload-key hash 但缺 `token_ids`、`block_size` 和 cache-spec metadata。\n**方法**：为 full-attention cache group 发出自描述事件（包含 token_ids、block_size、cache-spec metadata）。Mamba/SSM group 保持 legacy placeholder CPU-offload payload。\n**效果**：CPU-offload KV 事件对 full-attention block 自描述，支持下游消费者无需额外查询即可还原 KV cache。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV Offload partial recurrent block 自描述事件。",
+      "tags": ["feature", "high-risk", "kv-offload", "events", "recurrent"],
+      "pr_number": 51243
+    },
+    {
+      "sha": "7f6432cc0daf97c5b9a2df141641c595a766ff40",
+      "comment": "**背景**：ROCm CI 镜像构建缺少缓存复用，重复构建相同依赖。csrc 和 Rust compiler cache 在 PR commit 间不稳定。\n**方法**：拆分 ROCm base build 为独立可缓存依赖阶段；按 deterministic content identity 复用 base 和 `ci_base` 镜像，trust-scoped writes 和 digest-pinned downstream handoffs；csrc 和 Rust compiler cache 在 input 不变时保持稳定；Buildkite checkout 用于两个 AMD image step 同时隔离 remote-source cache identity；保留 per-commit wheel/image packaging。\n**效果**：ROCm CI 镜像构建时间大幅减少，缓存命中率提升。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 镜像缓存复用优化。",
+      "tags": ["improvement", "high-risk", "rocm", "ci", "docker", "cache"],
+      "pr_number": 48646
+    },
+    {
+      "sha": "f18e10a7e1c1eb37e898c31989ff625d79791657",
+      "comment": "**背景**：Flashinfer 版本需升级以获取新功能和 bug fix。\n**方法**：将 Flashinfer 升级到 0.6.16.post3，更新 Dockerfile、versions.json、requirements/cuda.txt 和 warmup/worker 相关文件。重新启用 autotuning persistent cache，使用 `set_autotune_process_group` 支持分布式 auto-tuning 跨 rank 同步以避免 straggler 导致的 timeout。\n**效果**：Flashinfer 新版本可用，autotuning 在分布式下不再 timeout。",
+      "sig": "sig-ci",
+      "sig_reason": "Flashinfer 版本升级和 autotuning persistent cache。",
+      "tags": ["chore", "low-risk", "flashinfer", "version-bump", "autotuning"],
+      "pr_number": 50892
+    },
+    {
+      "sha": "eb24bc38cfc6818d6dc6d8440faf6e7062396f17",
+      "comment": "**背景**：`get_sliding_window_size_in_chunks()` 处理 `SlidingWindowSpec` 和 `MambaSpec` 后断言其余为 `FullAttentionSpec`。Llama 4 使用 `ChunkedLocalAttentionSpec`，在 offloading connector 上启用时 engine 启动即崩溃于 bare `AssertionError`。\n**方法**：`ChunkedLocalAttentionSpec` 的 reachable tail 按 `attention_chunk_size` 的 sliding window 报告（向上取整确保 tail 不被低估——低估会静默跳过可命中的 chunk 存储）。剩余 assert 改为命名不支持 spec 而非 bare fail。\n**效果**：Llama 4 可启用 offloading connector，H100 TP4 真实权重 KV round-trip 验证通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Offloading scheduler chunked local attention 断言修复。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "llama4", "chunked-local-attention"],
+      "pr_number": 51161
+    },
+    {
+      "sha": "1b0ce31f3265dce4f0c638cd7e2cf27f5d8c0fbc",
+      "comment": "**背景**：secondary-tier load 失败（block file truncated/deleted/unreadable）时，async lookup cache 保留之前的 positive verdict，scheduler 看到 hit 调度 promotion，load 失败，下一步又看到同一 hit——busy-loop 浪费 I/O 和 scheduler 工作直到 request 被 abort。因 cache 按 block refcount，stale verdict 服务于所有 overlap block 的 request，一个坏 file 静默 wedge 多个 request。\n**方法**：load 失败时 owning tier 将 cached lookup verdict 标记为 miss（`mark_miss`），从 `get_finished_jobs` 在 scheduler thread 执行。cached miss 不重新 probe，request 在 GPU 上重算不重试该 block——结构性无法 loop。`load_block` 仅在 provable short read 时删除 block file（genuine corruption），open failure/read error 不删除。`drain_results` 断言 enqueue-once invariant 防止 duplicate result 复活 corrected verdict。\n**效果**：failed-load livelock 根除，transient hiccup 不变为永久数据丢失。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV Offload failed-load livelock 修复。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "livelock", "secondary-tier"],
+      "pr_number": 49328
+    },
+    {
+      "sha": "f8d03e77416bf90c49acbe50e233275722f02c4b",
+      "comment": "**背景**：PyTorch stable ABI header 有 string memory leak，已在 2.14 修复（pytorch commit 7f0ec65），但 vLLM 2.13 构建仍受影响。\n**方法**：将 2.14 的 stable string memleak fix backport 到 2.13 的 cmake patch 文件 `pytorch_stable_string.patch`。不改变 stable ABI 版本支持范围（仍 target 2.11 onwards）。torch 2.14 成为 vLLM 构建版本后应 revert 此 PR。\n**效果**：2.13 构建不再有 string memory leak，下游开发者验证通过。",
+      "sig": "sig-ci",
+      "sig_reason": "PyTorch 2.13 stable string memleak backport。",
+      "tags": ["bugfix", "high-risk", "build", "pytorch", "stable-abi", "memleak"],
+      "pr_number": 51185
+    },
+    {
+      "sha": "073c510c916f385315a5366173c883781762bb9e",
+      "comment": "**背景**：bitsandbytes 量化支持内置于 vLLM 核心代码中，增加维护负担和耦合。相关 issue #39583。\n**方法**：将 bitsandbytes 支持迁移到独立 OOT 插件 `vllm-bnb-plugin`。用户安装 `uv pip install vllm-bnb-plugin` 后仍可正常使用 BNB 模型。删除核心代码中 1895 行 BNB 相关代码，更新 Dockerfile、versions.json、文档、测试和 requirements。\n**效果**：BNB 支持通过插件提供，核心代码库精简，用户安装插件后模型使用不受影响。",
+      "sig": "sig-core",
+      "sig_reason": "bitsandbytes 量化迁移到 OOT 插件。",
+      "tags": ["refactor", "low-risk", "bitsandbytes", "plugin", "migration"],
+      "pr_number": 43529
+    },
+    {
+      "sha": "dedbf6be8b1afa17a6220473b9c8c98242ac1c03",
+      "comment": "**背景**：`Scheduler.make_stats()` 每 step 排空 prefix-cache hit/query 计数器并附加到 `EngineCoreOutputs`。但离线 `LLMEngine.step()` 仅在 step 产生 request outputs 时记录 stats（`len(outputs.outputs) > 0` gate）。无输出的 step 上 prefix-cache 计数器被排空但不记录，永久丢失——例如非最终 prefill chunk 上 request admit 时 apply cache hit。导致离线路径 prefix-cache hit rate 被低报。在线 `AsyncLLM` 不受影响（无条件记录 `scheduler_stats`）。\n**方法**：移除 `len(outputs.outputs) > 0` gate，使离线路径与已正确的 async 路径一致。\n**效果**：离线路径 prefix-cache hit rate 正确统计。GB200 上 Nemotron-Super-120B prefix cache hit 从 0 恢复为正确值。",
+      "sig": "sig-core",
+      "sig_reason": "V1 离线路径 prefix-cache 统计在零输出 step 丢失修复。",
+      "tags": ["bugfix", "high-risk", "v1", "metrics", "prefix-cache", "offline"],
+      "pr_number": 48668
+    },
+    {
+      "sha": "cb1a52aee3b31c692a6629ebd7ff5503b3cd13f7",
+      "comment": "**背景**：运行时镜像为 Ubuntu 22.04（rdma-core 39），但 NCCL GIN（`NCCL_GIN_TYPE=3` GDA-KI）需要 rdma-core > 44。维护 22.04 和 24.04 两套镜像增加构建/发布复杂度。\n**方法**：将运行时镜像升级到 Ubuntu 24.04（rdma-core 50.0），更新 Dockerfile、versions.json 和安装文档。\n**效果**：不再需要单独 24.04 镜像，NCCL GIN 可用。",
+      "sig": "sig-ci",
+      "sig_reason": "运行时镜像升级到 Ubuntu 24.04。",
+      "tags": ["chore", "low-risk", "docker", "ubuntu-2404", "rdma-core"],
+      "pr_number": 51058
+    },
+    {
+      "sha": "7581c56c86ce8dd881a84739c0a1eb83f9f2fdd6",
+      "comment": "**背景**：ROCm AITER FP8 MLA prefill 路径（`AiterMLAImpl._mla_fp8_prefill_attn` -> `mla_prefill_ps_asm_fwd` + `mla_reduce_v1`）此前无测试覆盖。\n**方法**：添加 gfx950-only (MI355) accuracy test，驱动真实 metadata builder（`get_ps_metadata_v1`）和 impl（通过 `object.__new__` 绕过构造），与 causal SDPA fp8-cast 参考比较输出。非 gfx950 平台 skip。\n**效果**：AITER FP8 MLA prefill 路径获得 accuracy 测试覆盖。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm AITER FP8 MLA prefill accuracy 测试新增。",
+      "tags": ["test", "low-risk", "rocm", "aiter", "fp8", "mla", "prefill"],
+      "pr_number": 51457
+    },
+    {
+      "sha": "fbff187d593c322c4a221864ce5756bd849e174e",
+      "comment": "**背景**：`VLLM_GPU_SYNC_CHECK` 机制（#44800）有两个问题：`torch.cuda.set_sync_debug_mode` 是 process-global 而非 thread-local——background thread 继承 main thread arm 的模式并在 deliberate sync 上 raise（kill 了 EPLB async transfer worker）；任何 thread 上 `set_sync_debug_mode(0)` 清除所有 thread 的模式，`gpu_sync_allowed()` off main thread 静默 disarmed 全局检查。此外 compile-time suppressors 在 `torch.compiler.is_compiling()` 状态下 `gpu_sync_allowed()` no-op，suppressors 停止 suppress 任何东西。\n**方法**：将 enforcement 移出 torch 全局 error mode：arm torch 为 `warn` 模式（报告 `UserWarning` 不 raise），安装 `warnings.showwarning` hook 将 warning 转为 `SYNC_ERROR_MESSAGE`（仅当 syncing thread 在 `with_gpu_sync_check` 函数内且不在 `gpu_sync_allowed` region）。用 `ContextVar` 跟踪（per-thread 和 per-asyncio-task）。hook 每次 checked call 重新安装（pytest `warnings.catch_warnings` 会 save/restore）。mode 同样 per checked call arm（refcounted，`execute_model` 和 `sample_tokens` 嵌套）。扩展 suppressors 到 inductor cudagraph tree setup；修复 `_suppressing()` bypass `gpu_sync_allowed()`。\n**效果**：GPU sync check 正确 per-thread 隔离，suppressors 在 compile 状态下恢复功能，EPLB async worker 不再误杀。",
+      "sig": "sig-core",
+      "sig_reason": "GPU sync check thread-local 重构和 suppressors 修复。",
+      "tags": ["bugfix", "high-risk", "gpu-sync-check", "thread-local", "contextvar"],
+      "pr_number": 51455
+    },
+    {
+      "sha": "9b0afeb4f6c435a06d394f8a25209d4682a215af",
+      "comment": "**背景**：多个 per-forward-pass 路径执行 blocking GPU<->CPU sync，通过 `VLLM_GPU_SYNC_CHECK=error` CI 发现。包括 LoRA fused_moe cache miss、qwen3_omni audio chunk lengths、gemma3n audio padding token、glm4_1v image_shapes、gpu_model_runner prompt_embeds 等。\n**方法**：用 `async_tensor_h2d` 替换 blocking `torch.tensor(..., device=<gpu>)` 构造；chameleon per-device 缓存 image-token mask 和 index tensor 用 `index_fill_`；voxtral 用 `torch.clamp` 替换 `torch.tensor(scalar, device=...)`；logits_processors test 用 on-device fill tensor + `.clone()` 替换 `.item()`；test_basic_correctness 用 `.fill_()` 替换 scalar H2D；extract_hidden_states 移除未读的 pinned+numpy CpuGpuBuffer host half；example_connector 和 kv_connector utils 非阻塞化。\n**效果**：消除多个 per-forward-pass GPU<->CPU sync 点，减少 decode 延迟。",
+      "sig": "sig-core",
+      "sig_reason": "消除多处不必要 GPU<->CPU sync。",
+      "tags": ["performance", "low-risk", "gpu-sync", "h2d", "lora", "multimodal"],
+      "pr_number": 51458
+    },
+    {
+      "sha": "d608dfabfdba7e1496e5fef7c66d27c131f59432",
+      "comment": "**背景**：MRV2 warmup 未预留 spec-decode lookahead blocks，可能导致 spec-decode 启用时 KV cache 块不足。\n**方法**：在 V2 warmup 中预留 spec-decode lookahead blocks。修改 config、core scheduler 和 worker 模块。\n**效果**：MRV2 spec-decode warmup 正确预留 lookahead blocks。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 spec-decode lookahead warmup 预留修复。",
+      "tags": ["bugfix", "high-risk", "mrv2", "spec-decode", "warmup", "kv-cache"],
+      "pr_number": 51438
+    },
+    {
+      "sha": "9e6be4a72bd29ecf2168a41f659aebfe2cdeda4a",
+      "comment": "**背景**：Sparse MLA index remap 将每个 2048 宽 row 拆为 16 个 column tile。valid-count path 上每个 tile atomic-add 到同一 per-row counter，row total 在 16-way contention 下构建，DCP compaction path 用同一 counter 作 atomic slot allocator。\n**方法**：给一个 program 整个 row——count 变为 in-register reduction + plain store，compaction base 静态为 0，counter buffer 不再需要零初始化。无 count 的 row 保持 16-tile layout（无 contention）。\n**效果**：GB200 CUDA graph 下 1 token 时 1.50x-3.18x 加速，16 tile 拉开 4 tile 差距随 batch 增大。78 层 index_topk=2048 模型每 decode step 节省 ~270us at 256 tokens。Bit-exact 1728 配置验证，compaction prefix 确定性 in-order。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Sparse MLA index remap atomic contention 消除。",
+      "tags": ["performance", "high-risk", "sparse-mla", "index-remap", "atomic", "kernel"],
+      "pr_number": 50365
+    },
+    {
+      "sha": "1c1077c6cc4308bdf4c2bf207d7420757a9bfd87",
+      "comment": "**背景**：Inkling reasoning pass 仅在 explicit reasoning-end event 时离开 reasoning phase。以 visible content 开头且无 thinking block 的 response 从未 emit 该 event，`DelegatingParser` 不进入 tool phase，tool pass 不运行。#51391 修复了 marker ownership 但未修复此 phase gating。\n**方法**：从每个开启 visible content block 的 transition emit `REASONING_END`——`TEXT_START`、`TOOL_TEXT` 和 `TOOL_ERROR`，从 `CONTENT` 和 `MESSAGE_HEADER` 两个 state。`inkling_config()` 中六处一行修改，不触碰 parser 或 engine 其他部分。\n**效果**：text-then-tool streaming response 正确触发 tool pass，tool call 被解析。",
+      "sig": "sig-core",
+      "sig_reason": "Inkling parser reasoning end 在 content block 开启时确认。",
+      "tags": ["bugfix", "high-risk", "inkling", "parser", "reasoning", "tool-call"],
+      "pr_number": 49876
+    },
+    {
+      "sha": "75231eff2f3873e2bce7cc9558bb5227ea70b808",
+      "comment": "**背景**：启用 tools 时，Inkling plain-text response 可泄露 `<|end_message|>` 或 `<|content_model_end_sampling|>` 到 `content`。常发生在 tool result 后的 synthesis turn。reasoning pass 禁用 tool parsing 并转发 tool syntax，但 Inkling 复用 block-end token 用于 reasoning、text 和 tool block，仅按 terminal identity 分类会转发普通 text closer 即使无 tool region开启。`TOOL_CALL_END` event 对 shared engine 不是可靠 lexical boundary（如 MiniMax 内层 `<invoke>` 先于外层 `<minimax:tool_call>` 关闭）。\n**方法**：跟踪 reasoning pass 是否在转发 lexical tool region；从 tool-state -> non-tool-state transition 结构性推导 tool-region exit；tool region 外正常 apply shared block-end terminals；tool region 内转发完整 tool syntax 包括 wrapper closers；projected skip state 无 transition 时也清除 forwarded span。新增 served two-pass 和 shared-engine regression 覆盖。\n**效果**：plain-text response 不再泄露 block-end token，3758 项 parser 测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Inkling parser block-end 在 tools 启用时泄露修复。",
+      "tags": ["bugfix", "high-risk", "inkling", "parser", "block-end", "tool-call"],
+      "pr_number": 51391
+    }
+  ]
+}

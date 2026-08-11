@@ -1,0 +1,191 @@
+{
+  "date": "2026-08-11",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-11T20:00:00+08:00",
+  "daily_summary": "当日 22 条变更，覆盖前端改进、推测解码优化、结构化输出修复、Kimi-K3 DCP 支持和 CI 基础设施改进等方向。前端方面升级 MiniJinja 至 2.22 移除 method lookup workaround，新增 gRPC 显式数据并行 rank 路由。推测解码方面 MRV2 启用 MTP topk index buffer 共享、修复 dspark `parallel_drafting_token_id` 初始化。结构化输出修复 xgrammar 中 stop token 在语法未终止状态下的掩码。Kimi-K3 新增 decode context parallelism (DCP) 支持，直接 symmetric-memory A2A 输出/LSE reduction 和 NVLS-multicast query gather。内核性能方面，top-k/top-p 采样 kernel 使用 8 warps 提速 1.2-1.85x，DeepSeek V4 eager CUDA graph 区域收窄，离线 beam search 跳过不必要的 detokenization。CI 方面并行化 release 镜像发布、新增 `/ci cancel` 命令、Docker test 依赖缓存优化。",
+  "sig_summaries": {
+    "sig-core": "修复 Ernie-4.5-VL 编码器 CUDA-graph postprocess 对多路径 dict 输出的适配（#51461）。升级 MiniJinja 至 2.22 移除自定义 `TemplateMap` workaround（#51235）。修复 DeepSeek V4/3.2 tokenizer `__len__` 过度计数词表导致 guided decoding 崩溃（#51727）。新增 Rust 前端 gRPC 显式数据并行 rank 路由（#51178）。Kimi-K3 新增 DCP 支持——直接 symmetric-memory A2A 输出/LSE reduction、NVLS-multicast query gather、直接发布 query shard 到 consumer-final buffer（#50484）。对齐 DeepSeek V4 parser thinking 默认与 tokenizer（#51296）。修复 DSpark SWA-only draft layer warmup 无 sparse index buffer 时断言失败（#50693）。修复 xgrammar 结构化输出中 stop token 在语法未终止时逃逸掩码（#49227）。修复 AMD KDA decode kernel 缺少 state-index stride 导致推测解码 warmup 失败（#51682）。",
+    "sig-ci": "并行化 release 镜像发布为七路 Buildkite matrix，关键路径从所有系列之和降为最慢单个系列（#51735）。修复 fork-path logits processor 测试 mock 吞噬非 logitproc entry points 导致 PyTorch nightly 无法发现 NCCL（#51097）。新增 `/ci cancel` PR 评论命令（#51732）。发布 gRPC protobuf schema 到 Buf Schema Registry（#51276）。启用 ROCm AMD 分布式推理 CI with buildkite/slurm（#47030）。Docker test 依赖在 vLLM install 前缓存，源码变更不再使 Git 和开发依赖 layer 失效（#51184）。跳过 precompiled wheel metadata hooks 期间的 wheel fetch（#51424）。",
+    "sig-model-performance": "离线 beam search 跳过不必要的 detokenization，beam width 20 提速 1.42x（#50333）。top-k/top-p Triton 采样 kernel 使用 8 warps，SM120 提速 1.2-1.5x、SM90 提速 1.02-1.85x（#51507）。收窄 DeepSeek V4 eager CUDA graph 区域，将 producer 操作移入 `forward`，仅保留 sparse indexer 加 `forward_mqa` 在 eager 区域（#51430）。",
+    "sig-spec-decode": "MRV2 启用 MTP topk index buffer 在 draft step 间共享，引入 callback pattern 避免模型特定优化泄漏到 `AutoRegressiveSpeculator`（#47352）。修复 MRV1 dspark `parallel_drafting_token_id` 初始化 bug，对齐 MRV2 已有修复（#51602）。",
+    "sig-omni": "修复 MiMo 视觉注意力 window attention 路径未应用 attention sinks 导致 sink 权重从检查点加载后被丢弃。新增 `sinks_bias_key0` 模式在 key 0 上加偏置而非作为 null logit，精度与 LSE correction 相同但快 2-4x（#49815）。"
+  },
+  "commits": [
+    {
+      "sha": "b2506d62aec7e6bccc5959b829221a7ae217abf3",
+      "comment": "**背景**：#45254 和多路径框架变更几乎同时合并，各自独立时通过但组合后在 `main` 上破坏了 Ernie-4.5-VL 编码器 CUDA-graph replay。`SupportsEncoderCudaGraph.postprocess_encoder_output` 现接收按编码器路径键控的 `outputs: dict[str, torch.Tensor]`（多路径图支持），但 `Ernie4_5_VLMoeForConditionalGeneration` 的覆写仍将第一个参数视为单个 tensor，导致 `AttributeError: 'dict' object has no attribute 'device'`。\n**方法**：fix-forward 修复而非 revert，从 dict 中正确提取对应路径的 tensor。\n**效果**：Ernie-4.5-VL 编码器 CUDA-graph replay 恢复正常。",
+      "sig": "sig-core",
+      "sig_reason": "Ernie-4.5-VL 模型编码器 CUDA-graph postprocess 对多路径输出的适配修复。",
+      "tags": ["bugfix", "high-risk", "ernie-4.5-vl", "cuda-graph", "multimodal"],
+      "pr_number": 51461
+    },
+    {
+      "sha": "d8c70f22434afcbd6644aa43d3f23aecb6e5a09f",
+      "comment": "**背景**：Rust 前端使用自定义 `TemplateMap`（#44311）绕过 MiniJinja 2.18 的 method lookup precedence 问题——对 `items` 等键的 mapping 查找不正确。\n**方法**：升级 MiniJinja 和 minijinja-contrib 从 2.18.0 到 2.22.0，移除自定义 `TemplateMap`，直接将工具定义和工具调用参数作为普通 `serde_json::Value` 传递。采用 Jinja2 风格直接布尔渲染。\n**效果**：255 项 lib 测试 + 17 项 chat 测试 + 31 项 gRPC 测试通过，16/16 模型配置 roundtrip suite 通过，prompt hash 稳定。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 MiniJinja 依赖升级和 workaround 移除。",
+      "tags": ["refactor", "low-risk", "rust-frontend", "minijinja"],
+      "pr_number": 51235
+    },
+    {
+      "sha": "8a9f9f762a47e24ed8b48a8472f6757346cb30ae",
+      "comment": "**背景**：Release v0.27.0 build 4962 的 DockerHub 发布步骤耗时超过 2 小时，脚本在一个 agent 上串行拉取、重标记和推送每个镜像系列。CUDA 12.9 最慢 40 分 20 秒，两系列合计约 72 分钟关键路径。\n**方法**：用七路 Buildkite matrix 替换串行 DockerHub 发布作业，CUDA 13.0、CUDA 12.9、两个 Ubuntu 24.04 CUDA 变体、ROCm、XPU 和 CPU 镜像系列独立发布。保留审批块和 `all` 向后兼容默认值。\n**效果**：发布关键路径从所有系列之和降为最慢单个系列。",
+      "sig": "sig-ci",
+      "sig_reason": "Release 镜像发布 CI 流水线并行化。",
+      "tags": ["ci", "low-risk", "release", "docker", "buildkite"],
+      "pr_number": 51735
+    },
+    {
+      "sha": "8977ea8895b19023f729db474d0f609e5bbac144",
+      "comment": "**背景**：离线 beam search 在每步内部请求中要求 `logprobs = 2 * beam_width`，引擎对每个 token id 进行 detokenization，但 beam search 从不读取这些字符串——它按 `cum_logprob` 排名 beam 并自行解码最终文本。#46422 已为在线路径修复了相同模式。\n**方法**：在两个内部 `SamplingParams` 上设置 `detokenize=False`。\n**效果**：A100 Qwen3-1.7B 上 beam width 4 提速 1.25x、width 8 提速 1.32x、width 20 提速 1.42x，输出 token id bit-identical。",
+      "sig": "sig-model-performance",
+      "sig_reason": "离线 beam search 采样路径性能优化。",
+      "tags": ["perf", "low-risk", "beam-search", "detokenization"],
+      "pr_number": 50333
+    },
+    {
+      "sha": "8bcc916a98a90822882455ab30aba02c409da2a6",
+      "comment": "**背景**：`DeepseekV4Tokenizer.__len__` 过度计数词表大小——返回 `tokenizer.vocab_size + len(get_added_vocab())`，但 1283 个 added token 中有 3 个 id 低于 128000（已在 base vocab 中），真实 token 数为 129280 而非 129283。这导致 guided decoding 崩溃。`deepseek_v32.py` 有相同陈旧模式。\n**方法**：移除 `__len__` 覆写，transformers 5.x `TokenizersBackend` 的 `len()` 已包含 added tokens。\n**效果**：DeepSeek V4/3.2 tokenizer 词表大小正确，guided decoding 不再崩溃。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4/3.2 tokenizer 词表大小计算修复。",
+      "tags": ["bugfix", "high-risk", "deepseek-v4", "tokenizer", "guided-decoding"],
+      "pr_number": 51727
+    },
+    {
+      "sha": "3e174bb73c70b677dd339c59c39d7460abc5d02d",
+      "comment": "**背景**：Deepseek 风格 topk index 选择在 MTP propose 阶段存在 bug——当 topk indices 在所有 MTP draft step 间共享时，`set_skip_topk` 在第一个 draft step 后调用以强制后续步骤复用相同 topk indices。此特性已在 MRV1 中引入（#44420），但 MRV2 缺失。\n**方法**：为 MRV2 启用此特性。引入 callback pattern（`AutoRegressiveSpeculatorCallbacks`），避免将模型特定优化泄漏到 `AutoRegressiveSpeculator`。topk index sharing 在 `MTPSpeculator` 加载 draft model 后注册。\n**效果**：DeepSeek-V3.2-NVFP4 TP4 MTP=3 上 decode throughput 提升，正确性不变。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "MRV2 MTP topk index buffer 跨 draft step 共享优化。",
+      "tags": ["feature", "medium-risk", "mrv2", "mtp", "spec-decode", "topk"],
+      "pr_number": 47352
+    },
+    {
+      "sha": "c3cac8c63d917759a38e94dfa933e71196de40bb",
+      "comment": "**背景**：`MiMoVisionAttention` 仅在 block 不在 `fullatt_block_indexes` 中时分配 `self.sinks`，而这正是运行 `_forward_window_attn` 的 block 集合。该路径从未读取该参数，所以 sink 权重从检查点加载后被丢弃。`XiaomiMiMo/MiMo-V2.5` 为 28 个 block 中的 24 个（非 full attention block）提供 `visual.blocks.N.attn.sinks`。\n**方法**：新增 `sinks_bias_key0` 模式在 key 0 上加偏置而非作为 null logit 膨胀分母，将 window 路径路由通过该 kernel。一次 softmax pass 即可在偏置分数上归一化。\n**效果**：精度与 LSE correction 相同（2.14e-03 bf16 噪声底），kernel 路径快 2-4x，减少约 50 行 correction 代码。",
+      "sig": "sig-omni",
+      "sig_reason": "MiMo 视觉模型 window attention sinks 正确性修复和内核优化。",
+      "tags": ["bugfix", "medium-risk", "mimo", "vision-attention", "sinks", "triton"],
+      "pr_number": 49815
+    },
+    {
+      "sha": "98a4144a4197c2b96e4df7bfd9c386d4fbdb1f4f",
+      "comment": "**背景**：fork-path logits processor 测试 helper 替换 `importlib.metadata.entry_points` 进程范围，此前对 `vllm.logits_processors` 以外的每个组返回空结果。PyTorch nightly 现通过 `torch.distributed.backends` 注册内置分布式后端，forked engine workers 无法发现 NCCL 并失败。\n**方法**：将非 logitproc 查询委托给原始实现，同时继续注入 fake logits processor 组。新增回归测试覆盖两种行为。\n**效果**：forked engine workers 可发现 NCCL 后端，不再报 `Unknown c10d backend type NCCL`。",
+      "sig": "sig-ci",
+      "sig_reason": "logits processor 测试 mock 修复 entry points 吞噬问题。",
+      "tags": ["test", "low-risk", "entry-points", "nccl", "logits-processor"],
+      "pr_number": 51097
+    },
+    {
+      "sha": "fa722b9f0188179a66728f2f882e9d5bc92c9b0c",
+      "comment": "**背景**：Rust 前端 gRPC 推理 API 缺少显式数据并行 rank 路由。\n**方法**：在 `GenerateRequest` 中添加可选 `data_parallel_rank`，将请求的全局 rank 通过请求转换转发到 EngineCore 选择。仅路由到匹配全局身份的已连接 engine；字段未设置时保留负载均衡。拒绝无法由 vLLM 两字节 engine identity 表示的 rank。\n**效果**：gRPC 推理 API 支持显式 DP rank 路由，62 项 cmd 测试 + 31 项 gRPC 测试 + 3 项 world_size 测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 gRPC 数据并行 rank 路由功能。",
+      "tags": ["feature", "medium-risk", "rust-frontend", "grpc", "data-parallel"],
+      "pr_number": 51178
+    },
+    {
+      "sha": "3c6b2e9c08447a7f839c6aa201d2683ab52d267e",
+      "comment": "**背景**：审阅者在早期 job 失败后通常有足够信号，应能停止剩余分支构建而非消耗更多 CI 容量。\n**方法**：在 `/ci run` 和 `/ci retry` 旁添加精确的 `/ci cancel` PR 评论命令，查找 PR 当前分支的可取消 Buildkite 构建，验证每个构建属于该 PR，通过 Builds API 请求取消。\n**效果**：审阅者可通过 `/ci cancel` 停止剩余 CI 构建，38 项测试通过。",
+      "sig": "sig-ci",
+      "sig_reason": "GitHub Actions CI 命令扩展。",
+      "tags": ["feature", "low-risk", "ci", "github-actions", "buildkite"],
+      "pr_number": 51732
+    },
+    {
+      "sha": "635dd6aae656f3b47d174461f34d3de799f2dc94",
+      "comment": "**背景**：vLLM 的 gRPC schema 需要发布到 Buf Schema Registry (BSR) 供下游 SDK 消费。\n**方法**：在 `rust/proto` 添加命名公共 Buf 模块，PR 时 build 和 lint schema 变更，每日发布 Git `main` schema 到 Buf `nightly` label，发布 tag 时更新 `main` label 并添加 `vX.Y.Z` label。Pin Buf CLI 和 GitHub Actions 版本。\n**效果**：gRPC schema 发布到 BSR，仅 schema 发布和文档变更，不修改 Protobuf wire schema 或运行时行为。",
+      "sig": "sig-ci",
+      "sig_reason": "gRPC protobuf schema 发布基础设施。",
+      "tags": ["feature", "low-risk", "grpc", "buf", "schema-registry"],
+      "pr_number": 51276
+    },
+    {
+      "sha": "63ac04a61e6272b746d82e180e7f6276b3ee1ede",
+      "comment": "**背景**：Kimi-K3 需要添加 decode context parallelism (DCP) 支持，继 #50000 之后。TP8 下 HBM KV 容量受限（1.933M tokens/GPU），需要 DCP 扩展至 19.752M tokens/GPU。\n**方法**：添加直接 symmetric-memory DCP A2A 输出/LSE reduction（含空 KV shard 掩码），DCP 支持融合 Kimi-K3 MLA 层，NVLS-multicast direct query gather 和 multimem chunked-context KV gather，直接将 query shard 发布到 consumer-final buffer 以移除 staging-to-final materialization。\n**效果**：GSM8K 准确率 DCP8 96.97% vs TP8 96.21%；120k regression workload TPOT 降 23-31%，HBM KV 容量从 1.933M 提升至 19.752M tokens/GPU。4x GB200 上 query-exchange 延迟降低 10.4%-29.9%。",
+      "sig": "sig-core",
+      "sig_reason": "Kimi-K3 decode context parallelism 核心引擎扩展。",
+      "tags": ["feature", "high-risk", "kimi-k3", "dcp", "context-parallelism", "mla"],
+      "pr_number": 50484
+    },
+    {
+      "sha": "3f142bd85e962a795c6c484f0249f9c92aed37b2",
+      "comment": "**背景**：DeepSeek V4 tokenizer 在未指定 thinking 或 enable_thinking 时默认为 thinking 模式，但 parser 默认为 content 模式，导致 reasoning 和 DSML tool-call 标记泄漏到 content 而非产生结构化 `reasoning_content` 和 `tool_calls`。不匹配由 #50580 引入。\n**方法**：对齐 parser 与 tokenizer 的默认 thinking 行为，同时保留通过 `thinking=false`、`enable_thinking=false` 或 `reasoning_effort=none` 的显式 opt-out。\n**效果**：parser 默认行为与 tokenizer 一致，reasoning 和 tool-call 不再泄漏到 content。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4 reasoning parser默认行为与 tokenizer 对齐修复。",
+      "tags": ["bugfix", "medium-risk", "deepseek-v4", "parser", "reasoning"],
+      "pr_number": 51296
+    },
+    {
+      "sha": "d40c3e3c00ab904928ab51c9c62b7f514c39647d",
+      "comment": "**背景**：DSpark 启动时 `profile_run` 调用 `forward_mqa` 无 attention metadata 来 sizing warmup workspace。对于 SWA-only draft layer（`compress_ratio <= 1`），`topk_indices_buffer` 故意不分配，但 warmup 路径断言该 buffer 存在后再设置 `top_k` 为零，导致引擎在加载完整 target 和 draft model 后失败。\n**方法**：在访问 sparse top-k buffer 前处理 SWA-only 情况——SWA-only warmup 使用 `top_k = 0` 不需要 sparse index buffer，断言仅保留在需要 buffer 的 sparse 路径中。\n**效果**：DSpark SWA-only draft layer warmup 不再失败。",
+      "sig": "sig-core",
+      "sig_reason": "DSpark warmup 路径 SWA-only draft layer 兼容性修复。",
+      "tags": ["bugfix", "medium-risk", "dspark", "warmup", "sparse-index"],
+      "pr_number": 50693
+    },
+    {
+      "sha": "1482d2e015cc71e6ce0d3d92249cb78f4738f2e7",
+      "comment": "**背景**：需要启用 ROCm AMD 设备上 vLLM Disaggregated inference P/D with MoRI IO KV connector 的 Buildkite CI。\n**方法**：添加 `.buildkite/amd-disagg` 下的 Buildkite CI 脚本，支持两种模式——WIDE_EP_MODE=0 为通用 PD TP8 独立服务，WIDE_EP_MODE=1 为 DP + Expert Parallelism。包含 cluster.sh、pipeline.disagg.yaml、run-slurm-disagg-test.sh 等文件。\n**效果**：AMD 分布式推理 CI 可用，GSM8k 1P1D TP8 0.947、1P1D DP8 EP 0.953、2P2D DP16 EP 0.932。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm AMD 分布式推理 CI 基础设施。",
+      "tags": ["feature", "low-risk", "rocm", "disagg", "ci", "slurm"],
+      "pr_number": 47030
+    },
+    {
+      "sha": "05f0a80016a4a12c5f4e241e92e233acd1c2c0b0",
+      "comment": "**背景**：结构化输出（如 JSON schema）时，模型可在 grammar FSM 仍在 object 中间时采样 stop token，截断生成产生无效 JSON。根因：xgrammar 仅知道 tokenizer的单个 eos，但请求的真实 stop 集合是 `generation_config` 的 eos 列表加用户 `stop_token_ids`。Gemma-4 的 `generation_config` eos 是 `[1, 106, 50]` 但 tokenizer eos 仅 `<eos>` (1)，token 106/50 对 grammar 不可见。\n**方法**：将请求的 `sampling_params.all_stop_token_ids` 转发到 `compile_grammar(...)` 进入 xgrammar 的 `GrammarMatcher(override_stop_tokens=...)`。xgrammar 在语法终端状态前门控每个请求 stop token——object 中间掩码，schema 满足后允许。\n**效果**：Gemma-4 结构化输出不再被 mid-object stop token 截断为无效 JSON。",
+      "sig": "sig-core",
+      "sig_reason": "结构化输出 xgrammar stop token 掩码修复。",
+      "tags": ["bugfix", "high-risk", "structured-output", "xgrammar", "gemma-4"],
+      "pr_number": 49227
+    },
+    {
+      "sha": "405bc86768d1267f05dd2d4139048eb30a84b6cb",
+      "comment": "**背景**：`_topk_topp_kernel`（Qrita 采样 kernel）每个 logits row 运行一个 program，每个 program 串行扫描整个 vocab row 的 `BLOCK_SIZE=8192` tile。Triton 默认 `num_warps=4` 使 8192 宽 fp32 tile 每 lane 仅 16 个元素，per-tile 延迟 warp-starved。该 kernel 是 seeded/per-request-generator 采样的热路径。\n**方法**：在 CUDA 上以 `num_warps=8` 启动 kernel（ROCm 保留默认 64-wide wavefronts）。\n**效果**：SM120 36/36 组合更快（1.2-1.5x），SM90 54/54 组合更快（1.02-1.85x，均值 1.37x），无回归。e2e `_topk_topp_kernel` 305.8 至 165.9 us/step（1.84x）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "top-k/top-p Triton 采样 kernel warp 数优化。",
+      "tags": ["perf", "low-risk", "triton", "sampler", "topk-topp"],
+      "pr_number": 51507
+    },
+    {
+      "sha": "79c865b838e34f7a98a936771284773819d79c8f",
+      "comment": "**背景**：DeepSeek V4 eager CUDA graph 区域过大，包含 Q up-projection、fused Q normalization/RoPE/KV insertion、indexer input preparation 和 MLA/indexer compression。之前的 region-narrowing 变更因输出损坏被 revert。\n**方法**：将 producer 操作移入 `forward`，仅保留 sparse indexer 操作加 `forward_mqa` 在 eager 区域。移除 tuple-of-mostly-None 管道，给 input-projection helper 描述性名称和显式返回类型，复用 indexer 现有 `forward` 方法。持久 eager scratch workspace 保持 eager 区域消费的 tensor 地址稳定。不减少 stream 并行度。\n**效果**：收窄 eager 区域同时保持 stream 并行度不变，ROCm 保留顺序 fallback。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DeepSeek V4 eager CUDA graph 区域收窄优化。",
+      "tags": ["perf", "low-risk", "deepseek-v4", "cuda-graph", "eager-region"],
+      "pr_number": 51430
+    },
+    {
+      "sha": "21c667aa64d4023320fb608b81a343e7f9a47250",
+      "comment": "**背景**：缓存命中的 Build image job 中，test image 在安装 Git 和开发依赖前添加完整 repository。任何源码变更使两个本可稳定的 layer 失效——Git 安装（18.9s, 65MB）和开发依赖（26.0s, 895MB），约 45 秒执行和 916 MiB 重新生成/push。\n**方法**：将 runtime-only setup 拆分为共享 `vllm-runtime-base` stage，添加 `test-deps` stage 在 per-commit artifacts 前安装 Git 和 `requirements/dev.txt`，在 final `test` stage 安装 vLLM 和 EP wheels 后添加 repository source。\n**效果**：源码变更不再使 Git 和开发依赖 layer 失效，BuildKit 可复用两个 layer 直到实际输入变更。",
+      "sig": "sig-ci",
+      "sig_reason": "Docker test 依赖缓存 layer 顺序优化。",
+      "tags": ["perf", "low-risk", "docker", "build-cache", "test-deps"],
+      "pr_number": 51184
+    },
+    {
+      "sha": "355a338b8f54befed4ab23a9f09aff301de26b4f",
+      "comment": "**背景**：MRV1 中 dspark `parallel_drafting_token_id` 初始化存在 bug，该 bug 已在 MRV2 的 `get_parallel_drafting_token_id` 函数中修复。\n**方法**：在 MRV1 中修复 `parallel_drafting_token_id` 初始化 bug，对齐 MRV2 已有修复。\n**效果**：MRV1 dspark `parallel_drafting_token_id` 初始化正确。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "MRV1 dspark parallel_drafting_token_id 初始化修复。",
+      "tags": ["bugfix", "medium-risk", "mrv1", "dspark", "spec-decode"],
+      "pr_number": 51602
+    },
+    {
+      "sha": "3a749ce81600f67e609eeb4a9b2b8da52dac16f2",
+      "comment": "**背景**：`VLLM_USE_PRECOMPILED=1 uv pip install --editable .` 调用 `setup.py` 进行 `egg_info`、`dist_info` 和实际 editable build。因为 precompiled-wheel setup 在模块作用域运行，每个阶段可解析、下载和提取同一个 wheel。\n**方法**：为 `egg_info` 和 `dist_info` 两个 metadata-only 命令跳过 precompiled artifact setup。实际 wheel build 路径不变。\n**效果**：wheel 访问和提取从三次降为一次，editable 安装成功完成。",
+      "sig": "sig-ci",
+      "sig_reason": "precompiled wheel metadata hooks 期间重复 fetch 修复。",
+      "tags": ["perf", "low-risk", "build", "setup-py", "precompiled-wheel"],
+      "pr_number": 51424
+    },
+    {
+      "sha": "0e2d78028c473bb04fc74bf945eb32da29239b0c",
+      "comment": "**背景**：AMD vendored KDA kernel `fused_recurrent_kda_packed_decode` 将 `state_indices` 视为 unit-stride 索引并拒绝其他 stride。NVIDIA 同一 kernel 副本已接受 `stride_state_indices` 且仅要求一维。开启推测解码后 `GDNAttentionMetadataBuilder` 将 KDA state slot 派生为 `block_table_tensor[:, 0]`，对于 Mamba group block table 有 `1 + num_speculative_blocks` 列，所以该列是 strided view，warmup 报错。\n**方法**：使 AMD 副本接受 `stride_state_indices` 参数并放宽检查与 NVIDIA 副本一致，kernel 直接计算地址而非调用者强制 contiguous copy。测试参数化扩展到两个 kernel 副本。\n**效果**：Kimi-K3 AMD 推测解码 warmup 不再因 strided `state_indices` 失败，AMD/NVIDIA kernel 收敛而非进一步分叉。",
+      "sig": "sig-core",
+      "sig_reason": "AMD KDA decode kernel state-index stride 支持修复。",
+      "tags": ["bugfix", "medium-risk", "kimi-k3", "amd", "kda", "spec-decode"],
+      "pr_number": 51682
+    }
+  ]
+}
