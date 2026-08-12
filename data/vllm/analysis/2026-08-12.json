@@ -1,0 +1,265 @@
+{
+  "date": "2026-08-12",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-12T20:00:00+08:00",
+  "daily_summary": "当日 31 条变更，主要覆盖 GPU↔CPU 同步优化、ROCm MoE/双流解码改进、KV cache 布局修复、MRV2 编码器时序修复和 CI 基础设施优化等方向。性能方面移除模型执行路径上多处 GPU↔CPU 同步、ROCm 启用 fused bf16→fp32 router GEMM 和双流 decode hipgraph 兼容。正确性方面修复 ROCm 混合模型 KV-first attention 页重叠、MoE expert_map 与 AITER expert_mask 混淆、FlashAttention sliding window 从 KV cache group 读取而非 layer、FA4 FP8 descale 丢失、以及 KV block zeroing 仅覆盖 full-attention group 等问题。CI 方面升级 Transformers 至 5.15.0、加速 ROCm skinny GEMM 测试、修复 tensor IPC 多进程测试稳定性。新增 Triton Proton profiling 后端和 DeepSeek-V4 gfx11 支持。",
+  "sig_summaries": {
+    "sig-core": "移除模型执行路径上多处 GPU↔CPU 同步，涵盖 kv-sharing fast prefill、mamba2、EPLB、gemma4、多模态处理器等（#51738）。启用 DeepSeek-V4 在 ROCm gfx11 上的支持（#47017）。修复 MRV2 uniform-decode dispatch 要求所有请求均处于 decoding 状态（#51865）。新增 Triton Proton profiling 后端（#48789）。KV-Cache Layout 重构引入 `replace_as()` 泛化 replace helper 修复 promotion 丢字段 bug（#51612）。修复 ROCm 混合模型 KV-first attention 块页重叠导致推测解码输出乱码（#51837）。删除模型中未使用的 `is_internal_router` 等死代码（#51838）。修复 Inkling 模型 HF config 字段兼容（#51850）。泛化 KV block zeroing 到 `AttentionSpec` 修复 sliding-window 回收页残留数据（#51749）。修复 MRV2 编码器时序统计缺失（#50020）。",
+    "sig-model-performance": "ROCm 启用 fused bf16→fp32 router GEMM，将 fp32 cast 折入 hipBLASLt GEMM epilogue，TPOT 提升 1.6%（#50268）。ROCm 双流 decode 兼容 hipgraph，将 shared expert 提前到 aux stream 启动实现真正 overlap，DPA 下 TPOT 降 3-4%（#48223）。FlashInfer XQA decode 支持 SM12x，含 uniform/ragged spec decode 和 sliding-window（#49718）。修复 ROCm MoE `expert_map` 与 AITER `expert_mask` 在非 AITER kernel 下混淆导致 EP 下 token 坍缩（#49758）。修复 MoE fused block-scale 方向推断错误导致 Qwen3-VL 精度下降（#50727）。允许 FlashInfer one-sided all2all 下 shared expert overlap，TPOT 改善 5-7%（#50569）。修复 FlashAttention sliding window 从 KV cache group 而非 layer 读取导致全局层丢失历史（#51756）。",
+    "sig-ci": "分布式测试改用 `file://` rendezvous 避免 CI 并行下端口竞争（#51652）。稳定 tensor IPC 多进程测试，使用显式 spawn context 和有界清理（#50804）。vLLM Recipes 转换支持不同数据类型和部署策略（#51878）。ROCm skinny GEMM 测试从 2 小时降至 10 秒（#51877）。修复 `test_sharded_state_loader` 在 PyTorch 2.14 下 batch 不变性问题（#51736）。移除陈旧的 FlashAttention metadata 参数（#51854）。恢复 MiniCPMV transformers 版本 cap，限定 HF runner（#45042）。支持部分 torch requirement 上下文中 `use_existing_torch.py`（#51832）。升级 Transformers 至 5.15.0（#51668）。",
+    "sig-large-scale-serving": "修复 TieredOffloading 在 KV promotion 触发时返回 `HIT_PENDING` 而非错误状态，解决 #51439 中的 KV cache 提升竞态问题（#51840）。",
+    "sig-rl": "重写 weight-transfer 文档，统一 RL 示例为单一 inference-side 模式，删除冗余的 `rlhf_nccl.py` 和 `rlhf_ipc.py`，移除废弃的 worker ABC 抽象方法（#51729）。",
+    "sig-omni": "移除 ROCm 陈旧的 Math SDPA 强制和 skinny GEMM 禁用 workaround，修复 MI250 上 32-image Gemma3 profiling OOM，修复非连续激活在 ROCm GEMM dispatcher 中的 bug（#50907）。",
+    "sig-quantization": "修复 TurboQuant v2 docstring 中 `[i][j]` 被 mkdocs-autorefs 误解析为交叉引用的 WARNING（#51857）。修复 FA4 路径丢失 per-head FP8 Q/K/V descale 导致 llm-compressor 注意力/KV 量化检查点输出乱码（#51363）。"
+  },
+  "commits": [
+    {
+      "sha": "3fa89225bc5f36ad3ada1edf0ff8c99425d7ff24",
+      "comment": "**背景**：`get_open_port()` 在释放探测 socket 后、spawn 出的 worker 初始化真正 process group 前存在端口被其他 CI 进程抢占的窗口，导致 `EADDRINUSE` 间歇失败。\n**方法**：将 DCP A2A 多进程启动器和 CUDA Async-TP spawn 测试从 probe-then-bind TCP rendezvous 切换为共享 `file://` rendezvous，新增 FileStore init method 唯一性测试覆盖。\n**效果**：单节点分布式测试在并行 CI 下不再出现端口竞争失败，21 项网络工具测试通过。",
+      "sig": "sig-ci",
+      "sig_reason": "分布式测试启动器 rendezvous 机制改进，属 CI 测试稳定性范畴。",
+      "tags": ["test", "low-risk", "rendezvous", "filestore", "distributed"],
+      "pr_number": 51652
+    },
+    {
+      "sha": "20727e2841ed7c3194ad5d6410486fc72dac4556",
+      "comment": "**背景**：MoE router gate 需要 `out_dtype=torch.float32`，但 ROCm 上 fused fp32-output GEMM 仅在 CUDA 平台启用，导致 ROCm 回退到 bf16 GEMM + 独立 cast kernel，在性能 trace 中可见一个独立的 bf16→fp32 copy kernel。\n**方法**：在 `gate_linear.py` 中将 `allow_cublas_router_gemm` 的条件扩展为 ROCm 同样适用（无 bias、bf16 权重、fp32 输出），使 fused tier 在 ROCm 上执行，将 fp32 cast 折入 hipBLASLt GEMM epilogue。\n**效果**：gfx942 上基准测试 duration 降 1.6%，output throughput 升 1.6%，精度在 ~6e-5 容差内匹配 fp32 参考。CUDA 无影响。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm MoE router gate GEMM 性能优化，将 fp32 cast 融入 GEMM epilogue。",
+      "tags": ["perf", "medium-risk", "rocm", "moe", "gemm", "hipblaslt"],
+      "pr_number": 50268
+    },
+    {
+      "sha": "f97e5029698cb9b4b63dcb53e2e7140a5035804b",
+      "comment": "**背景**：模型执行路径上存在多处 GPU→CPU roundtrip sync（如 `.max().item()`、`torch.any().item()`、Python 标量索引等），在 VLLM_GPU_SYNC_CHECK 分支下被暴露。\n**方法**：逐个消除而非抑制：kv-sharing fast prefill 从 host 端数据推导 decode metadata，新增 `CommonAttentionMetadata.max_logits_per_req`；mamba2 从 CPU prefill metadata 推导 `prep_initial_states`；EPLB `non_blocking=True`；gemma4 缓存 per-device suppressed-token index 并用 `index_fill_`；多模态处理器标记 token-id/size 字段 `keep_on_cpu=True`。\n**效果**：每步减少多处 host roundtrip，模型执行路径更高效。",
+      "sig": "sig-core",
+      "sig_reason": "模型执行路径上 GPU↔CPU 同步消除，涉及 attention metadata、mamba2、EPLB、多模态处理器等核心组件。",
+      "tags": ["perf", "high-risk", "gpu-sync", "attention", "mamba2", "eplb", "multimodal"],
+      "pr_number": 51738
+    },
+    {
+      "sha": "23f25aac141c885c9885bdec1d26ffcca8eab184",
+      "comment": "**背景**：PR #32104 引入的短 parent deadline 和不完整失败清理在 ROCm 上导致 parent 在 children 仍在导入时超时，销毁同步对象后产生误导性 `SemLock` 错误。\n**方法**：使用显式 spawn context 管理所有队列/事件/barrier/worker，给予 spawned worker 共享 60 秒启动和结果 deadline，按角色标记编码器/解码器结果而非依赖跨进程队列顺序，失败时执行有界 join/terminate/kill 清理。\n**效果**：12 项 tensor IPC 测试全部通过，ROCm 上不再出现误导性 SemLock 错误。",
+      "sig": "sig-ci",
+      "sig_reason": "tensor IPC 多进程测试 harness 稳定性修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "tensor-ipc", "multiprocessing", "rocm"],
+      "pr_number": 50804
+    },
+    {
+      "sha": "f067737b2a4ba4385f30256baa297200d06300c1",
+      "comment": "**背景**：TieredOffloading 在 KV promotion 触发时返回错误状态，导致 #51439 中的 KV cache 提升逻辑出现竞态问题。\n**方法**：在 KV promotion 触发时返回 `HIT_PENDING` 而非错误状态，使上层调度逻辑能正确处理正在进行的提升操作。\n**效果**：修复 KV cache 提升竞态问题，分层卸载行为正确。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "TieredOffloading KV cache 提升状态修复，属大规模服务范畴。",
+      "tags": ["bugfix", "high-risk", "tiered-offloading", "kv-cache", "promotion"],
+      "pr_number": 51840
+    },
+    {
+      "sha": "793ca6998adfa5a3ab22d6012dee78044b8ba901",
+      "comment": "**背景**：trainer-side weight-transfer 文档中所有代码片段仍描述已被 PR 2/3 移除的静态 `trainer_send_weights` 路径，RL 示例分散在多个文件中且不可无人值守运行。\n**方法**：围绕已发布的抽象（`WeightSource`/`ModuleSource`/`VLLMWeightSyncClient`）重写四页文档；删除冗余的 `rlhf_nccl.py` 和 `rlhf_ipc.py`，将 fp8 量化移入 `rlhf_http_nccl.py`；HTTP 示例自启停 `vllm serve`；移除废弃的 `WeightTransferEngine.trainer_send_weights` ABC 方法。\n**效果**：RL 文档与实际 API 对齐，示例可无人值守运行，CI 覆盖保留。",
+      "sig": "sig-rl",
+      "sig_reason": "RL weight-transfer 文档重写和示例标准化。",
+      "tags": ["docs", "low-risk", "rl", "weight-transfer", "examples"],
+      "pr_number": 51729
+    },
+    {
+      "sha": "9b3382685e85d6b7e6ab4adbe91f95a9924622fa",
+      "comment": "**背景**：vLLM Recipes 转换脚本不支持不同数据类型变体和多节点/单节点部署策略。\n**方法**：扩展 `recipe_json_to_vllm_config.py` 支持不同数据类型和策略参数。\n**效果**：Recipes 转换覆盖更多配置组合，手动测试通过。",
+      "sig": "sig-ci",
+      "sig_reason": "vLLM Recipes 转换工具功能扩展，属 CI/工具链范畴。",
+      "tags": ["feature", "low-risk", "recipes", "config-conversion"],
+      "pr_number": 51878
+    },
+    {
+      "sha": "045a986f3bad4f68e6409b17fffd26dcbca0f720",
+      "comment": "**背景**：`test_rocm_skinny_gemm` 测试套件参数化数量达 11040，每个参数化后执行环境清理（0.3s），总运行时间约 2 小时。\n**方法**：将参数化从 11040 减至 2644，移除每参数化的环境清理改为模块级一次性清理。\n**效果**：测试套件运行时间从约 2 小时降至约 10 秒。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm skinny GEMM 测试套件参数化精简和清理优化。",
+      "tags": ["test", "low-risk", "rocm", "gemm", "ci-perf"],
+      "pr_number": 51877
+    },
+    {
+      "sha": "47ececb58e073c6ff7a99033950455763f302055",
+      "comment": "**背景**：ROCm 上 dual-stream decode 的 shared expert 在 routed experts 完成后才在 aux stream 启动，导致无 overlap 的串行 launch；且此前未兼容 hipgraph。\n**方法**：将 shared expert 提前到 dispatch 之前在 aux stream 启动实现真正 overlap；使 dual-stream decode 兼容 hipgraph。仅在 DP 模式下启用（TP 下有性能回退），与 `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS` 互斥。\n**效果**：8xMI300 上 DSv3 DPA 下 1k/1k 和 8k/1k TPOT 降 3-4%。FSE 可用时仍优于 dual-stream。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm 双流 decode 性能优化和 hipgraph 兼容。",
+      "tags": ["perf", "high-risk", "rocm", "dual-stream", "hipgraph", "moe"],
+      "pr_number": 48223
+    },
+    {
+      "sha": "466855a2bfc57e58f7e2d03ee2deba79ceab2617",
+      "comment": "**背景**：DeepSeek-V4 检查点在 ROCm gfx11/RDNA 设备上因 Python 端 sparse-indexer 路径阻塞和 `INCConfig` 未通过 ROCm 平台验证而无法运行。\n**方法**：在 gfx11 上注册 ROCm sparse-indexer ops；让 `SparseAttnIndexer.forward_hip()` 委托给 ROCm sparse-indexer custom op 并使用 op 级 fallback；将 `inc` 添加到 `RocmPlatform.supported_quantization`。\n**效果**：DeepSeek-V4-Flash-W4A16-AutoRound 在 gfx1100（TP=8）和 gfx1151（TP=2+EP=2）上验证通过，模型加载和 serving 正常。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek-V4 模型在 ROCm gfx11 平台上的启用，涉及 sparse-indexer、平台验证等核心组件。",
+      "tags": ["feature", "high-risk", "rocm", "deepseek-v4", "gfx11", "sparse-indexer"],
+      "pr_number": 47017
+    },
+    {
+      "sha": "0a94d85a66499cad8297ead86a470967de5c0212",
+      "comment": "**背景**：MRV2 uniform-decode dispatch 在所有请求并非均处于 decoding 状态时可能触发错误路径。\n**方法**：要求所有请求均处于 decoding 状态才进行 uniform-decode dispatch；将 `prepare_inputs` 中的部分逻辑拆分为 `gather_batch_req_state` 方法，在 dp token count / cuda-graph mode 同步之前运行，避免冗余计算。\n**效果**：MRV2 uniform-decode dispatch 正确性修复，减少冗余计算。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 model runner uniform-decode dispatch 正确性修复。",
+      "tags": ["bugfix", "high-risk", "mrv2", "uniform-decode", "model-runner"],
+      "pr_number": 51865
+    },
+    {
+      "sha": "1d2d83a07fd3180068917a031c28dcc83141d0be",
+      "comment": "**背景**：SM120/SM121 缺少 FlashInfer XQA decode 支持，无法利用 XQA 专用 API 的性能优势。\n**方法**：为 SM12x decode 选择 XQA API；支持 uniform 和 ragged spec decode（通过 `q_len_per_req` 和 `q_cu_seq_lens`）；构建 packed causal/non-causal draft mask；支持 sliding-window decode、attention sinks、non-causal draft attention 和 uniform-batch CUDA graph。对齐 Python/cubin/JIT-cache/Docker pin 到 FlashInfer 0.6.16.post1。\n**效果**：SM12x 获得 XQA decode 支持，SM90 shared-XQA 和 SM100 trtllm-gen 路径不变。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer XQA decode 在 SM12x 上的启用，属模型性能优化。",
+      "tags": ["feature", "low-risk", "flashinfer", "xqa", "sm12x", "attention", "spec-decode"],
+      "pr_number": 49718
+    },
+    {
+      "sha": "a367cdbca0824c8c428fe15b4552fbc4b824d718",
+      "comment": "**背景**：vLLM 缺少 Triton Proton profiling 后端，用户无法在 worker profiling 中采集 Triton kernel 级性能数据。\n**方法**：新增 Triton Proton 作为可选 worker profiling 后端（与 PyTorch/CUDA profiling 并列）。暴露 typed Proton context/data/CUPTI backend/output format/mode/Triton hook 配置；Proton 惰性导入；每请求独立 finalize 输出名（prefix/rank/process/instance/run-qualified）；配置验证中拒绝不支持的平台；要求 graph-free 执行（`--enforce-eager` 或 `cudagraph_mode=NONE`）。\n**效果**：NVIDIA GPU 上可通过 worker profiler 采集 Triton kernel profiling 数据。ROCm 支持推迟到后续 PR。",
+      "sig": "sig-core",
+      "sig_reason": "Triton Proton profiling 后端集成，属核心 profiling 基础设施。",
+      "tags": ["feature", "low-risk", "profiler", "triton-proton", "cupti", "nvidia"],
+      "pr_number": 48789
+    },
+    {
+      "sha": "61874f9842bd084cc5e9e348de4b3b6a8f46cdc8",
+      "comment": "**背景**：`_promote_local_kv_cache_specs` 为每个类手写构造调用，字段列表已漂移：MLA 和 chunked-local promotion 静默丢弃 `kv_quant_mode`（导致量化 KV cache 页大小错误）和 `head_size_v`。\n**方法**：新增 `replace_as()`——`dataclasses.replace` 泛化为跨类重建——通过 MRO 解析 source→target 类映射驱动 promotion，所有共享字段自动携带。\n**效果**：promoted MLA 和 chunked-local spec 保留 `kv_quant_mode`；`SlidingWindowMLASpec` 记录 `sliding_window`。新字段不再被 promotion 静默丢弃。",
+      "sig": "sig-core",
+      "sig_reason": "KV-Cache Layout 重构中 promotion helper 修复，涉及核心 KV cache 接口。",
+      "tags": ["refactor", "medium-risk", "kv-cache", "layout-refactor", "dataclasses"],
+      "pr_number": 51612
+    },
+    {
+      "sha": "cb30f6f8ddca45fd2e2acc3c43735a7c3b2ecdd3",
+      "comment": "**背景**：`test_sharded_state_loader` 在 PyTorch 2.14 下失败——比较直接加载与 reshard 后加载的输出时，vLLM scheduler 可能在不同 batch 间调度不同数量的 batch，违反 batch 不变性假设。\n**方法**：强制 generation 一次只处理一个序列以固定 batch size，与 ROCm 路径已有做法对齐。\n**效果**：PyTorch 2.14 下测试通过。",
+      "sig": "sig-ci",
+      "sig_reason": "sharded state loader 测试 batch 不变性修复。",
+      "tags": ["test", "low-risk", "sharded-loader", "batch-invariance"],
+      "pr_number": 51736
+    },
+    {
+      "sha": "3e372c5ff23438eeeafc86c7d8d51026f3dacb6a",
+      "comment": "**背景**：MI300 上 DSpark 推测解码在 `Qwen3.6-35B-A3B-NVFP4` 上产生乱码，GSM8K 精度从 0.95 降至 0.20。根因是 ROCm KV cache 布局 `(2, num_blocks, block_size, num_kv_heads, head_size)` 使 K/V 分布在分配的两半，block `b` 覆盖 page `b/2` 和 page `num_blocks/2+b/2` 的各一半，导致 attention 块与 Mamba state 页解析到重叠字节互相覆盖。**方法**：将 view 构建为 page-first 再交换维度回来，使每个 block 拥有独立的 page。仅对 KV-first attention 层（且其分配同时被 Mamba state 使用时）应用，blocks-first 后端和 attention-only 分配不受影响。**效果**：MI300 上 DSpark 推测解码输出正确，H200 不受影响。",
+      "sig": "sig-core",
+      "sig_reason": "ROCm KV cache 布局导致混合模型 attention 与 Mamba state 页重叠的核心 bug 修复。",
+      "tags": ["bugfix", "high-risk", "rocm", "kv-cache", "hybrid-model", "spec-decode", "mamba"],
+      "pr_number": 51837
+    },
+    {
+      "sha": "0f0cb918b7c6d08aabb86ec4eff4bae05f6736d9",
+      "comment": "**背景**：`RoutedExperts.expert_map` 在 `VLLM_ROCM_USE_AITER=1` 时无论实际运行哪个 experts kernel 都返回 AITER 0/1 `expert_mask`，但非 AITER kernel（Triton `moe_wna16`、MXFP4 emulation、Marlin）期望 canonical global→local `expert_map`（`-1` 表示非本地），将 0/1 mask 误读为 slot index 导致所有 token 坍缩到 slot 0/1。**方法**：`expert_map` 询问已解析的 experts kernel 需要哪种表示——仅 AITER CK kernels（`AiterExperts` 和 `AiterMxfp8Experts`）设置 `consumes_expert_mask` 并接收 0/1 `expert_mask`，其他 kernel 获取 canonical `_expert_map`。基于每层实际 kernel 而非全局 `VLLM_ROCM_USE_AITER` 开关。**效果**：Kimi-K2.6 INT4 WNA16 EP 下 GSM8K 5-shot 从 0.00 恢复到 0.95；AITER 路径行为不变。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm MoE expert_map 与 AITER expert_mask 混淆修复，影响 EP 下 MoE 推理正确性。",
+      "tags": ["bugfix", "high-risk", "rocm", "moe", "expert-parallel", "aiter"],
+      "pr_number": 49758
+    },
+    {
+      "sha": "36f4630d8926b8bd16fd6fc80b71e9defce2ad92",
+      "comment": "**背景**：PR #50137 修复了 fused per-channel scale 加载，但基于 tensor shape 的方向推断在两个维度都被量化 block size 除后无法可靠恢复 checkpoint 布局，导致 Qwen3-VL 的 fused gate/up 和 down-projection block scales 以错误方向加载，精度下降。**方法**：显式表示 fused checkpoint 布局而非从 tensor shape 推断——从模型层通过 `FusedMoEFactory` 向 `RoutedExperts` 传递 `is_fused_checkpoint_transposed` 设置；为 Qwen3-VL MoE 启用转置布局同时保留下游模型（如 InternS1Pro）的 decoder-layer 覆写；转置 fused 权重和 canonical block scales，保持 per-channel scales 不变。**效果**：Qwen3-VL MoE 精度恢复，涵盖标准和转置 w1/w2 权重/scale 布局。",
+      "sig": "sig-model-performance",
+      "sig_reason": "MoE fused block-scale 方向修复，影响量化 MoE 模型精度。",
+      "tags": ["bugfix", "medium-risk", "moe", "block-scale", "qwen3-vl", "quantization"],
+      "pr_number": 50727
+    },
+    {
+      "sha": "fd04edef3e62c8dec19cddd76253c0fc6d56ab62",
+      "comment": "**背景**：模型代码中存在未使用的 `is_internal_router` 和一些未使用的 expert rank/range 状态字段。**方法**：删除这些死代码，净减 189 行。**效果**：代码更清晰，无功能变化。",
+      "sig": "sig-core",
+      "sig_reason": "模型代码死代码清理，属核心模型代码维护。",
+      "tags": ["refactor", "low-risk", "dead-code", "models", "moe"],
+      "pr_number": 51838
+    },
+    {
+      "sha": "ded6c452c3657aad7149cedaf50e88aa83336f8f",
+      "comment": "**背景**：Inkling 模型的新量化检查点使用 Transformers 风格 config 字段名（`dense_intermediate_size` 等），与 vLLM 中 OG Inkling 字段名不兼容，导致加载失败。**方法**：同时接受 OG Inkling 和 Transformers config.json 字段名（MoE/dense intermediate sizes 和 conv kernel size），无需改写 Hub 配置。**效果**：新量化检查点可直接加载。",
+      "sig": "sig-core",
+      "sig_reason": "Inkling 模型 HF config 字段兼容性修复，属核心模型配置。",
+      "tags": ["bugfix", "medium-risk", "inkling", "config-compat", "quantization"],
+      "pr_number": 51850
+    },
+    {
+      "sha": "b2ab0960178cc737d8537208f1e1de79404ca1ac",
+      "comment": "**背景**：TurboQuant v2 模块 docstring 中 `pair_table[i][j]` 未用反引号包裹，Markdown 将 `[i][j]` 解析为完整引用链接，mkdocs-autorefs 尝试解析 `j` 为交叉引用目标失败，产生文档构建唯一的 WARNING。**方法**：将 `pair_table[i][j]` 用反引号包裹使其渲染为代码，与代码库中其他同类写法（如 `blocks[i][j]`）一致。**效果**：`mkdocs build` 零 WARNING，无功能变化。",
+      "sig": "sig-quantization",
+      "sig_reason": "TurboQuant 量化模块 docstring 修复，属量化文档维护。",
+      "tags": ["docs", "low-risk", "turboquant", "autorefs", "docstring"],
+      "pr_number": 51857
+    },
+    {
+      "sha": "cc668c5b72e7353569a388bb609f1a7644376756",
+      "comment": "**背景**：PR #51756 从 `FlashAttentionMetadata` 移除了 `sliding_window`，但 #46849 添加的两个 speculator metadata 测试 fixture 仍传入 `sliding_window=None`，导致 V1 测试套件失败。**方法**：从两个 speculator metadata fixture 中移除陈旧的 `sliding_window=None` 参数。**效果**：V1 测试套件恢复，无运行时行为变化。",
+      "sig": "sig-ci",
+      "sig_reason": "移除测试中陈旧的 FlashAttention metadata 参数，修复 CI 回归。",
+      "tags": ["test", "low-risk", "flashattention", "metadata", "v1"],
+      "pr_number": 51854
+    },
+    {
+      "sha": "1ab2801ddebe31b75dd6022c69113b610bbdc950",
+      "comment": "**背景**：ROCm 上陈旧的 Math SDPA 强制导致 32-image Gemma3 profiling forward 在 MI250 上 OOM（#37736）；移除 blanket skinny GEMM 禁用后暴露了非连续激活在 ROCm GEMM dispatcher 中的 bug。**方法**：移除 ROCm-wide Math SDPA 强制和 blanket skinny GEMM disable override；使非连续 skinny GEMM 激活连续化并安全回退不支持的 weight/bias 布局；MI250 使用默认 speech attention，CDNA3+ 保留 AITER 路由；embedding 参考比较对齐 per-request 执行几何。**效果**：32-image Gemma3 profiling 在 MI250 上完成，模型行为保持，广泛多模态和 ROCm 验证通过。",
+      "sig": "sig-omni",
+      "sig_reason": "ROCm 多模态 SDPA 和 GEMM workaround 清理，属全平台/多模态范畴。",
+      "tags": ["bugfix", "medium-risk", "rocm", "sdpa", "gemm", "multimodal", "gemma3"],
+      "pr_number": 50907
+    },
+    {
+      "sha": "4f2f31b82e03917ef33c9008337909ae418dc323",
+      "comment": "**背景**：FA3 路径正确转发 `q_descale`/`k_descale`/`v_descale`，但 FA4 路径丢失了这些 per-head FP8 descale，导致 per-head FP8 Q/K/V tensor 在没有校准 scale 的情况下被消费，输出乱码。**方法**：将 Q/K/V descale 传入 FA4 `_flash_attn_fwd` 调用；新增非 unity per-KV-head descale 回归测试。**效果**：llm-compressor 注意力/KV 量化检查点输出从乱码恢复为正常文本。",
+      "sig": "sig-quantization",
+      "sig_reason": "FA4 FlashAttention 路径 FP8 descale 修复，属量化正确性范畴。",
+      "tags": ["bugfix", "high-risk", "fa4", "fp8", "descale", "attention", "quantization"],
+      "pr_number": 51363
+    },
+    {
+      "sha": "52be12cfac0c5a18ba906814b2d2bcadb40a9c4b",
+      "comment": "**背景**：PR #28377 因 `deepep_low_latency` 下正确性问题，对所有非 `allgather_reducescatter` 后端在 EPLB 下禁用了 shared expert overlap。**方法**：验证 `flashinfer_nvlink_one_sided` 后端在 overlap 启用下结果正确后将其从限制中豁免。**效果**：4×GB300 上 DeepSeek-V2-Lite TP=1/DP=4/EP=4/EPLB 下 TPOT 改善 5-7%，精度差异在 200 题 sampling noise 范围内。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer one-sided all2all 下 shared expert overlap 启用，属 MoE 性能优化。",
+      "tags": ["perf", "medium-risk", "eplb", "flashinfer", "all2all", "shared-expert", "moe"],
+      "pr_number": 50569
+    },
+    {
+      "sha": "9cc347ae424e1c8649b2394fe7fb175e93f59066",
+      "comment": "**背景**：#48413 移除 MiniCPMV 的 `max_transformers_version` cap 后，vLLM-only 覆盖正确恢复，但也暴露了 HF 侧 `MiniCPMV` 远程代码从未调用 `post_init()` 导致 `all_tied_weights_keys` 缺失的问题，9 项测试在 nightly full CI 中失败。**方法**：恢复 `max_transformers_version` cap，但将 reason 从 `vllm` 改为 `hf`，仅限 HF runner，使 vLLM-only 覆盖不受影响。**效果**：vLLM-only MiniCPMV 测试保留，HF 比较侧跳过直到上游修复。",
+      "sig": "sig-ci",
+      "sig_reason": "MiniCPMV 测试注册 transformers 版本 cap 修复，属 CI 测试管理。",
+      "tags": ["test", "low-risk", "minicpmv", "transformers-version", "ci"],
+      "pr_number": 45042
+    },
+    {
+      "sha": "ca9c8cbd1bfb6a3fdcd3abf64b7204d967f539f0",
+      "comment": "**背景**：干净的 CUDA CI 镜像构建从部分 `test-deps` 上下文运行 `use_existing_torch.py`，该上下文缺少 `pyproject.toml`，导致依赖设置在测试前失败：`FileNotFoundError: 'pyproject.toml'`。**方法**：将 `pyproject.toml` 视为可选，保留依赖缓存的同时支持部分上下文。**效果**：部分上下文构建不再失败，8 项 docker metadata 测试通过。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 镜像构建中部分 torch requirement 上下文支持修复。",
+      "tags": ["bugfix", "medium-risk", "ci", "docker", "torch-requirement"],
+      "pr_number": 51832
+    },
+    {
+      "sha": "e3fe212eaf0dc06da03d4df615f7d3d1e8bd5f20",
+      "comment": "**背景**：`KVCacheConfig.needs_kv_cache_zeroing` 对混合 Mamba 和混合精度 KV cache 启用，但 scheduler 仅报告 full/MLA block 类型的 allowlist，worker zeroer 仅处理 full-attention group。回收的 FP8 sliding-window 页可能残留旧数据，导致 Kimi-K3 DSpark drafter with SWA GQA 的 acceptance rate 从 4.8 逐渐崩溃。**方法**：记录新分配的 `AttentionSpec` block ID；`KVBlockZeroer` 包含所有分配 attention group；从 attention backend 和已分配 tensor 推导物理 block 维度/stride/page span 而非假设 full-attention 布局；覆盖 chunked-local、sliding-window MLA、R-SWA、sink 等 subclass。新增 sliding-window 和 chunked-local 回归测试。**效果**：Kimi-K3 DSpark SWA acceptance rate 稳定，uniform-precision 非 Mamba 配置不受影响。",
+      "sig": "sig-core",
+      "sig_reason": "KV block zeroing 泛化到 AttentionSpec，涉及核心 KV cache 管理和调度。",
+      "tags": ["bugfix", "high-risk", "kv-cache", "zeroing", "attention-spec", "sliding-window", "spec-decode"],
+      "pr_number": 51749
+    },
+    {
+      "sha": "513f83e7ecee5e39be727fcb7b7de660bd851cf2",
+      "comment": "**背景**：Gemma-3 在 `--disable-hybrid-kv-cache-manager` 下将 sliding-window 层提升为 full-attention 存储，合并后的 group spec 仍记录 window。FlashAttention 从 group spec 读取 window 并应用于 group 内所有层，导致全局层静默丢失 window 之前的历史；CPU attention 同理。**方法**：FlashAttention 和 CPU attention 从层自身而非 KV cache group spec 读取 sliding window。新增 e2e 测试验证启用/禁用 hybrid KV cache manager 不改变模型计算结果，以及 CPU group window 单元测试。**效果**：全局层不再丢失历史，Gemma-3 输出正确。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashAttention sliding window 从 layer 而非 KV cache group 读取修复，影响模型精度。",
+      "tags": ["bugfix", "high-risk", "flashattention", "sliding-window", "kv-cache-group", "gemma3"],
+      "pr_number": 51756
+    },
+    {
+      "sha": "c65aa2ee6cd8286ebe83615afdfab9b77d21f035",
+      "comment": "**背景**：vLLM 需要升级 Transformers 依赖版本以跟进上游修复和新功能。**方法**：在 CPU/CUDA/ROCm/nightly-torch 等 11 个 requirements 文件中将 Transformers 从 5.14.x 升级到 5.15.0。**效果**：Transformers 依赖统一升级到 5.15.0。",
+      "sig": "sig-ci",
+      "sig_reason": "Transformers 依赖版本升级，属 CI/依赖管理范畴。",
+      "tags": ["deps", "medium-risk", "transformers", "upgrade"],
+      "pr_number": 51668
+    },
+    {
+      "sha": "457a5f34db04b082239c11ee34601e5ee5754a7c",
+      "comment": "**背景**：`vllm bench mm-processor` 在 MRV2 上崩溃——`get_encoder_timing_stats` 仅在 V1 中存在，MRV2 的 `GPUModelRunner` 无此方法，报 `AttributeError`。**方法**：将 encoder timing 逻辑移植到 MRV2：timing 位于 `EncoderRunner` 上，由 `enable_mm_processor_stats` 门控；`EncoderTimingStats` 移到 `worker/utils.py` 供共享。新增 registry accumulate/clear 测试。**效果**：MRV2 上 `vllm bench mm-processor` 正常运行并输出 encoder 统计数据。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 model runner 编码器时序统计支持，属核心 model runner 功能。",
+      "tags": ["bugfix", "medium-risk", "mrv2", "encoder", "timing-stats", "multimodal"],
+      "pr_number": 50020
+    }
+  ]
+}
