@@ -1,0 +1,280 @@
+{
+  "date": "2026-08-13",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-13T20:00:00+08:00",
+  "daily_summary": "当日 33 条变更，主要涵盖 CPU triton-cpu wheel 集成与 pin_memory 修复、Kimi-K3 MLA chunked-context K/V packing 融合优化、DFlash/DSpark 推测解码改进、KV offload 混合布局事件修复与数据并行拓扑暴露、以及多项 CI 基础设施优化。性能方面融合 Kimi-K3 chunked-context K/V packing 每 chunk 仅需一个 kernel、Power10 VSX MoE backend prefill 提速 35%、Flash kda out kernel 提升 1.1~1.4x、ROCm paged decode masked load 修复 10-15% 回归。正确性方面修复 KV block zeroing 启动几何溢出、DFlash 调度预算缺少 bonus query slot、persistent top-k 直方图复用、DeepGEMM FP8 量化 oracle 初始化、KV cache spec kind 误报 UNKNOWN 等。推测解码方面新增 DSpark 置信度调度验证，高并发下保持推测增益。CI 方面镜像外部测试资产至 S3、强制 hybrid 依赖源码编译、修复多项 ROCm/XPU Docker 配置与测试问题。",
+  "sig_summaries": {
+    "sig-core": "CPU 构建集成预构建 triton-cpu wheel 并修复硬编码 `pin_memory=True`（#52092）。跳过 Jina V5 未使用的 output layer 减少 31.75% 驻留参数（#52037）。pooling 输入验证迁移至 `VLLMValidationError`（#51931）。为 Ultravox 添加 audio tower/connector LoRA 支持（#48215）。修复 KV block zeroing 启动几何溢出（#52058）。修复 `get_kv_cache_spec_kind()` 对 uniform-base KVCacheSpecs 误报 UNKNOWN 导致丢失 cache routing credit（#51218）。修复 ROCm chunked prefill paged decode masking 性能回归 10-15%（#50017）。改进 `BlockPool.free_blocks()` 注释（#52076）。修复 model_executor models mypy 类型错误（#52003）。为 Anthropic API 添加 stop sequence 数量限制（#51997）。",
+    "sig-model-performance": "融合 Kimi-K3 chunked-context K/V packing，每 chunk 尾部合并为一个 kernel 并消除 per-chunk 输出拷贝（#51772）。回退 ROCm 双流 decode with hipgraphs（#52024）。新增 Power10 VSX unquantized MoE backend，prefill 提速 35%+（#51624）。修复 persistent top-k 直方图在 short row 后复用导致结果错误（#49139）。优化 K3 Flash kda out kernel 预分配 workspace，性能提升 1.1~1.4x（#51311）。",
+    "sig-ci": "移除 NIXL wheel 重装步骤修复版本不一致（#51882）。更新 XPU UMD 至 26.27（#50513）。镜像外部测试资产至 vLLM S3 解决第三方主机依赖失败（#52064）。恢复 DeepSeek-V4 input GEMM override point 修复 ROCm 精度归零（#51821）。强制 hybrid 依赖源码编译绕过 GitHub release probe 失败（#52043）。修复 CI MoE 测试路径错误（#52009）。更新 DeepGEMM pin 至上游 nv_dev tip 含 SiTU 支持（#52035）。DeepEP pin 改用完整 commit hash（#52028）。修复 AITER MXFP4 W4A16 测试 expert_mask 重命名（#51980）。修复 CI Qwen3.5 测试（#52007）。更新 ROCm base docker triton 修复 gluon MLA 编译（#51464）。",
+    "sig-large-scale-serving": "修复混合 KV-cache 布局下 CPU KV offload 事件在错误粒度发射导致消费者拒绝或误解（#51614）。向 offloading backend 暴露 `data_parallel_size` 和 `data_parallel_rank_local` 完善 DP 拓扑信息（#51879）。修复 EPLB balancedness 沿 layer 轴聚合导致误报完美平衡（#51813）。",
+    "sig-spec-decode": "修复 DFlash 调度预算缺少 bonus query slot，将净 drafting expansion 从 K-1 调整为 K（#51256）。新增 DSpark 置信度调度验证，按 per-request confidence 自适应调整 draft verification 预算，高并发下保持推测增益（#47808）。",
+    "sig-quantization": "修复 `DeepGemmQuantScaleFMT` oracle 延迟初始化和 QuantFP8 UE8M0 packed path group_size 限制，解决 Blackwell 上 FP8 kernel 崩溃（#51359）。ROCm 上为不支持 quant query 的 TRITON_MLA backend 反量化 fp8 decode query，解锁 DSpark+fp8 KV cache（#51860）。"
+  },
+  "commits": [
+    {
+      "sha": "373592ef57d4a19b057237fb015b0bd1382daa03",
+      "comment": "**背景**：CPU 构建中 triton-cpu 从源码安装耗时且不稳定，且多处硬编码 `pin_memory=True` 在 CPU 上不可用。**方法**：在 CPU 构建/测试镜像中预构建并安装 `triton-cpu` wheel，将 topk-topp Triton kernel 测试移出 soft-fail 套件，将硬编码 `pin_memory=True` 调用置于 `PIN_MEMORY` flag 之后，在 CPU shim 中 stub `torch.cuda.stream`。**效果**：解锁 Triton topk-topp kernel 正常测试，CPU V2 runner 不再因 pinned memory 失败。",
+      "sig": "sig-core",
+      "sig_reason": "CPU 后端基础设施修复，涉及 triton-cpu 集成和 pin_memory 兼容，属核心运行时范畴。",
+      "tags": ["feature", "medium-risk", "cpu", "triton", "pin-memory"],
+      "pr_number": 52092
+    },
+    {
+      "sha": "89c8401c8aeb53ccee87060e913514068e0a1e82",
+      "comment": "**背景**：Jina Embeddings V5 为 pooling-only 模型，但其 wrapper 继承 causal-LM 类，保留了未使用的 `ParallelLMHead`（nano 变体达 187.875 MiB）。**方法**：对两个 Jina V5 wrapper 应用 pooling-model `no_init_weights` 模式，将 `ParallelLMHead` 和 `LogitsProcessor` 替换为 `StageMissingLayer`，保留 tied embedding 不变。**效果**：nano 变体减少 31.75% 驻留参数（187.875 MiB）和约 188 MiB 加载后 CUDA 内存。",
+      "sig": "sig-core",
+      "sig_reason": "模型实现优化，跳过 pooling 模型未使用的 output layer 以减少内存占用。",
+      "tags": ["optimization", "low-risk", "model", "jina-v5", "memory"],
+      "pr_number": 52037
+    },
+    {
+      "sha": "7bc1660bd67d94cd2c8188d5e2cf2828e5b1bc7a",
+      "comment": "**背景**：pooling 输入验证中四处调用方导致的验证错误使用原始 `ValueError`，不符合 #48227 的迁移目标。**方法**：将冲突 offline pooling 任务、不可信 request-level chat template、prompt 与 pooling 参数数量不匹配、prompt 与 LoRA 请求数量不匹配四类错误从 `ValueError` 迁移为 `VLLMValidationError`，保留原有验证行为和错误消息。**效果**：在线服务仍返回 HTTP 400，离线调用方现在收到 `VLLMValidationError` 而非 `ValueError`。",
+      "sig": "sig-core",
+      "sig_reason": "pooling 入口验证错误类型标准化迁移，属核心 API 验证范畴。",
+      "tags": ["refactor", "low-risk", "pooling", "validation", "error-handling"],
+      "pr_number": 51931
+    },
+    {
+      "sha": "b908a21f9a449592ca06352381d9118dbc39c6d2",
+      "comment": "**背景**：Ultravox 无法对 audio tower 和 connector 应用 LoRA，tower/projector 路径未完全由 LoRA-wrappable 模块构建，且变长 Whisper chunks 需要 padding-aware attention。**方法**：通过薄 Ultravox 子类复用原生 `WhisperEncoder`，扩展 Whisper encoder self-attention 接受多模态 `cu_seqlens` metadata，使用 vLLM 原生 linear 层构建 connector，在 tower/connector LoRA 模式下将每个 audio chunk pad 到 Whisper tower 完整上下文，添加精确的 `get_num_mm_encoder_tokens` 和 `get_num_mm_connector_tokens` 映射。**效果**：Ultravox audio tower 和 connector 可正确应用 LoRA 适配器。",
+      "sig": "sig-core",
+      "sig_reason": "多模态模型 LoRA 支持扩展，涉及 Ultravox audio tower/connector 的 LoRA 适配。",
+      "tags": ["feature", "high-risk", "lora", "ultravox", "multimodal", "whisper"],
+      "pr_number": 48215
+    },
+    {
+      "sha": "5658391af7db332a46389738dad5dfe99f7c55a8",
+      "comment": "**背景**：Dockerfile 中的 NIXL wheel 重装步骤已不再需要（NIXL 上游已修复依赖问题），且未使用版本 pin 导致 `nixl-cu13` 浮动到 1.3.2 与 `nixl`/`nixl-cu12` 的 1.3.1 pin 不一致。**方法**：移除 NIXL wheel 重装步骤，依赖 `kv_connectors.txt` 中的 pin 保持三个包对齐。**效果**：所有 `nixl*` 包版本一致为 1.3.1。",
+      "sig": "sig-ci",
+      "sig_reason": "Docker 构建中 NIXL 依赖安装步骤修复，属 CI 基础设施范畴。",
+      "tags": ["bugfix", "low-risk", "docker", "nixl", "dependency"],
+      "pr_number": 51882
+    },
+    {
+      "sha": "903d2efe7eb6d045d03c0a8192b1ac7bec50d168",
+      "comment": "**背景**：K3 MLA 层将 chunked-context prefill 委托给 `impl._compute_prefill_context`，每 chunk 需多次 cast/concat/re-quantize 操作，效率低下。**方法**：为该层实现独立的 context loop，每个 chunk 的尾部合并为一个 kernel：`fused_kimi_k3_mla_kv_concat{,_quant_fp8}` 直接读取 strided `kv_b_proj` 输出和 gathered `k_pe`，写入连续 key 和（fp8 路径）连续 fp8 V。同时通过 `run_prefill_context_chunk` 的 `out` tensor 复用消除每 chunk 输出拷贝。修复了 fp8 KV cache 下 stock checkpoint 的 `kv_b_proj` dtype 不匹配问题。**效果**：大幅减少 chunked-context prefill 的 kernel 数量和内存拷贝。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 MLA attention kernel 融合优化，减少 chunked-context prefill 的 kernel 数量和内存拷贝。",
+      "tags": ["perf", "high-risk", "mla", "kimi-k3", "kernel-fusion", "fp8"],
+      "pr_number": 51772
+    },
+    {
+      "sha": "63344913a66c76a13b4b7f20735c6b2963cfb997",
+      "comment": "**背景**：XPU Docker 镜像中的 UMD（Unified Memory Driver）版本需要更新。**方法**：将 Dockerfile.xpu 中的 UMD 版本更新到 26.27。**效果**：XPU 镜像使用最新 UMD 版本。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU Docker 镜像 UMD 版本更新，属 CI 基础设施范畴。",
+      "tags": ["chore", "low-risk", "xpu", "docker", "umd"],
+      "pr_number": 50513
+    },
+    {
+      "sha": "3d204dfdaaf09d67d49c7855630ef949754e0f8f",
+      "comment": "**背景**：PR #48223 引入的 ROCm 双流 decode with hipgraphs 功能存在问题，需要回退。**方法**：完整回退 #48223 的所有变更。**效果**：ROCm 恢复到双流 decode 之前的稳定状态。",
+      "sig": "sig-model-performance",
+      "sig_reason": "回退 ROCm 双流 decode 性能特性，恢复稳定状态。",
+      "tags": ["revert", "medium-risk", "rocm", "dual-stream", "hipgraph"],
+      "pr_number": 52024
+    },
+    {
+      "sha": "2ac1f683f11cf0f526c896e5fa5e0e22ebc6ffa2",
+      "comment": "**背景**：DFlash 每个请求有 K+1 个 query token，但通用 parallel-drafting 计算仅预留 K-1 个 slot，导致调度预算少算一个 slot。例如 `max_num_batched_tokens=2048, max_num_seqs=256, num_speculative_tokens=8` 时允许 256 个 scheduled tokens，但满 batch 需 2304 个 query token 超出限制。**方法**：将 DFlash 的净 drafting expansion 从通用 K-1 调整为 K slots。**效果**：DFlash 调度预算正确反映 K+1 query token 的需求。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DFlash 推测解码调度预算修正，修复 bonus query slot 预留缺失。",
+      "tags": ["bugfix", "high-risk", "dflash", "speculative-decoding", "scheduling"],
+      "pr_number": 51256
+    },
+    {
+      "sha": "79f3183f86b89c3bda05d467041bf3ef9ef60426",
+      "comment": "**背景**：`KVBlockZeroer` 在 DeepSeek-V4（181 KV segments + 292-element pages）上因选择最大公约数 power-of-two divisor 导致 292-element page 强制所有 segment 使用 4-element chunks，零化 6,870 blocks 展平为 2,904,745,920 programs 溢出 signed launch dimension。**方法**：将 blocks、segments、chunks 直接映射到 3-D grid（block IDs 在大 x 轴），每个 program 最多处理 1,024 个元素并 mask 每个 segment 的尾部。**效果**：失败几何从 2,904,745,920 programs 降至 12,434,700 programs（减少 233.6x），保留一个编译 kernel 跨不同 block count。",
+      "sig": "sig-core",
+      "sig_reason": "KV block zeroing kernel 启动几何溢出修复，属核心 KV cache 管理范畴。",
+      "tags": ["bugfix", "high-risk", "kv-cache", "kernel", "overflow", "deepseek-v4"],
+      "pr_number": 52058
+    },
+    {
+      "sha": "f9538af28c99513ce580948eb107195f5ae0c4ca",
+      "comment": "**背景**：`BlockPool.free_blocks()` 中解释 eviction precedence 的注释含糊不清。**方法**：重写注释使其更清晰明确。**效果**：代码可读性提升，无功能变更。",
+      "sig": "sig-core",
+      "sig_reason": "BlockPool 代码注释改进，属核心 KV cache 管理代码质量范畴。",
+      "tags": ["docs", "low-risk", "block-pool", "comments"],
+      "pr_number": 52076
+    },
+    {
+      "sha": "9a276d63753a5b05de394adbdf54680d70a7d906",
+      "comment": "**背景**：`vllm/model_executor/models/` 下以 c/C 和 d/D 开头的模型文件存在 mypy 类型错误。**方法**：修复 24 个文件中的 mypy 类型问题，更新 `tools/pre_commit/mypy.py`。**效果**：`pre-commit run --hook-stage manual mypy-3.13 -a` 通过。",
+      "sig": "sig-core",
+      "sig_reason": "模型执行器 mypy 类型错误修复，属核心代码质量范畴。",
+      "tags": ["chore", "low-risk", "mypy", "type-checking", "model-executor"],
+      "pr_number": 52003
+    },
+    {
+      "sha": "15227b934ad807180cc4d3c5dbe316ee424b26fb",
+      "comment": "**背景**：混合 KV-cache 布局中 request hash 计算频率高于 full-attention group 的 block size（如 DeepSeek V4 tokens_per_hash=4, tokens_per_block=256），offloading event tracker 发布每个 4-token hash 并设置 block_size=4，消费者配置为 256-token vLLM block size 时会拒绝或误解这些 CPU 事件。**方法**：使用与 GPU KV 事件相同的 `resolve_block_hashes()` 转换，将每个 chunk 的 raw request hash 从 tokens_per_hash 粒度解析到 KV group 的 tokens_per_block 粒度。**效果**：CPU 事件正确发射每个 KV-group block 的尾部 hash，block_size 设为 GroupOffloadConfig.tokens_per_block。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload CPU 事件粒度修复，属大规模服务 KV 传输范畴。",
+      "tags": ["bugfix", "high-risk", "kv-offload", "cpu-events", "hybrid-cache", "deepseek-v4"],
+      "pr_number": 51614
+    },
+    {
+      "sha": "f9a0f629bdb6ffa0202ed79f566e052e3cef42f4",
+      "comment": "**背景**：原生 KV-offloading backend 仅接收 `data_parallel_index`，但不知道 data-parallel replica 总数或本地 DP rank，`OffloadingParallelConfig` 缺少描述 DP 拓扑的信息。**方法**：在 `OffloadingParallelConfig` 中添加 `data_parallel_size` 和 `data_parallel_rank_local`，从 `ParallelConfig` 填充。**效果**：offloading backend 可获得完整 DP 拓扑信息，不影响 DP 初始化或数据移动。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload backend 数据并行拓扑信息暴露，属大规模服务分布式范畴。",
+      "tags": ["feature", "low-risk", "kv-offload", "data-parallel", "topology"],
+      "pr_number": 51879
+    },
+    {
+      "sha": "6e502b62cb6affb3710b50d6f0f9c74eb6accabd",
+      "comment": "**背景**：EPLB balancedness 日志沿 layer 轴聚合 rank load，导致即使一个 EP rank 在每层接收所有 token 也报告完美平衡。**方法**：修复为在每个 MoE layer 内聚合 rank load，新增回归测试验证。**效果**：修复前报告 `avg_tokens=100, max_tokens=100`（完美但错误），修复后正确报告 `avg_tokens=50, max_tokens=200`。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EPLB 负载均衡度量计算修复，属大规模服务专家并行范畴。",
+      "tags": ["bugfix", "medium-risk", "eplb", "moe", "load-balancing", "metrics"],
+      "pr_number": 51813
+    },
+    {
+      "sha": "61826c1c6fa301f1b0dc56156fd2f3fad5dfd138",
+      "comment": "**背景**：Power 架构上不支持 grouped GEMM，Fused MoE 无优化后端。**方法**：新增 `csrc/cpu/micro_gemm/cpu_micro_gemm_vsx.hpp` 支持 Power 架构的 grouped GEMM，使用 Power10 MMA 指令优化 BF16 矩阵乘法。**效果**：prefill 阶段 TTFT 提速 35%+，高并发（C=128）下吞吐量提升 13.9%，TPOT 降低 10.2%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Power 架构 MoE fused kernel性能优化，使用 VSX MMA 指令加速 grouped GEMM。",
+      "tags": ["feature", "medium-risk", "power", "vsx", "moe", "cpu", "gemm"],
+      "pr_number": 51624
+    },
+    {
+      "sha": "8eb35c5217ef98ab06c88f42ef4e41737dd2d1f3",
+      "comment": "**背景**：多个测试直接依赖第三方主机（OpenCV、Bogotobogo 视频）下载 fixture，因 GitHub 连接问题导致 `RemoteDisconnected` 失败。**方法**：将外部托管的视频、图像和 GSM8K 测试资产镜像到公开 vLLM S3 bucket，更新相关测试使用 `VLLM_S3_BUCKET_URL` 常量。**效果**：7 个镜像资源通过 SHA256 校验，测试不再依赖第三方主机可用性。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 测试资产镜像至 S3 解决第三方主机依赖，属 CI 基础设施范畴。",
+      "tags": ["test", "low-risk", "ci", "s3", "test-assets", "mirror"],
+      "pr_number": 52064
+    },
+    {
+      "sha": "b369f10d5c5dc3af29e5a2f9213a462b8faadae9",
+      "comment": "**背景**：PR #51430 在缩小 CUDA graph 区域时删除了 `DeepseekV4Attention._fused_wqa_wkv_gemm` 方法并内联调用，但该方法是 ROCm attention layer 的 override point。ROCm 上 `fused_wqa_wkv` 权重在模型加载时 preshuffle，只能由 AITER 的 preshuffled-B GEMM 正确乘法，内联后所有 attention 层对 shuffled 权重执行 plain linear，从第一层起产生垃圾输出。**方法**：恢复 `_fused_wqa_wkv_gemm` 方法作为 override point。**效果**：ROCm 上 DeepSeek-V4 恢复正确输出，GSM8K accuracy 从 0.0000 恢复正常。",
+      "sig": "sig-ci",
+      "sig_reason": "恢复 ROCm CI 回归测试中 DeepSeek-V4 input GEMM override point，修复精度归零。",
+      "tags": ["bugfix", "high-risk", "rocm", "deepseek-v4", "attention", "override"],
+      "pr_number": 51821
+    },
+    {
+      "sha": "5936bac7d746dd51ad0f6cf391ce2f990cc4986d",
+      "comment": "**背景**：`get_kv_cache_spec_kind()` 对内部有多个 kind 的 `UniformTypeKVCacheSpecs` 返回 `UNKNOWN`，但该 group 仅在所有成员共享同一 `uniform_type_base_spec` 时才形成。KV-cache 事件被标记为 `UNKNOWN` 后消费者直接丢弃，导致受影响模型丢失所有 cache-aware routing credit。**方法**：回退到注册的 base spec，仅当所有成员解析为 `FullAttentionSpec` 时升级为 `FULL_ATTENTION`。**效果**：混合 FullAttention+MLA 的模型不再丢失 KV-aware routing credit。",
+      "sig": "sig-core",
+      "sig_reason": "KV cache spec kind 分类修复，影响 cache-aware routing，属核心 KV cache 管理范畴。",
+      "tags": ["bugfix", "high-risk", "kv-cache", "kv-cache-spec", "routing", "mla"],
+      "pr_number": 51218
+    },
+    {
+      "sha": "caf9e8f7d525f8c5a30d3a37d01eb07244bb9e87",
+      "comment": "**背景**：Hybrid language-model CI 在 pytest 前因 `mamba-ssm` 和 `causal-conv1d` 探测 GitHub release-wheel URL 失败而中止，GitHub 连接问题时请求以 `Remote end closed connection without response` 结束而非正常 404 回退。**方法**：设置 `MAMBA_FORCE_BUILD=TRUE` 和 `CAUSAL_CONV1D_FORCE_BUILD=TRUE`，绕过脆弱的 release probe 直接执行源码编译。**效果**：Hybrid、Granite L4、Extended Generation 和 AMD mirror 作业不再因依赖安装失败。",
+      "sig": "sig-ci",
+      "sig_reason": "Hybrid 模型 CI 依赖安装强制源码编译修复，属 CI 基础设施范畴。",
+      "tags": ["bugfix", "low-risk", "ci", "mamba", "causal-conv1d", "dependencies"],
+      "pr_number": 52043
+    },
+    {
+      "sha": "98f86b9c02329200a0390aecfe598e27928cbf40",
+      "comment": "**背景**：PR #47305 修复正确性时引入了普遍应用的 masking，导致 `kernel_paged_attention_2d` 在 v0.25.0 上比 v0.24.0 慢 1.33x，Qwen3-30B-A3B 服务延迟回归 10-15%。**方法**：仅在最后一个 block（token id 可能大于 sequence length 时）应用 masking。**效果**：output tok/s 从 79.76 恢复到 97.08（超过 v0.24.0 基线 91.33），TPOT 从 12.25ms 降至 10.23ms，gsm8k 精度无变化。",
+      "sig": "sig-core",
+      "sig_reason": "ROCm paged attention kernel masking 性能回归修复，属核心 attention 后端范畴。",
+      "tags": ["bugfix", "medium-risk", "rocm", "attention", "paged-decode", "perf-regression"],
+      "pr_number": 50017
+    },
+    {
+      "sha": "23f360edaaa39e2e933857eeab6babf64e57f8b6",
+      "comment": "**背景**：CI 中 MoE 测试命名为 triton test 但实际运行 flashinfer 路径，flashinfer 上游 TRT-LLM BF16 MoE 存在 bug。**方法**：修正测试命名使其正确运行 triton 路径。**效果**：CI MoE 测试不再因路径错误失败。",
+      "sig": "sig-ci",
+      "sig_reason": "CI MoE 测试路径配置修复，属 CI 测试范畴。",
+      "tags": ["bugfix", "low-risk", "ci", "moe", "test-config"],
+      "pr_number": 52009
+    },
+    {
+      "sha": "025d56a11e8f9bdf614af26e5386cdd8d322aaef",
+      "comment": "**背景**：DeepGEMM pin 使用 `vllm-project/DeepGEMM` fork，因 `nv_dev` 分支此前缺少 SiTU 支持而保留 fork 间接依赖。`nv_dev` tip 现已包含 SiTU for FP8xFP4 MegaMoE。**方法**：将 cmake 和 install 脚本中的 DeepGEMM pin 从 fork `e21c821f` 更新到上游 `deepseek-ai/DeepGEMM` `nv_dev` tip `8b1392b9`。**效果**：移除 fork 依赖，SM120/SM121 kernel 和 SiTU 支持均来自上游。",
+      "sig": "sig-ci",
+      "sig_reason": "DeepGEMM 依赖 pin 更新至上游，属 CI 构建依赖管理范畴。",
+      "tags": ["build", "medium-risk", "deepgemm", "dependency", "situ", "mega-moe"],
+      "pr_number": 52035
+    },
+    {
+      "sha": "34735aceda0be9d79d8f440fcb74a21825bde0b6",
+      "comment": "**背景**：`tools/ep_kernels/install_python_libraries.sh` 用 10 字符缩写 `d4f41e4e93` pin DeepEP，缩写不是有效 ref，`git fetch --depth 1` 无法直接获取，仅完整 SHA 可通过 `allowAnySHA1InWant` 获取。**方法**：将缩写 hash 替换为完整 40 字符 hash `d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb`。**效果**：浅克隆消费者可直接 fetch pinned commit，解析的 commit 不变。",
+      "sig": "sig-ci",
+      "sig_reason": "DeepEP 依赖 pin 修复为完整 commit hash，属 CI 构建依赖管理范畴。",
+      "tags": ["bugfix", "low-risk", "deepep", "dependency", "git-pin"],
+      "pr_number": 52028
+    },
+    {
+      "sha": "e62abc37d4c341b6026b945d7aff7e7537cce75d",
+      "comment": "**背景**：`persistent_topk` 在一个 persistent CTA group 处理 radix row（`seq_len > 32768`）后跟一个 short/medium row（`seq_len <= 32768`）再跟另一个 radix row 时，使用外层 row 迭代计数器旋转 triple-buffered radix histograms，short row 推进计数器但不执行 `radix_topk`，导致下一个 radix row 复用可能包含旧数据的 histogram。**方法**：引入独立的 `radix_iter` 计数器，仅在 `radix_topk` 执行时推进。**效果**：RTX 3080 上 long-short-long 模式从 `match=False, set_diff=8` 修复为 0/10 失败。",
+      "sig": "sig-model-performance",
+      "sig_reason": "persistent top-k kernel 正确性修复，涉及 radix histogram 复用逻辑。",
+      "tags": ["bugfix", "high-risk", "kernel", "top-k", "radix", "histogram"],
+      "pr_number": 49139
+    },
+    {
+      "sha": "7f7a32cfec0f1bc5b73c37200b86631523a1ea8f",
+      "comment": "**背景**：固定 k 推测解码在高并发下 GPU 饱和后验证 7 个 draft 消耗的算力超过 accepted token 回报，性能低于非推测解码。**方法**：Triton kernel 按 survival probability（per-position confidence 的 cumprod）排序 draft slot，选择最大化估计 accepted tokens/ms 的前缀；step cost 从启动时 dummy step profiling 曲线获取；batch 级预算从 double-buffered stale confidence（无 sync）在 CPU 运行，per-request 分配在 GPU 从 live value 运行；decode cudagraph 改为 varlen。**效果**：c<=64 时与固定 k 误差 +-3%，c=256 时固定 k 比非推测慢 33%，自适应保持推测增益。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DSpark 推测解码置信度调度验证，自适应调整 draft verification 预算。",
+      "tags": ["feature", "high-risk", "dspark", "speculative-decoding", "confidence", "adaptive", "triton"],
+      "pr_number": 47808
+    },
+    {
+      "sha": "fe889ac9255491e82e58012d7787e920c6c7fbc2",
+      "comment": "**背景**：`_flashkda_prefill` 每次调用都重新分配 workspace 内存，产生额外开销。**方法**：使用 workspace manager 预分配 `_flashkda_prefill` 所需内存，避免每次调用重新分配。**效果**：kernel 性能提升 1.1~1.4x。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 Flash kda kernel 性能优化，预分配 workspace 减少内存分配开销。",
+      "tags": ["perf", "low-risk", "kimi-k3", "flashkda", "workspace", "kernel"],
+      "pr_number": 51311
+    },
+    {
+      "sha": "19d61b1273a56e0ebd8a9160bffb2e75dccad82b",
+      "comment": "**背景**：`DeepGemmQuantScaleFMT.from_oracle()` 断言 cache 已填充，但 cache 仅作为其他 DeepGEMM wrapper `_lazy_init()` 的副作用填充。直接构建 `use_ue8m0=True` 的 `QuantFP8` 可在 DeepGEMM kernel wrapper 运行前命中 `from_oracle()` 崩溃。修复 init 顺序后又暴露两个问题：packed branch 对任意 group size 都触发，但 `per_token_group_quant_8bit_packed` 仅支持 `group_size==128`。**方法**：使 `from_oracle()` 首次使用时初始化，将 packed branch 限制为 `group_size==128`，更新测试解包 int32 UE8M0 scales。**效果**：Blackwell (SM100/SM120) 上 FP8 kernel 测试套件不再崩溃。",
+      "sig": "sig-quantization",
+      "sig_reason": "DeepGEMM FP8 量化 oracle 初始化和 UE8M0 packed path 修复，属量化范畴。",
+      "tags": ["bugfix", "high-risk", "fp8", "deepgemm", "ue8m0", "quantization", "blackwell"],
+      "pr_number": 51359
+    },
+    {
+      "sha": "d20a031d33fb8d56cfe090681872319544040da7",
+      "comment": "**背景**：PR #49758 将 `expert_map` 关键字重命名为 `expert_mask` 并更新了生产调用方，但未更新两个测试调用点。**方法**：将测试中的 `expert_map` 重命名为 `expert_mask`。**效果**：gfx950 上两个 AITER MXFP4 W4A16 测试从 TypeError 恢复为通过，整个文件 31 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm AITER MoE 测试关键字重命名修复，属 CI 测试范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "aiter", "moe", "test"],
+      "pr_number": 51980
+    },
+    {
+      "sha": "0fb168e6ee546466573dd3b920149417e82d9123",
+      "comment": "**背景**：PR #51908 引入的 Qwen3.5 CI 测试存在配置问题。**方法**：修复 CI 中 Qwen3.5 测试配置。**效果**：CI Qwen3.5 测试不再失败。",
+      "sig": "sig-ci",
+      "sig_reason": "CI Qwen3.5 测试配置修复，属 CI 测试范畴。",
+      "tags": ["bugfix", "low-risk", "ci", "qwen3.5", "test-config"],
+      "pr_number": 52007
+    },
+    {
+      "sha": "b745d08de14fddf0cbb843c686b5d335f7d658cc",
+      "comment": "**背景**：ROCm 上 DSpark draft 自动选择 TRITON_MLA（唯一支持非因果多 token block 的 backend），TRITON_MLA 在加载时反量化 fp8 KV 并接受 bf16 query，导致 Kimi-K3 的 `_decode_concat_cache` 对 `supports_quant_query_input` 的断言使 fp8 KV 在 DSpark 下不可用。**方法**：照常执行 fused fp8 q-concat + cache insert，当 impl 不接受 fp8 query 时反量化返回的 query。**效果**：gfx950 x8 TP8 上 DSpark+fp8 正常服务，gsm8k 94.4%，acceptance 3.40。对支持 fp8 query 的 backend 为 no-op。",
+      "sig": "sig-quantization",
+      "sig_reason": "ROCm K3 fp8 decode query 反量化修复，涉及 fp8 KV cache 量化路径兼容。",
+      "tags": ["bugfix", "medium-risk", "rocm", "kimi-k3", "fp8", "kv-cache", "triton-mla", "dspark"],
+      "pr_number": 51860
+    },
+    {
+      "sha": "324f452f640015e9616b5ad5615fae6c25eb6353",
+      "comment": "**背景**：vllm nightly docker 在 MLA decode 时因 gluon frontend 报 `CompilationError`，triton 的 `DistributedLinearLayout` 被拒绝。**方法**：在 ROCm base docker 中更新 triton 至包含 ROCm/triton PR #960 的版本。**效果**：gluon kernel 可编译，K3 无 spec 服务正常，gsm8k 94.5%。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm base docker triton 版本更新修复 gluon MLA 编译，属 CI Docker 基础设施范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "docker", "triton", "gluon", "mla"],
+      "pr_number": 51464
+    },
+    {
+      "sha": "6ea6c4265938df98e8797254c591be4d9fc04158",
+      "comment": "**背景**：PR #51447 用 `VLLM_MAX_STOP_STRINGS` 限制了 OpenAI stop 参数，但 Anthropic 请求仍无限制，5 个 stop sequence 通过入口验证但在转换为 bounded `ChatCompletionRequest` 时失败返回 HTTP 500。**方法**：在 Anthropic API 边界应用相同的 `VLLM_MAX_STOP_STRINGS` 限制。**效果**：oversized 请求在 Anthropic 验证阶段即被拒绝（HTTP 400），而非转换时 HTTP 500。",
+      "sig": "sig-core",
+      "sig_reason": "Anthropic API stop sequence 数量限制修复，属核心 API 入口验证范畴。",
+      "tags": ["bugfix", "low-risk", "anthropic-api", "validation", "stop-sequences"],
+      "pr_number": 51997
+    }
+  ]
+}
