@@ -1,0 +1,208 @@
+{
+  "date": "2026-08-15",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-15T20:00:00+08:00",
+  "daily_summary": "当日 24 条变更以 CI 基础设施为主：Humming H100、MoE refactor B200、multimodal extended、extended pooling、Quantization 等多个长时评测作业被分片并行，关键路径提速约 3-3.65x，另有 ROCm no-GPU 平台探测与 Dockerfile pybind11 版本修复。模型与性能方面修复 DSV4 sparse MLA 后端七处缺陷使 plain decode/MTP/DSpark 三种模式端到端可用，新增 `VLLM_GPU_SYNC_CHECK` 同步检测工具并在多模态编码器中消除隐藏同步，ROCm 启用 16-token block preshuffled sparse indexing 使 paged-MQA kernel 提速 3.64x。前端与生态方面流式解析引擎支持 reasoning token 计数、Rust gRPC 补齐 `skip_special_tokens` 并新增 RL 生命周期控制。推测解码方面 DSpark draft 继承 target attention backend、MTP 尾部 all-reduce 融合与 local argmax 优化、Kimi K3 DFlash aux 状态修正。",
+  "sig_summaries": {
+    "sig-ci": "集中对多个长时 CI 评测作业做分片并行：Humming H100 eval 3 分片提速 3.01x（#52326）、MoE refactor B200 eval 4 分片提速 3.65x（#52327）、multimodal extended generation-2 4 分片提速 3.448x（#52323）、extended pooling 4 分片提速 3.697x（#52322）、Quantization 4 分片提速 3.075x（#52328），且各分片 node ID 覆盖与基线完全一致。CMake 配置阶段对全局 PTX 架构请求发出警告并更名 `clear_cuda_gencode_flags`（#51901）。ROCm no-GPU 作业导出 `VLLM_TARGET_DEVICE=cpu` 修复平台探测（#49515），移除 Dockerfile.rocm 的 pybind11 重装避免 AITER 版本不匹配（#52400），为 DeepEP v2 MoE 测试 worker 播种修复间歇性失败（#50589），LoRA 测试作业三项提速（#52331）。",
+    "sig-core": "流式解析引擎新增 token 级 reasoning token 计数并透出至 OpenAI 兼容 usage 字段（#45802）。修复 ModelScope 新版缺失 `Type` 字段导致的 KeyError 并统一 `VLLM_USE_MODELSCOPE` 布尔解析（#52431）。Rust gRPC Generate API 补齐 `skip_special_tokens` 选项与 Python API 对齐（#52384）。MRV2 支持 attention-free 模型（#52374）。",
+    "sig-model-performance": "修复 DSV4 sparse MLA 后端七处缺陷，使 plain decode/MTP/DSpark 三种解码模式端到端可用（#51538）。新增 `VLLM_GPU_SYNC_CHECK` 与 `gpu_sync_allowed()` 在 CI 中检测 GPU<->CPU 同步（#43107）。多模态编码器消除阻塞 H2D 拷贝与设备回读（#52369）。ROCm `--block-size 16` 启用 preshuffled FP8 paged-MQA，kernel 提速 3.64x（#51216）。放宽 `flashinfer.comm` 导入保护避免引擎启动崩溃（#52241）。",
+    "sig-spec-decode": "DSpark draft 在 speculative config 未指定后端时继承 target 的 attention backend，修复 DSV4 上 shape 崩溃（#52288）。MTP 尾部 all-reduce 融合进最终 RMSNorm 且贪心 draft token 走 vocab-parallel local argmax（#49793）。Kimi K3 DFlash aux 状态改采 pre-norm AttnRes 混合流（#50487）。",
+    "sig-quantization": "移除 `Mxfp4MoEMethod` 中 Kimi-K3 SiTU 的模型专属特判，按激活类型走标准分发：SITU 纳入 `AiterExperts._supports_activation`，尺寸圆整与权重 shuffle 按 activation 参数路由（#50597）。",
+    "sig-rl": "Rust 前端 gRPC Control 服务新增 RL 生命周期控制：pause/resume 调度、sleep/wake 显存管理、weight-transfer 全流程 RPC，能力经 EngineCore ready 握手通告并复用 NCCL/IPC/sparse-NCCL 传输后端（#51316）。"
+  },
+  "commits": [
+    {
+      "sha": "d4801990a45792c7081652f8ebea4ee56ceb67f9",
+      "comment": "**背景**：用户可通过 `TORCH_CUDA_ARCH_LIST`（如 `8.0+PTX`）请求 PTX，但 vLLM 会剥离 Torch 提供的全局 `-gencode` 标志并按源文件重建，全局 PTX 请求被静默丢弃。**方法**：将 `clear_cuda_arches` 重命名为 `clear_cuda_gencode_flags` 以澄清其只清除 `-gencode` 标志，新增 `warn_if_ptx_arch_requested()` 在 CMake 配置阶段发出警告，并补充安装文档说明 CUDA 架构与 PTX 标志的归一化行为。**效果**：PTX 请求不再被静默忽略，构建配置时即得到明确提示，配套 pytest 单测覆盖宏改名。",
+      "sig": "sig-ci",
+      "sig_reason": "CMake 构建系统改进与配套测试，属 CI/构建基础设施范畴。",
+      "tags": ["feature", "low-risk", "cmake", "ptx", "build"],
+      "pr_number": 51901
+    },
+    {
+      "sha": "97388c44f9c608f83318e0c9540a536cd7de3e0d",
+      "comment": "**背景**：DeepSeek-V4-Flash-0731 无法通过 SM120 sparse MLA 后端可靠运行，共存在七个缺陷，阻断 plain decode、MTP 与 DSpark 三种解码模式，其中 MTP hang 是 main 上的既有缺陷（#51593），batch 排空后任何 `next_n > 1` 服务都会挂起。**方法**：修复 `cooperative_topk`/`persistent_topk` kernel、SWA 宽度（`decode_swa_width`）、mxfp4 gemm1_alpha、expert placement 等七处问题；前五个 commit 解锁 DSpark，后两个修复 indexer `seq_lens` 在 uniform/native spec-decode 路径产生负长度导致的挂起。**效果**：在 8xRTX PRO 6000 Blackwell 上三种解码模式端到端验证通过，涵盖 in-flight batching 与 prefill/decode 分离部署。",
+      "sig": "sig-model-performance",
+      "sig_reason": "sparse MLA attention 后端与配套 topk kernel 的多项正确性修复，属模型性能/kernel 范畴。",
+      "tags": ["bugfix", "high-risk", "sparse-mla", "deepseek-v4", "mtp", "dspark"],
+      "pr_number": 51538
+    },
+    {
+      "sha": "ac2ae8798c7ef59c1924d5c0447a4279fa645770",
+      "comment": "**背景**：流式解析引擎（Streaming Parser Engine）此前无法进行 token 级 reasoning token 计数，OpenAI 兼容 usage 响应缺少 `completion_tokens_details.reasoning_tokens` 字段。**方法**：沿 `TokenIDScanner -> IncrementalLexer -> StreamingParserEngine -> SemanticEvent` 管路传播 token 计数，仅统计 `REASONING_CHUNK` token、排除 `<think>`/`</think>` 等边界终结符；非流式解析在输出 token ID 可用时复用同一引擎路径，并确保 parser 实例按 output choice 隔离。**效果**：流式与非流式请求的 reasoning token 统计使用一致的 token 级边界，chat completion 与 Responses API 的 usage 字段正确返回计数。",
+      "sig": "sig-core",
+      "sig_reason": "前端解析引擎与 OpenAI 兼容 usage 字段扩展，属核心 API 前端范畴。",
+      "tags": ["feature", "medium-risk", "streaming-parser", "reasoning-tokens", "openai-api"],
+      "pr_number": 45802
+    },
+    {
+      "sha": "5cecfc01375052698823fc401e31518fb32a981e",
+      "comment": "**背景**：新版 ModelScope 不再返回 `Type` 字段导致 `modelscope_list_repo_files` 抛出 `KeyError`，且 `VLLM_USE_MODELSCOPE` 只接受 `True` 不接受 `1`，与其他布尔环境变量不一致。**方法**：移除对 `Type` 字段的依赖，布尔解析改为同时接受 `1` 与 `True`。**效果**：通过 ModelScope 加载模型（如 `meta-models/Muse-Glimmer-30B`）恢复正常。",
+      "sig": "sig-core",
+      "sig_reason": "模型加载工具与环境变量解析修复，属核心模型加载范畴。",
+      "tags": ["bugfix", "low-risk", "modelscope", "env-var"],
+      "pr_number": 52431
+    },
+    {
+      "sha": "42156466db66f6d54cbea6075af82304cdfdaa6a",
+      "comment": "**背景**：原生 Generate gRPC API 未暴露 `skip_special_tokens` 解码选项，gRPC 调用方无法保留部分 reasoning/tool parser 需要的 tokenizer 特殊标记，与 Python 各端点行为不一致。**方法**：在 proto 中新增 `optional` 字段并经 `ResponseOptions` 映射进 `TextDecodeOptions`，缺省保持 Python 默认 `true`，显式 `false` 被保留。**效果**：gRPC 与 Python 端点解码行为对齐，仅影响解码文本，不改变采样、生成 token ID 或 EOS 行为，13 个 gRPC 转换测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 gRPC API 与 Python 服务端点行为对齐，属核心 API 前端范畴。",
+      "tags": ["feature", "low-risk", "grpc", "rust-frontend", "skip-special-tokens"],
+      "pr_number": 52384
+    },
+    {
+      "sha": "44fc57d7b72eafaaefdcb0983451e08648be4d49",
+      "comment": "**背景**：ROCm CI 上 native `no_gpu: true` 作业正确隐藏了 MI300 设备，但复用的 ROCm wheel 后缀阻止平台探测选择 CPU，导致 Basic Models Test (Other CPU) 等测试组在 no_gpu agent 上失败。**方法**：期望零 GPU 的 native 作业导出 `VLLM_TARGET_DEVICE=cpu`，显式 CPU 选择优先于 wheel 元数据与宿主加速器探测，仅改变运行时平台选择。**效果**：保持现有 `dind: false` 调度模型不变，两组 CPU 测试在 no_gpu agent 上恢复通过。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 平台探测与测试基础设施修复，属 CI 范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "ci", "platform-detection", "cpu"],
+      "pr_number": 49515
+    },
+    {
+      "sha": "acb0f1dcdb668d90bbbf50e57552d2f6f0987c87",
+      "comment": "**背景**：`load_dspark_model` 用 `speculative_config.attention_backend` 构建 draft 配置，该字段未指定时为 `None`，而 `None` 会触发后端自动选择而非表示“与 target 一致”，显式固定的 target 后端被静默丢弃；DSV4 上 draft 回退到 `DeepseekV4FlashMLAAttention` 后将共享 `cache_config.cache_dtype` 重写为 `fp8_ds_mla`，首次 forward 即以 shape 错误崩溃。**方法**：speculative config 未命名后端时回退继承 target 的 attention backend，显式 `attention_backend` 仍然优先。**效果**：DSV4 + `FLASHINFER_MLA_SPARSE_DSV4` + DSpark（k=7）配置下引擎正常初始化并服务，与 #51538 的修复互补。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DSpark draft 模型后端选择修复，属推测解码范畴。",
+      "tags": ["bugfix", "medium-risk", "dspark", "attention-backend", "deepseek-v4"],
+      "pr_number": 52288
+    },
+    {
+      "sha": "615d4cfadeb3d5ea1df248eb59aa128af5dbd441",
+      "comment": "**背景**：vLLM 默认使用异步调度，性能依赖主 CUDA 流上不存在 GPU<->CPU 同步，但此类同步隐蔽且容易被无意引入。**方法**：新增 `VLLM_GPU_SYNC_CHECK` 环境变量为模型 forward 与 sampler 启用 `torch.cuda.set_sync_debug_mode`，提供 `gpu_sync_allowed()` 上下文管理器包裹已知或不可避免的同步，并将检查接入 Docker 镜像与 CI 作业。**效果**：CI 中可自动暴露模型与采样热路径中隐藏的同步点，防止异步调度性能回归。",
+      "sig": "sig-model-performance",
+      "sig_reason": "面向异步调度性能的 GPU 同步检测工具与 CI 集成，属模型性能保障范畴。",
+      "tags": ["feature", "medium-risk", "gpu-sync", "async-scheduling", "ci"],
+      "pr_number": 43107
+    },
+    {
+      "sha": "7b544ecb524b6a5847465b671db2df9b8560ad93",
+      "comment": "**背景**：DeepSeek-V3.2/GLM-5.2 的 MTP draft 路径上尾部 all-reduce 未与最终 RMSNorm 融合，贪心模式下 draft token 还需全词表 all-gather。**方法**：非序列并行路径上将尾部 all-reduce 融合进最终 RMSNorm（与主模型层边界一致）；贪心 draft token 改经 vocab-parallel local argmax（`get_top_tokens`）跳过 `compute_logits` 的全词表 all-gather，序列并行路径不变。**效果**：2xGB300 TP8、GLM-5.2-NVFP4、MTP=5 下并发 64 时吞吐与接受长度获益，batch 1 场景三组基线重叠无回归。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "MTP draft 路径 kernel 融合与通信量削减的性能优化，属推测解码范畴。",
+      "tags": ["perf", "medium-risk", "mtp", "allreduce-fusion", "local-argmax", "deepseek-v32"],
+      "pr_number": 49793
+    },
+    {
+      "sha": "d6f17f3d530efbd83a730d3d73e9f483726dfde1",
+      "comment": "**背景**：Model Runner V2 切换为默认前需兼容使用 `MambaHybridModelState` 的 attention-free 模型，另有若干 CI 兼容性问题。**方法**：MRV2 支持 attention-free 模型的状态管理，并包含切换 MRV2 为默认所需的小改动，从 #46646 拆分而来。**效果**：attention-free（Mamba 类）模型在 MRV2 下可正常运行，为 MRV2 默认化扫清一项障碍。",
+      "sig": "sig-core",
+      "sig_reason": "Model Runner V2 对新模型架构类别的支持，属核心引擎范畴。",
+      "tags": ["feature", "medium-risk", "mrv2", "attention-free", "mamba"],
+      "pr_number": 52374
+    },
+    {
+      "sha": "9df9b0b0a1816b6d0d0f6ecd0da563cc37fd72f5",
+      "comment": "**背景**：`Dockerfile.rocm_base` 中 AITER kernel 以 pybind11 3.0.4 构建，而 `Dockerfile.rocm` 重新安装 pybind11 3.1.0，API 不兼容导致 Kimi K2.6/K3 等模型损坏（ROCm/aiter#4770）。**方法**：移除后者的 pybind11 重装步骤，后续将在 ROCk 工作中统一 Dockerfile。**效果**：单行变更消除版本不一致，AITER 依赖模型恢复正常。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm Docker 镜像依赖版本修复，属 CI/构建范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "docker", "pybind11"],
+      "pr_number": 52400
+    },
+    {
+      "sha": "bb4b448f9896cf3f5607bd5ed4b35b29cd866a6b",
+      "comment": "**背景**：`lm-eval-humming-f16-h100` 在 CI build 83851 中耗时 62.6 分钟，14 个模型配置串行执行。**方法**：将步骤拆为三个 Buildkite 作业，按实测时长把 14 个配置划分为三个显式 H100 列表，每个配置仅属一个分片。**效果**：关键路径从 62.63 分钟降至 20.79 分钟（3.01x），三个分片 14/14 配置全覆盖、无遗漏或重复，总 GPU 时间无膨胀。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 评测作业分片并行化，属 CI 基础设施范畴。",
+      "tags": ["optimization", "low-risk", "ci", "buildkite", "sharding", "lm-eval"],
+      "pr_number": 52326
+    },
+    {
+      "sha": "81e81dac1f3654564c3c48000edce1cdbe248ab9",
+      "comment": "**背景**：`moe-refactor-integration-test-b200-temporary` 在 CI build 83851 中耗时 81.3 分钟，19 个模型配置串行执行。**方法**：将步骤拆为四个 Buildkite 作业，按实测时长显式划分 19 个配置（最慢配置单独占 13.31 分钟，故用静态列表而非按数量分片）。**效果**：关键路径从 81.32 分钟降至 22.26 分钟（3.65x），19/19 配置全覆盖且各分片执行内容与列表完全一致。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 评测作业分片并行化，属 CI 基础设施范畴。",
+      "tags": ["optimization", "low-risk", "ci", "buildkite", "sharding", "moe", "b200"],
+      "pr_number": 52327
+    },
+    {
+      "sha": "694db075f8af1ccb026720782bc0e2400a3f5c61",
+      "comment": "**背景**：`multi-modal-models-extended-generation-2` 单作业耗时 71 分钟（近期 p90 75 分钟、最大 131 分钟）。**方法**：拆为四个确定性 pytest 分片并标注分片号，保留原有 `split(group=0) and not core_model` 选择。**效果**：最慢分片 20.678 分钟（3.448x 提速），116 个 node ID 两两不相交且并集与基线完全一致。",
+      "sig": "sig-ci",
+      "sig_reason": "多模态 CI 测试作业分片并行化，属 CI 基础设施范畴。",
+      "tags": ["optimization", "low-risk", "ci", "buildkite", "sharding", "multimodal"],
+      "pr_number": 52323
+    },
+    {
+      "sha": "549cef0b0b2c8924d302686c613cb4c39fc24dcd",
+      "comment": "**背景**：`language-models-test-extended-pooling` 单作业耗时 72 分钟（近期 p90 82 分钟）。**方法**：拆为四个确定性 pytest 分片，AMD 镜像保持单作业原命令不受影响（依赖 ci-infra #473 的 `mirror.amd.parallelism` 向后兼容覆盖）。**效果**：最慢分片 19.486 分钟（3.697x 提速），120 个 node ID 无缺失、多余或重复，NVIDIA `parallelism: 4` 与 AMD `parallelism: 1` 渲染验证通过。",
+      "sig": "sig-ci",
+      "sig_reason": "pooling 模型 CI 测试作业分片并行化，属 CI 基础设施范畴。",
+      "tags": ["optimization", "low-risk", "ci", "buildkite", "sharding", "pooling"],
+      "pr_number": 52322
+    },
+    {
+      "sha": "d87ef456abe54565cef476637df5e585bfddfb37",
+      "comment": "**背景**：`Quantization` CI 作业单作业耗时约 71-75 分钟，是 CI 长尾任务。**方法**：`parallelism: 4` 加 pytest-shard（`--shard-id`/`--num-shards`）在收集期切分 `tests/quantization/`，保留现有 device/key、V2 env、torchao pin 与 `-k` 过滤选择，超时从 75 分钟降至 40 分钟。**效果**：四个分片最慢 23.10 分钟（3.075x 提速），536 个 node ID 并集与基线完全一致，总 GPU 时间无膨胀，`VLLM_CI_ONLY_STEP_KEYS` 定向启动仍可用。",
+      "sig": "sig-ci",
+      "sig_reason": "量化 CI 作业分片并行化，属 CI 基础设施范畴。",
+      "tags": ["optimization", "low-risk", "ci", "buildkite", "sharding", "quantization"],
+      "pr_number": 52328
+    },
+    {
+      "sha": "925ea7e60f727bbb3fe3fcdb1c02b01a5bfb2749",
+      "comment": "**背景**：`test_deep_ep_v2_moe` 间歇性以 `Only 98.2% of FP8 outputs are within tolerance` 失败（#50184）：测试只在父进程 `set_random_seed(7)`，而断言实际依赖的张量在 worker 中以未播种 RNG 生成，输入每次运行都不同。**方法**：在两个 worker 入口内按 `pgi.rank` 偏移播种，各 rank 数据仍互不相同，未放宽容差或 0.99 阈值。**效果**：测试可复现（三次运行结果一致），为诊断 #50184 奠定基础。",
+      "sig": "sig-ci",
+      "sig_reason": "DeepEP v2 MoE 测试非确定性修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "flaky-test", "deepep-v2", "seeding"],
+      "pr_number": 50589
+    },
+    {
+      "sha": "c794754062d49a8fdb63ab3c5215b488b865030c",
+      "comment": "**背景**：`Mxfp4MoEMethod` 中 `_use_k3_situ_aiter` 模型专属谓词对 Kimi-K3 SiTU 激活做特判，横跨后端选择、尺寸圆整与权重 shuffle 三条路径，将行为绑定到具体模型而非激活类型本身。**方法**：删除特判，将 `MoEActivation.SITU` 纳入 `AiterExperts._supports_activation`；`mxfp4_round_up_hidden_size_and_intermediate_size` 与权重转换函数增加 activation 参数（SiTU 跳过 ROCm 256 对齐并走专用 shuffle），`_setup_kernel` 对所有 MXFP4 路径无条件调用。**效果**：未来任何使用 SiTU 激活 + MXFP4 权重的模型在 ROCm gfx950 上无需新增特判代码即可正确路由。",
+      "sig": "sig-quantization",
+      "sig_reason": "MXFP4 量化方法中模型特判重构为按激活类型标准分发，属量化范畴。",
+      "tags": ["refactor", "medium-risk", "rocm", "mxfp4", "moe", "aiter", "situ"],
+      "pr_number": 50597
+    },
+    {
+      "sha": "f473870ecf7a5a83958dbc116468663224f45b05",
+      "comment": "**背景**：可信的 RL sidecar 此前只能使用开发用 HTTP 服务器，Rust 前端 gRPC `Control` 服务缺少 RL 生命周期操作。**方法**：新增 scheduler 的 pause/resume RPC、GPU 内存的 sleep/wake RPC、以及 weight-transfer 的初始化/开始/更新/结束/版本 RPC；通过 EngineCore ready 握手通告 RL 能力并拒绝不支持的操作，状态变更串行化且要求暂停生成后才能更新权重，复用已配置的 NCCL/IPC/sparse-NCCL 传输后端，并文档化无鉴权控制面的管理信任边界。**效果**：外部 RL sidecar 可直接使用原生 Rust gRPC 前端完成完整 RL 生命周期，未新增监听端口或独立权重传输实现。",
+      "sig": "sig-rl",
+      "sig_reason": "Rust 前端新增 RL 生命周期控制（pause/resume、sleep/wake、权重传输），属 RL 生态范畴。",
+      "tags": ["feature", "high-risk", "rl", "grpc", "rust-frontend", "weight-transfer"],
+      "pr_number": 51316
+    },
+    {
+      "sha": "3e3ceb1961d44252ff4a4f8e22364186d70c54f7",
+      "comment": "**背景**：多模态编码器中存在大量阻塞式 H2D 拷贝与本可在宿主端完成的设备回读，破坏异步调度性能。**方法**：keye/paddleocr_vl/ernie45_vl/flash_linear_attention 的位置 ID、`cu_seqlens`、索引表等改用非阻塞拷贝或 `async_tensor_h2d`；glm4_1v、keye 等宿主已知量改用 numpy 展开避免 `lengths[i]` 等回读；diffusion_gemma 为 `repeat_interleave` 传入 `output_size`；仅驱动 Python 形状计算的字段（`image_sizes` 等）改为 `keep_on_cpu`。**效果**：多模态编码器前向中的隐藏 GPU<->CPU 同步显著减少。",
+      "sig": "sig-model-performance",
+      "sig_reason": "多模态编码器 GPU 同步消除的性能优化，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "multimodal", "gpu-sync", "encoder"],
+      "pr_number": 52369
+    },
+    {
+      "sha": "9b0ab5dd53583ee25066b8d937e8bd3235daa6e2",
+      "comment": "**背景**：ROCm sparse MLA indexer 后端此前在 `--block-size 16` 时只能选 kernel block size 1，禁用了 AITER 更快的 preshuffled FP8 paged-MQA 路径，性能留有空间。**方法**：允许 ROCm sparse MLA indexer 后端使用与 16-token KV cache block 对齐的 kernel block size，从而启用 preshuffled AITER kernel。**效果**：MI355X 上 GLM-5.2 MXFP4 TP4、50k 输入/1k 输出负载下 paged-MQA kernel 从 28.53µs 降至 7.84µs（3.64x），输出吞吐 +2.52%、TPOT -2.98%、E2E 延迟 -2.86%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm sparse MLA indexer 启用更快 preshuffled paged-MQA kernel 的性能优化。",
+      "tags": ["perf", "low-risk", "rocm", "sparse-mla", "paged-mqa", "block-size"],
+      "pr_number": 51216
+    },
+    {
+      "sha": "83ded8d839f60d97f5b020b598001cd9081150f6",
+      "comment": "**背景**：LoRA CI 作业耗时较长，且大部分时间消耗在被测对象之外的准备工作。**方法**：punica 参考实现改为在 GPU 上运行（XPU 保留 CPU 以绕过 oneDNN/oneMKL bug）；FP8 quant/dequant 参考实现由 Python 逐块循环向量化为整张量 amax 归约（数值与循环版完全一致）；跳过冗余的每测试全局清理。**效果**：LoRA 测试作业显著提速，无测试被删除或削弱。",
+      "sig": "sig-ci",
+      "sig_reason": "LoRA 测试作业提速，仅改测试代码，属 CI 测试范畴。",
+      "tags": ["optimization", "low-risk", "lora", "test", "punica"],
+      "pr_number": 52331
+    },
+    {
+      "sha": "e078a2238a1e4b53d49a7cc15e09716ed61abf3b",
+      "comment": "**背景**：`allreduce_rms_fusion.py` 中可选的 `flashinfer.comm` 导入仅以 `except ImportError` 保护，`flashinfer-python==0.6.16.post3`（Python 3.11）在导入时抛出 `TypeError`，导致 `tp_size=1` 且未启用融合的 EngineCore 启动直接失败。**方法**：将保护放宽为 `except Exception` 并记录警告。**效果**：损坏的 flashinfer 只会禁用 allreduce 融合 pass 并给出警告，不再阻断引擎启动。",
+      "sig": "sig-model-performance",
+      "sig_reason": "编译 pass 中 flashinfer 导入保护修复，避免可选依赖破坏启动，属编译/性能 pass 范畴。",
+      "tags": ["bugfix", "low-risk", "flashinfer", "allreduce-fusion", "startup"],
+      "pr_number": 52241
+    },
+    {
+      "sha": "03a8d0b1ede68efc20b8bbfc14ee4681a62f8d75",
+      "comment": "**背景**：DFlash drafter 依赖目标层固定位置捕获的辅助隐状态，但 Kimi K3 此前捕获的是 post-mixture 流（AttnRes 残差混合在 layer norm 之后取值），与 drafter 训练所用的 pre-norm 流不一致。**方法**：改在 layer norm 之前 tap AttnRes 混合流，并按 tap 层位置选择正确权重（有下一层时用其 AttnRes 权重、最终 stage 的最后层用模型输出侧聚合、非最终 stage 的最后层回退运行中前缀）；日志移至 `_set_aux_hidden_state_layers` setup 钩子，避免在编译 forward 中设置属性引发 graph break。**效果**：由 `VLLM_KIMI_K3_AUX_ATTN_RES_STREAM` 门控（默认关闭），8xB300 TP8、DFlash 16 spec token 下 drafter 输入恢复为训练一致的表示。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "Kimi K3 DFlash drafter 辅助隐状态捕获点修正，属推测解码范畴。",
+      "tags": ["feature", "medium-risk", "kimi-k3", "dflash", "spec-decode", "attnres"],
+      "pr_number": 50487
+    }
+  ]
+}

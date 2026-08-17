@@ -1,0 +1,136 @@
+{
+  "date": "2026-08-16",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-16T20:00:00+08:00",
+  "daily_summary": "当日共 15 条变更，DeepSeek-V4 相关工作集中：global top-k index kernel 编译期常量化与 sparse top-k metadata kernel 提高并行度（16K token 下快 36.9%），同时回退导致 FULL CUDA graph 重放读取过期偏移的自适应 C128A metadata packing。新增 `CuMemAllocator.discard()` 支持按 tag 选择性释放 GPU 内存并理顺与 sleep/wake_up 的交互。推测解码修复三项：DSpark 自适应验证 draft budget 为 0 时的 grammar bitmask 崩溃、bad_words draft 前缀匹配 off-by-one、EAGLE 部分哈希命中路径的前缀缓存注册丢失。前端方面 Anthropic API 客户端错误改返 4xx、结构化输出校验器改抛 `VLLMValidationError`；EC connector 打通 worker 到 scheduler 的元数据通道。",
+  "sig_summaries": {
+    "sig-core": "新增 `CuMemAllocator.discard()` 支持按 tag 选择性释放 KV cache 等过期分配并保持权重映射可用，理顺 sleep/discard/wake_up 交互与冲突检查（#52514）。DSV4 eager cudagraph 区域改为按 model runner 选取，ROCm 恢复默认 MRV1 且不再拒绝 MRV1+PIEWISE（#52401）；回退自适应 C128A metadata packing，修复 FULL graph 重放下稀疏 decode 读取过期行偏移（#51318）。Anthropic `/v1/messages` 客户端错误改返 4xx（#52246）；结构化输出校验器改抛 `VLLMValidationError`（#52394）；修复 thinking-budget 非对称 SWAP 遗留状态（#49613）。",
+    "sig-model-performance": "DSV4 global top-k index kernel 以编译期常量替代运行时参数，端到端吞吐 +0.50%（#51967）；sparse top-k metadata kernel 提高 worker 并行度，16K token 下快 36.9%，服务吞吐 +1.56%（#52084）。",
+    "sig-quantization": "跳过 chunked prefill 下无用的 ROCm FP8 MLA PS metadata 构建（#52356）；修复 Kimi-K3 MegaMoE 向 `fp8_fp4_mega_moe` 传参名错误导致的 TypeError（#52445）。",
+    "sig-spec-decode": "修复 DSpark 自适应验证在 draft budget 为 0 时 grammar bitmask 行数与映射不一致的崩溃（#52436）；修复 `_bad_words_kernel` spec-decode 分支缺少 +1 的 off-by-one（#52311）；修复细粒度部分哈希命中路径上 EAGLE cache 注册上限被重新对齐导致漏注册（#52419）。",
+    "sig-omni": "Gemma 4 视频帧计数张量保留在 CPU，修复 CI 上的崩溃（#52441）。",
+    "sig-large-scale-serving": "为 EC connector 打通 worker 到 scheduler 的元数据通道（`build_connector_worker_meta` 与 `ECOutputAggregator`），支撑基于 CUDA 事件与 NIXL P2P 的 CPU offload EC connector（#49585）。"
+  },
+  "commits": [
+    {
+      "sha": "83f591d7f694a3ca3ae3bf22d646e818a1421872",
+      "comment": "**背景**：DSV4 global top-k index kernel 此前以运行时参数传入 topk、block_size 等常量，阻碍编译器优化。**方法**：将这些形状参数改为编译期常量。**效果**：DSV4-Flash 端到端吞吐 +0.50%、TPOT -0.98%，kernel 微基准同步改善。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSV4 top-k index kernel 编译期常量化优化。",
+      "tags": ["perf", "low-risk", "dsv4", "triton", "kernel"],
+      "pr_number": 51967
+    },
+    {
+      "sha": "9409f59e0963a033a87a6847d6cafef54a64a79c",
+      "comment": "**背景**：#46438 引入按 tag 的 `discard()`，可释放 KV cache 等过期分配而保持权重映射可用，但 sleep 与 discard 的交互尚未理顺。**方法**：为 CUDA/XPU allocator 完善：仅丢弃 KV-cache tag 时权重保持映射可用；unmap 前同步设备；`wake_up()` 仅重映射真正 asleep 的分配；对已丢弃再 offload（无 CPU 备份可恢复）与已 offload 再 discard（改变既定策略）做冲突检查，同策略重复请求幂等。**效果**：sleep/discard/wake_up 组合语义明确且安全。",
+      "sig": "sig-core",
+      "sig_reason": "设备内存分配器 sleep/discard 语义完善，属核心内存管理。",
+      "tags": ["feature", "medium-risk", "allocator", "sleep-mode", "gpu-memory"],
+      "pr_number": 52514
+    },
+    {
+      "sha": "fe1c317157d4478fdc0e02096447e61305b871e9",
+      "comment": "**背景**：ROCm FP8 MLA PS ASM kernel 仅在非分块（causal）prefill 上运行，但其 persistent metadata 即使在 chunked prefill 中也被无条件构建。**方法**：仅在真正需要时构建该 metadata。**效果**：chunked prefill 省去无用元数据构建，DeepSeek-V3-0324（MTP+EP，TP8）服务基准相应改善。",
+      "sig": "sig-quantization",
+      "sig_reason": "ROCm FP8 MLA 注意力元数据构建时机优化。",
+      "tags": ["perf", "low-risk", "rocm", "fp8", "mla", "chunked-prefill"],
+      "pr_number": 52356
+    },
+    {
+      "sha": "836aac92ffdaa337083934181cb6d00b64b2a1a6",
+      "comment": "**背景**：DSV4 sparse top-k metadata kernel 的 worker 数量偏低，限制 prefill 吞吐。**方法**：提高 kernel 并行度（128 提升至 256 workers）。**效果**：1024/4096/16384 token 下 kernel 分别快 15.2%/30.7%/36.9%，配对 A/B/A 服务基准吞吐 +1.56%、TPOT -2.79%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSV4 sparse top-k metadata kernel 并行度优化。",
+      "tags": ["perf", "low-risk", "dsv4", "triton", "kernel"],
+      "pr_number": 52084
+    },
+    {
+      "sha": "4d2a68d64d9e05921ed5c4099146e768a92d71d5",
+      "comment": "**背景**：DSpark 自适应验证中 `draft_budget=0` 是低置信度时的常规 argmax 选择，但 `compact_batch()` 零预算分支改写 `cu_num_logits_np` 后，调度器按 `len(drafts)+1` 行生成的 grammar bitmask 与 worker 侧映射行数不一致，结构化输出请求触发 assert 崩溃。**方法**：修正零预算（bonus-only）布局下的 bitmask 到 logits 映射，使调度器与 worker 对行数达成一致。**效果**：DSpark 自适应验证加结构化输出在零预算步不再崩溃。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DSpark 投机解码与结构化输出 bitmask 映射修复。",
+      "tags": ["bugfix", "medium-risk", "spec-decode", "dspark", "structured-output"],
+      "pr_number": 52436
+    },
+    {
+      "sha": "84530eb235dc3d866fa7d4588217f2fb53f43e76",
+      "comment": "**背景**：Gemma 4 视频处理将每请求帧计数张量放在 GPU 上，触发 Buildkite CI 崩溃。**方法**：帧计数保留在 CPU。**效果**：Gemma 4-E2B 视频多模态 CI 恢复。",
+      "sig": "sig-omni",
+      "sig_reason": "Gemma 4 多模态视频处理设备放置修复。",
+      "tags": ["bugfix", "low-risk", "multimodal", "gemma-4", "video"],
+      "pr_number": 52441
+    },
+    {
+      "sha": "1b079c40ff9d2598d837f4ed1fc08342fca4fd6e",
+      "comment": "**背景**：`_bad_words_kernel` spec-decode 分支读取 draft token 时缺少与 `_penalties_kernel` 等一致的 `+1`（#33433 引入以来），draft 区域读取整体前移一位：跨 committed/draft 边界的前缀匹配漏禁或迟到一行，边界重复读取还可能误禁无辜 token。**方法**：补上 +1 对齐 draft token 布局，并新增该 kernel 首个单测覆盖边界场景。**效果**：bad_words 与投机解码组合时掩码行为正确，单 token bad_words 与非 spec 行不受影响。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "bad_words 采样 kernel 投机解码分支 off-by-one 修复。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "sampling", "bad-words"],
+      "pr_number": 52311
+    },
+    {
+      "sha": "70aaec832bde70ada17cbad2061105bbd07541dc",
+      "comment": "**背景**：Anthropic 到 OpenAI 的请求转换失败（如超过 `VLLM_MAX_STOP_STRINGS`）时被 `except Exception` 吞掉 `pydantic.ValidationError`，返回 HTTP 500 而非 4xx。**方法**：`POST /v1/messages` 与 `/count_tokens` 统一走 `create_error_response`，客户端错误映射 4xx、真实服务端错误保持 500，并新增回归测试。**效果**：客户端错误稳定返回 400，修复 #52088 剩余部分。",
+      "sig": "sig-core",
+      "sig_reason": "Anthropic API 入口错误码规范化，属核心前端范畴。",
+      "tags": ["bugfix", "low-risk", "anthropic", "error-handling", "api"],
+      "pr_number": 52246
+    },
+    {
+      "sha": "41f12a0daf193c80f2e748f6a65f0735623be3a5",
+      "comment": "**背景**：结构化输出校验器抛原始 `ValueError`，被 `AsyncLLM.generate` 包装为 `EngineGenerateError`，坏 `response_format` schema 得到 500 而非 400（ray serve 上即表现为引擎失败）。**方法**：将 `SamplingParams.verify()` 可达的四个校验器迁移为抛 `VLLMValidationError`（一种 `VLLMClientError`，generate 原样上抛），包装外部调用泄漏的原始异常，并修正 auto backend 的 fallback except 链。**效果**：无效 schema 正确返回 4xx。",
+      "sig": "sig-core",
+      "sig_reason": "结构化输出校验错误类型迁移，属核心验证路径。",
+      "tags": ["bugfix", "low-risk", "structured-output", "validation", "error-handling"],
+      "pr_number": 52394
+    },
+    {
+      "sha": "8efa13b700f1836657699cae2503dc2feab27fa0",
+      "comment": "**背景**：#51430 收窄 DSV4 eager cudagraph 区域导致 MRV1 输出损坏，#51768 随之默认 MRV2 并拒绝 MRV1+PIECEWISE，代价是 MRV1 更快的 ROCm 性能受损。**方法**：eager 区域改由 model runner 决定——MRV1 在 `_prepare_and_attn_eager` 中包裹整个 attention 体（恢复 #51430 前的区域），MRV2 保持窄区域与更短 TTFT；撤回 MRV1+PIECEWISE 拒绝；CUDA 默认 MRV2、ROCm 默认 MRV1。**效果**：各平台 DSV4 输出均正确，ROCm 恢复更快的 runner。",
+      "sig": "sig-core",
+      "sig_reason": "DSV4 cudagraph 区域按 model runner 选取的修复。",
+      "tags": ["bugfix", "medium-risk", "dsv4", "cuda-graph", "mrv1", "mrv2"],
+      "pr_number": 52401
+    },
+    {
+      "sha": "6593754e61a45b27a93e40fa0479568945d38661",
+      "comment": "**背景**：细粒度部分哈希命中下 `cache_blocks` 的注册上限应为原始 token 数，而 #50062 重写的 EAGLE 分支重新按 `scheduler_block_size` 对齐，导致每段尾部 `(n % scheduler_block_size) - manager.block_size` 个 token 不再注册前缀缓存；`--mamba-cache-mode align` 加 EAGLE 系 drafter 的混合 Mamba 模型即受影响。**方法**：将两条上限统一收敛到 `_align_cacheable` 助手，豁免逻辑不再可能被二次推导丢失。**效果**：EAGLE 系请求恢复完整前缀缓存注册。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "EAGLE 前缀缓存注册上限回归修复。",
+      "tags": ["bugfix", "medium-risk", "spec-decode", "eagle", "prefix-cache", "mamba"],
+      "pr_number": 52419
+    },
+    {
+      "sha": "edd4c8176cfd98ece8a29beda574378c42971967",
+      "comment": "**背景**：#50004 引入的自适应 C128A top-k 宽度与打包 persistent-buffer 视图存在缺陷：metadata builder 在 FULL CUDA graph 重放前运行，而捕获的稀疏 decode 消费者沿用捕获期行布局，运行时按 `active_topk_width` 打包写入使后续行从过期偏移读取（#52448）。**方法**：回退为固定 `c128a_max_compressed` 宽度、容量步长切片与捕获期 `stride(0)`，并删除断言打包布局的测试。**效果**：GB300 上 2xTP+EP 的 DSV4 复现负载 0/256 错误签名、0 请求错误。",
+      "sig": "sig-core",
+      "sig_reason": "DSV4 稀疏 MLA 元数据打包回退，修复 CUDA graph 重放正确性。",
+      "tags": ["revert", "high-risk", "dsv4", "sparse-mla", "cuda-graph"],
+      "pr_number": 51318
+    },
+    {
+      "sha": "fa9d67f7828e9bc105912ddf41dc384105732b1e",
+      "comment": "**背景**：V2 model runner 的 EC connector 缺少 worker 到 scheduler 的元数据通道（KV connector 有完整三件套），worker 侧无法回报如 `mm_hash` 已持久化等逐步状态，阻塞基于 CUDA 事件与 NIXL P2P 的 CPU offload EC connector。**方法**：新增 `ECConnectorWorkerMetadata` ABC 与 `build_connector_worker_meta()`，`ECConnectorOutput` 增加 meta 字段，`ECOutputAggregator` 将连接器输出聚合到送达调度器的 rank，engine/executor 完成接线，MRV1/MRV2 均填充该字段。**效果**：EC connector 具备逐步状态回报能力，现有连接器默认行为不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EC/KV 连接器元数据通道建设，属大规模服务范畴。",
+      "tags": ["feature", "medium-risk", "ec-connector", "kv-transfer", "metadata-channel"],
+      "pr_number": 49585
+    },
+    {
+      "sha": "c94cdd0ae03865c00b694ca6f13b2d2bc4360fcd",
+      "comment": "**背景**：`ThinkingBudgetStateHolder.sync_batch` 处理非对称 SWAP 时用 `.get()` 加赋值而非 `.pop()`，有预算请求与无预算槽位交换后原索引残留状态，两个索引引用同一 state 对象，混合批次中思考结束强制可能作用到错误请求。**方法**：与 logits processor 的 `swap_dict_values` 一致，先 pop 两个索引再重新赋值。**效果**：SWAP 后不再有悬挂的 thinking-budget 状态，回归测试覆盖双向交换。",
+      "sig": "sig-core",
+      "sig_reason": "thinking-budget 批次状态交换修复，属核心采样范畴。",
+      "tags": ["bugfix", "medium-risk", "sampling", "thinking-budget"],
+      "pr_number": 49613
+    },
+    {
+      "sha": "ed0f4750f8766c2cc3984be4f1ba073a6915d4ed",
+      "comment": "**背景**：`KimiMegaMoEExperts.forward` 以 `activation_beta=`/`activation_linear_beta=` 传参，而 pinned DeepGEMM（8b1392b）的签名为 `situ_beta`/`situ_linear_beta`，首次 mega-MoE forward 即 TypeError。**方法**：重命名这两个 kwargs（类内部属性名不动）。**效果**：Kimi-K3 MegaMoE 在 NVIDIA mega-MoE backend 上恢复可用。",
+      "sig": "sig-quantization",
+      "sig_reason": "fp8_fp4_mega_moe 量化 kernel 传参名修复。",
+      "tags": ["bugfix", "low-risk", "kimi-k3", "moe", "fp8-fp4", "deepgemm"],
+      "pr_number": 52445
+    }
+  ]
+}

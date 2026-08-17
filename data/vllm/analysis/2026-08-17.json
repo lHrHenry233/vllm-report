@@ -1,0 +1,153 @@
+{
+  "date": "2026-08-17",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-17T20:00:00+08:00",
+  "daily_summary": "当日 17 条变更以 ROCm 性能为重心：gfx950 Triton sparse-MLA decode 专用 kernel 大规模优化、gfx942 改用 AITER FlyDSL fp8 MQA logits kernel 使 GLM-5.2-FP8 长上下文吞吐 +63%、FlashKDA pin 升级启用 K2 自动 V-split。正确性方面修复 DSv4 indexer 短上下文捷径被固化进 breakable CUDA graph 导致长前缀候选截断输出错误、Mooncake 异步 store 读取已释放 GPU 块写入错误 KV、多模态 encoder cache 同步驱逐重分配崩溃、Blackwell FA4 head-dim 256 临时回退 FA2。核心方面 MRV2 采样器缓存 logits 处理谓词、入口校验器对非对象 JSON 返回 422、indexer cache dtype 配置统一到 `indexer_kv_dtype`。CI 方面新增 ROCm ViT CUDA graph 覆盖、多模态测试合并 runner 启动、KV-offload 评估适配受限共享内存。",
+  "sig_summaries": {
+    "sig-quantization": "新增 GB10（DGX Spark）fused-MoE fp8 调优配置（E=256/E=512, N=512，DeepSeek 系形状）（#52502）。gfx942 以 AITER FlyDSL fp8 MQA logits kernel 替换 vendored Triton 实现，GLM-5.2-FP8 ISL=128K 吞吐 +63%（#49544）。删除量化相关死代码 395 行（#52221）。",
+    "sig-model-performance": "修复 DSv4 indexer 短上下文捷径在 CUDA stream 捕获期间被固化进 breakable graph、长前缀回放时候选被截断为 0..511 的错误（#52492）。gfx950 Triton sparse-MLA decode 大规模优化：专用 partial kernel（512 宽 QK 点积 + 四个 128 宽 PV 累加器）、工作量感知 split 选择与 BF16 直出（#52212）。Blackwell 临时禁用 FA4 head-dim 256 回退 FA2，规避 SM100 2-CTA kernel 不支持 `seqused_q/k`（#52050）。FlashKDA pin 升级启用 K2 自动 V-split 提升低并行度 CTA 利用率（#52458）。",
+    "sig-core": "MRV2 采样器在 `add_request()` 时缓存 logits-processing 组合谓词，热路径只扫描紧凑布尔数组的活跃行（#52329）。13 个 before-validator 对非对象 JSON body 加 `isinstance(data, dict)` 守卫，返回 422 而非 500（#52528）。`indexer_kv_dtype` 统一为 indexer cache dtype 唯一旋钮并弃用 `use_fp4_indexer_cache`（#52550）。MRV2 支持 Transformers backend pooling 模型（#52425）。",
+    "sig-ci": "MI355（gfx950）新增 ViT encoder CUDA graph 两个 optional 测试步骤并更新设计文档兼容性矩阵（#52256）。多模态测试合并各 size factor 避免重复启动 runner，收集用例数 259 降至 108（#52417）。小型 KV-offload GSM8K 评估 `cpu_offload_gib` 降至 1 GiB 以适配受限 `/dev/shm`（#52496）。",
+    "sig-large-scale-serving": "Mooncake store job 改以单调递增 `store_job_id` 为键并对 GPU block pool 持有引用直至所有 rank 完成，修复抢占后异步 PUT 读取已释放块、将不属于 key 的 KV 写入并随前缀命中持续扩散的缺陷（#52372）。",
+    "sig-omni": "修复 encoder cache 条目在同一调度步内先驱逐后重分配时，陈旧驱逐通知删除仍需使用的张量导致 `Encoder cache miss` 引擎终止（#52482）。",
+    "other": "文档新增 MatrixHub 作为模型加载源：自托管、HF 兼容 API，设置 `HF_ENDPOINT` 即可开箱使用（#50492）。"
+  },
+  "commits": [
+    {
+      "sha": "7ea4b40954084bbafa595faab6b322a5eb124ec0",
+      "comment": "**背景**：NVIDIA GB10（DGX Spark）缺少设备专属 fused-MoE Triton 配置，运行时回退到启发式默认值。**方法**：新增 `E=256,N=512` 与 `E=512,N=512`、`fp8_w8a8`、`block_shape=[128,128]`（DeepSeek 系 MoE 层形状）的调优配置，经 `benchmark_moe.py` 在 GB10 上调优。**效果**：GB10 上 MoE 层吞吐超过启发式回退，2 节点 TP=2 服务 DeepSeek-V4-Flash-0731 端到端解码吞吐提升；纯 JSON 变更，不影响其他设备的代码路径。",
+      "sig": "sig-quantization",
+      "sig_reason": "新增 fp8 fused-MoE 调优配置，属量化 kernel 性能范畴。",
+      "tags": ["feature", "low-risk", "gb10", "fused-moe", "fp8", "tuning-configs"],
+      "pr_number": 52502
+    },
+    {
+      "sha": "292187dd8ca1b1bfa195f25b2886262527269999",
+      "comment": "**背景**：#51430 将 `DeepseekV4Indexer.forward` 移入捕获区域后，#49486 的宿主侧短上下文捷径（跳过 learned indexer scoring）被固化进 graph；breakable PIECEWISE 捕获使用短 dummy metadata，而 graph 之后可能为超 2048 token 的长缓存前缀回放，此时 C4 层候选超过 512 个需要打分，被捕获的捷径却只选候选 `0..511`，产生错误输出。**方法**：CUDA stream 处于捕获状态时不走捷径，eager 执行保留该优化。**效果**：DSV4-Flash 在 2xB200 TP2+EP、DSpark-7、prefix caching、`FULL_AND_PIECEWISE` breakable graph 下输出恢复正确，#52448 负载 256 请求 0 个长度失控。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CUDA graph 捕获语义下的 indexer 正确性修复，属 CUDA graph/模型性能范畴。",
+      "tags": ["bugfix", "medium-risk", "deepseek-v4", "cuda-graph", "indexer", "dspark"],
+      "pr_number": 52492
+    },
+    {
+      "sha": "6664d397bf091cb9371cba481d4efb8233436fe6",
+      "comment": "**背景**：`Sampler._requires_logits_processing()` 每个采样步都要扫描多个 per-request 的 NumPy/Python 状态，采样热路径开销大。**方法**：在 `add_request()` 时计算组合谓词并按请求槽位存储一个布尔值，热路径只需扫描一个紧凑数组的活跃行；缓存随槽位复用被覆盖，经现有 `idx_mapping_np` 保持活跃子集过滤。**效果**：采样热路径开销显著降低，不改变任何公开或下游 processor API。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 采样器热路径性能优化，属核心引擎范畴。",
+      "tags": ["perf", "low-risk", "mrv2", "sampler", "logits-processing"],
+      "pr_number": 52329
+    },
+    {
+      "sha": "502af5ed007da93c2a7747b31d0dc0e6110e17a3",
+      "comment": "纯文档变更：在 `docs/models/supported_models.md` 中于 Hugging Face Hub 与 ModelScope 旁新增 MatrixHub 模型加载源说明。MatrixHub 是自托管、Apache 2.0 许可的模型注册表，经 HF 兼容 API 提供上游缓存模型，vLLM 设置 `HF_ENDPOINT` 即可开箱使用，适用于气隙集群与避免跨节点重复下载。",
+      "sig": "other",
+      "sig_reason": "纯文档新增模型加载源说明，不涉及任何 SIG 所属代码。",
+      "tags": ["docs", "low-risk", "matrixhub", "model-loading"],
+      "pr_number": 50492
+    },
+    {
+      "sha": "a6a2a93f9b9f3b2c155b50c8c6f2badf41cbfd66",
+      "comment": "**背景**：`mode=\"before\"` 校验器直接调用 `data.get(...)`，客户端发送非对象 JSON body（列表、字符串、数字、布尔）时抛出 `AttributeError`，表现为 HTTP 500 而非 422 验证错误；#51654 只修复了 chat completion，其余入口的相同模式未覆盖。**方法**：对 completion、responses、pooling、serve/tokenize、speech_to_text 等 13 个遗漏的 before-validator 添加相同的 `isinstance(data, dict)` 守卫，并扫遍 `vllm/entrypoints/**` 确认无剩余遗漏。**效果**：所有入口对非对象 JSON body 统一返回 422 而非 500。",
+      "sig": "sig-core",
+      "sig_reason": "API 入口请求校验器健壮性修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "validation", "openai-api"],
+      "pr_number": 52528
+    },
+    {
+      "sha": "967e104fad12758e1fc4f16b7f9fdebfc3b6b1bb",
+      "comment": "**背景**：稀疏注意力 indexer 的 K-cache dtype 由两个互不相关的旋钮控制：`use_fp4_indexer_cache`（仅 DeepSeek 读取）与 `indexer_kv_dtype`（仅 MiniMax M3 读取），同时传入时 bool 静默获胜，请求 fp8 却实际运行 MXFP4 且无任何警告。**方法**：将 `indexer_kv_dtype` 统一为唯一旋钮并新增 `auto` 默认值按模型解析（DeepSeek 为 fp8、M3 为 bf16，保持现行为）；`use_fp4_indexer_cache` 标记弃用（v0.19 移除，`True` 映射 `mxfp4`），冲突取值改为报错；弃用字段排除出 `compute_hash` 以共享编译缓存；新增 `dsa_indexer_uses_fp4()` 集中解析与校验，DSA 不支持的 dtype 提前报 `ValueError`。**效果**：配置面收敛为单一入口，静默歧义消除。",
+      "sig": "sig-core",
+      "sig_reason": "attention 配置系统统一 indexer cache dtype 旋钮并弃用旧字段，属核心配置范畴。",
+      "tags": ["refactor", "medium-risk", "config", "indexer", "kv-dtype", "deprecation"],
+      "pr_number": 52550
+    },
+    {
+      "sha": "0ad04cff1b10267a2642becbf31f62c91018cad5",
+      "comment": "**背景**：ViT encoder CUDA graph 测试此前以 `current_platform.is_cuda()` 为条件跳过 ROCm，gfx950 上缺少覆盖。**方法**：skip 条件改为 `is_cuda_alike()`，在 MI355 分节新增 `Encoder Cudagraph` 与 `Multi-Modal Models (ViT CUDA Graph)` 两个 optional 步骤，MI300/MI355 的 standard 多模态 sweep `--ignore` 该文件避免重复执行，设计文档新增兼容性矩阵并记录 MI350X + `FLASH_ATTN` 实测结论。**效果**：MI350X/MI355X（gfx950）上 ViT encoder CUDA graph 进入 CI 覆盖。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 新增测试覆盖与流水线配置，属 CI 范畴。",
+      "tags": ["test", "low-risk", "rocm", "ci", "vit", "cuda-graph"],
+      "pr_number": 52256
+    },
+    {
+      "sha": "a18c9b56ff9feb617d8f7c2eeca9263b328cc9c1",
+      "comment": "**背景**：Kimi K3 的 FlashKDA pinned revision `b5d1101` 在低并行度负载下 CTA 级并行不足。**方法**：将 `flashkda.cmake` 的 pin 从 `b5d1101` 升至 `053de1b`：新 revision 在 `2 * local_heads * sequences <= SM count` 时自动对 K2 的 value 维做 split 以提升 CTA 并行度，被启发式拒绝的形状仍走原 K2 路径，并包含上游 TMA proxy-fence 修复。**效果**：单行 CMake 变更、无 vLLM API 或模型代码改动；SM120 与 SM90a 稳定 ABI 构建下以 Kimi-K3 TP8 rank-local 几何完成完整 forward 验证。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashKDA kernel 依赖升级带来低并行度负载性能提升，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "kimi-k3", "flashkda", "cmake", "pin-bump"],
+      "pr_number": 52458
+    },
+    {
+      "sha": "dc9ae4b8ac2331991ad7091812ef82ece4f8fdc2",
+      "comment": "**背景**：Mooncake 异步 store 作业在 worker 入队后、后台线程实际读取 GPU 前即可被 scheduler 抢占并归还块，PUT 读取到其他请求的 KV 并写入错误 key，且错误数据随前缀命中持续扩散；既有 `request_finished` 延迟释放只覆盖正常完成路径，台账以 req_id 为键还存在复用错配。**方法**：每个 store job 以调度器侧单调递增的 `store_job_id` 标识并对 GPU block pool 持有自己的引用，待所有 rank 报告该作业完成后释放，同时覆盖正常完成与抢占路径（`request_finished` 不再需要延迟释放）；部分尾部 offload 读取的写时复制块同样被引用。**效果**：#52360 与 #51637 修复，store 不再读取已释放块、不再写入不属于 key 的数据。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Mooncake KV 传输异步 store 的 GPU 块生命周期与台账修复，属大规模服务 KV connector 范畴。",
+      "tags": ["bugfix", "high-risk", "mooncake", "kv-transfer", "kv-connector", "store-job"],
+      "pr_number": 52372
+    },
+    {
+      "sha": "eee538d5daa0c8c969f20d0c48c972155a6f1859",
+      "comment": "**背景**：encoder cache 条目可能在同一次 `schedule()` 内先被驱逐加入 `self.freed`、随后又被重新分配，陈旧的驱逐通知仍被发给 model runner，导致 `_gather_mm_embeddings()` 使用前张量即被删除，引擎以 `Encoder cache miss` 终止。**方法**：仅当条目不在最终 `self.cached` 状态时才上报为 freed，实际驱逐行为与缓存记账不变。**效果**：同调度步驱逐后重分配场景不再崩溃，新增回归测试在 main 上失败、本修复后 17 项测试全部通过。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态 encoder cache 生命周期修复，属多模态范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "encoder-cache", "scheduler"],
+      "pr_number": 52482
+    },
+    {
+      "sha": "e3c1cb54fcafe796bc2a0354bb0962edbb4abbb8",
+      "comment": "**背景**：多模态测试需为每个 size factor 各启动一次 server，启动开销占据了 CI 大部分时间。**方法**：将各 size factor 合并为单个测试内的多个多模态请求，一次 runner 启动覆盖全部组合。**效果**：收集的测试数从 259 降至 108，测试仍全部通过。",
+      "sig": "sig-ci",
+      "sig_reason": "多模态测试结构合并以减少 CI 启动开销，属 CI 测试范畴。",
+      "tags": ["optimization", "low-risk", "ci", "multimodal", "test"],
+      "pr_number": 52417
+    },
+    {
+      "sha": "6b0b850a8b1764a66d7ffbb023c0b0e0bbdb900b",
+      "comment": "**背景**：两个小型 KV-offload GSM8K 评估请求 4 GiB `cpu_offload_gib`，而共享 H200 CI worker 的 `/dev/shm` 仅剩 1.4-2.1 GiB，评估开始前即因空间不足失败。**方法**：仅为 `Nemotron-H` 与 `Gemma 4` 两个 OffloadingConnector 用例将 `cpu_offload_gib` 从 4 GiB 降至 1 GiB，较大用例与 simple-connector 用例不变。**效果**：在 2 GiB tmpfs 模拟环境下 4 个测试全部通过，实际执行远低于 1 GiB。",
+      "sig": "sig-ci",
+      "sig_reason": "CI 评估资源配置修复以适配受限共享内存，属 CI 范畴。",
+      "tags": ["bugfix", "low-risk", "ci", "gsm8k", "kv-offload", "dev-shm"],
+      "pr_number": 52496
+    },
+    {
+      "sha": "fdab2b10bcac00a16c406f8b17a75a1c3f729e59",
+      "comment": "**背景**：Transformers backend 的 pooling 模型尚未支持迁移到 Model Runner V2，是 #48290（Transformers backend 全面切换 MRV2）落地的前置条件。**方法**：MRV2 支持 Transformers pooling 模型。**效果**：H200 上 `TransformersEmbeddingModel` 与 `TransformersForSequenceClassification` 在 MRV2 + 默认 FlashAttention/FA4 下对照 Hugging Face 参考全部通过。",
+      "sig": "sig-core",
+      "sig_reason": "Model Runner V2 对 Transformers pooling 模型的支持扩展，属核心引擎范畴。",
+      "tags": ["feature", "low-risk", "mrv2", "transformers-backend", "pooling"],
+      "pr_number": 52425
+    },
+    {
+      "sha": "ef43e3101b8fda8cd2b52de150c76b4fc177fad2",
+      "comment": "**背景**：gfx950/MI355X 上现有的 in-tree Triton DeepSeek-V4 sparse-MLA decode 路径性能落后于 AITER/Gluon 校正参考。**方法**：新增 gfx950 专用 partial kernel：448 NoPE 与 64 RoPE 维合并为一次 512 宽 QK 点积、四个 128 宽 PV 累加器避免寄存器溢出、压缩缓存整组剥离为两次有序 BK32 更新、保留 masked tail 与 attention sink 语义；配合工作量感知 split 选择（短负载至多 4 split、低 batch 长上下文至多 32 split）、graph 安全的自适应工作选择、BF16 直出与 cp-gather 反特化；全部新行为由 `_ON_GFX950` 门控，gfx942 保持原路径（AOT 审计 HSACO 字节一致）。**效果**：MI355 256-CU 上 sparse-MLA decode kernel 接受度与吞吐显著提升，gfx942 零行为变化。",
+      "sig": "sig-model-performance",
+      "sig_reason": "gfx950 sparse-MLA decode Triton kernel 的大规模性能优化，属模型性能范畴。",
+      "tags": ["perf", "high-risk", "rocm", "gfx950", "sparse-mla", "triton", "deepseek-v4"],
+      "pr_number": 52212
+    },
+    {
+      "sha": "1f0e0bf61210346a6bef4ad75172e62554d1b86c",
+      "comment": "**背景**：#42669 在 Blackwell 启用 FA4 head-dim 256 后，专用 SM100 2-CTA kernel 仍拒绝 vLLM decoder attention 提供的 `seqused_q/k`，ColPali 在 MRV2 下暴露该失败。**方法**：临时在 Blackwell 上将 head-dim 256 回退 FA2，head-dim 128 与受支持的 MLA 192/128 场景仍用 FA4，待上游补充支持后恢复。**效果**：ColPali 多模态 pooling 测试通过，attention selector 31 passed / 10 skipped，MLA prefill selector 21 passed。",
+      "sig": "sig-model-performance",
+      "sig_reason": "attention 后端在 Blackwell head-dim 256 的选择回退修复，属 attention 后端范畴。",
+      "tags": ["bugfix", "low-risk", "fa4", "blackwell", "attention-backend", "head-dim-256"],
+      "pr_number": 52050
+    },
+    {
+      "sha": "7d7b6f26f4120b5db10d0a697a878ad605f09579",
+      "comment": "移除量化相关死代码：删除 `vllm/model_executor/kernels`、`vllm/model_executor/layers/quantization` 与对应 kernel 测试中 395 行无引用代码。纯清理重构，无任何行为变化。",
+      "sig": "sig-quantization",
+      "sig_reason": "量化模块死代码清理，属量化范畴。",
+      "tags": ["refactor", "low-risk", "quantization", "dead-code"],
+      "pr_number": 52221
+    },
+    {
+      "sha": "6914d60b1e1a2594f0066fe81e3684574413fbe7",
+      "comment": "**背景**：gfx942 上 vendored Triton `fp8_mqa_logits` kernel 性能落后于 ROCm/aiter#3913 提供的 FlyDSL 实现。**方法**：以 `aiter.ops.flydsl.flydsl_fp8_mqa_logits` 直接替换（参数与语义相同），由 `_ON_GFX942` 门控，gfx950 及其他路径不受影响。**效果**：GLM-5.2-FP8 8xMI325X TP8 下 ISL=128K 输出吞吐 +63%、TTFT -49%、TPOT -37%，短上下文（ISL=8K）无回归；GSM8K 0.94、NIAH 128K 精度正常。",
+      "sig": "sig-quantization",
+      "sig_reason": "gfx942 fp8 MQA logits kernel 替换为更快实现，属量化 kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "rocm", "gfx942", "aiter", "fp8-mqa", "flydsl"],
+      "pr_number": 49544
+    }
+  ]
+}
