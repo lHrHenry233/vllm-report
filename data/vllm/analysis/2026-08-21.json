@@ -1,0 +1,167 @@
+{
+  "date": "2026-08-21",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-21T20:00:00+08:00",
+  "daily_summary": "当日 19 条变更中 Rust 前端进展密集：修复 Kimi K3 `reasoning_effort=none` 兼容、新增 HY3 统一解析器与本地 XGrammar 结构标签构建器、支持 `--generation-config vllm`，并以纯 Rust `protox` 取代外部 `protoc` 构建依赖。投机解码方向连落三子：DSpark 后端继承收窄回 DeepSeek V4、DSv4 自适应验证扩展至 SM90、修复投机推理结束后的虚假 FSM 错误，另有按请求接受率统计进入 OpenAI API 响应（默认关闭）。性能上 DeepSeek V4 将 FP8 共享专家融合进 MegaMoE kernel（batch-1 吞吐 +14.98%），FlashInfer CUTLASS experts 调优上界对齐调度器 token 限制。正确性修复覆盖 CPU 采样器种子丢失、Gemma 未绑定 LM head 加载、MistralCommonBackend 结构化输出与 MiniMax-M3 FP8 query 的 CUDA graph 重放稳定性。CI 侧 manylinux 构建镜像全面固定为不可变 tag，ROCm 清理 CUDA-only kernel 测试，tpu-inference 升级 v0.27.0。",
+  "sig_summaries": {
+    "sig-core": "Rust 前端连落四项：Kimi K3 渲染器把 `chat_template_kwargs` 中的 `reasoning_effort=none` 视为关闭思考（显式 `thinking`/`enable_thinking` 仍可覆盖），与 Python 语义对齐（#53043）；HY3 新增统一解析器，tokenizer 推导的 marker 后缀同时驱动推理与工具调用解析，模型特定的结构标签构建器移入 vLLM 并以 `xgrammar-structural-tag` 原语表达工具协议（#53054）；支持 `--generation-config auto|vllm`，`vllm` 模式跳过模型提供的采样默认值（#53044）。正确性方面：CPU `TopKTopPSampler` 的快路径判断 `len(generators) != batch_size` 使批次混入一个无种子请求即丢弃全部 generator，改为 `not generators`（#51866）；Gemma 未构造 `lm_head` 致 GPTQ checkpoint 加载失败，现构造输出头并按需绑定（#53170）；结构化输出统一包装 `MistralCommonBackend` tokenizer，修复 xgrammar HTTP 500 与 outlines 静默错误词表（#52720）。另新增按请求投机解码接受统计暴露于 OpenAI API 响应的 `metrics.speculative_decoding`（默认关闭，#48915），并禁止 `language_model_only` 与 `mm_encoder_cudagraph` 组合使用（#53127）。",
+    "sig-spec-decode": "DSpark 未指定后端时继承目标后端的行为收窄到 `model_type == deepseek_v4`，修复 Kimi MLA 目标 + Qwen3/SWA draft 因继承 `FLASHINFER_MLA` 不支持滑动窗口而初始化失败（#52809）；DSv4 indexer 自适应验证扩展到 SM90，复用 flattened decode 路径并从设备侧长度构建单 token 行、启用 CUDA graph 捕获，修复 Hopper 启动失败（#52795）；投机推理结束标记后窗口内的未验证 draft token 改为先 `validate_tokens` 校验再推进语法，消除虚假 `Failed to advance FSM` 错误（#53046）。",
+    "sig-model-performance": "DSV4 把复制式 FP8 共享专家融合进 DeepGEMM 持久 SM100 MegaMoE kernel，共享 L1、路由 dispatch/MMA、共享 L2 与 FP32 累积统一调度，batch-1 输出吞吐 +14.98%、平均 TPOT -13.19%（#53040）；FlashInfer CUTLASS experts 的 BF16/BF16 LoRA/MXINT4 路径补上并行感知的最大 token bucket，此前调优停在默认 8192，超过该值的 prefill 批次复用了为小桶选择的 tactic（#52989）。",
+    "sig-quantization": "MiniMax-M3 的 FP8 query buffer 分配条件从依赖请求元数据（eager 段内重新求值）改为静态的 CUTLASS decode capability，消除捕获时无 MSA plan、重放时有 plan 场景下 `query_fp8=None` 的断言失败，保证 graph 输出稳定（#51203）。",
+    "sig-ci": "Rust 前端 gRPC 绑定改用纯 Rust `protox` 编译 proto 并传给 `tonic-prost-build`，删除 Buildkite/macOS wheel/Docker 各处的 `protoc` 安装步骤（#52892）；manylinux 构建镜像分两步全面固定为 PyTorch `release/2.13` 所用的 commit-tagged 不可变镜像（#52994、#53172），消除工具链漂移导致的不可归因构建失败；ROCm 上 `test_fp32_router_gemm` 改用 `current_platform.is_cuda()` 门控、`test_kimi_k3_gemm_rs` 把 cutlass 导入移入 worker，从收集失败 + 218 失败变为 219 项干净跳过（#53113）；tpu-inference 升级至 v0.27.0（#53088）。"
+  },
+  "commits": [
+    {
+      "sha": "2adf4b9e2a915bd30876ab0c5dba2243f54fe5b7",
+      "comment": "**背景**：Rust 前端的 Kimi K3 渲染器对 `chat_template_kwargs` 中携带 `reasoning_effort=none` 的请求直接报错 `unsupported thinking_effort=none`——Kimi K3 原生仅接受 `low`/`high`/`max` 三个努力级别，但 `none` 是禁用思考的标准兼容值，Python 渲染器早已按此处理；Rust 侧此前默认保持思考开启再把 `none` 当努力级别校验，导致合法请求失败。**方法**：将经 `chat_template_kwargs` 传入的 `reasoning_effort=none` 视为关闭思考的请求，不把 `none` 加入支持的努力级别；组合语义与 Python 渲染器对齐——单独 `none` 关闭思考，显式 `thinking=true` 或 `enable_thinking=true` 覆盖 `none` 保持思考开启且不再发出/校验 `none`。**效果**：合法兼容请求不再失败，`low`/`high`/`max` 与非法值的行为保持不变，附 `overrides_standard_none` 与 kimi_k3 渲染器两组 cargo 测试。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 chat 渲染器的请求兼容性修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "kimi-k3", "reasoning-effort"],
+      "pr_number": 53043
+    },
+    {
+      "sha": "5df31ea52d7d175dd920fce61a19017941b18b4b",
+      "comment": "**背景**：DSv4 indexer 的自适应验证（adaptive verification）在 Hopper（SM90）上启动失败：原生变长 DeepGEMM paged-MQA 路径仅限 SM100，而自适应验证会把每个请求裁剪到不同长度，CPU 元数据中只有统一占位符，设备/CPU query 长度不匹配（#47808 评论报告的启动失败）。**方法**：SM90 上改用既有 flattened decode 路径，从设备侧 decode 长度构建单 token 行；构建器对自适应验证强制设备长度扁平化、声明支持设备/CPU query 长度不匹配并启用该路径的 CUDA graph 捕获；仅单个 decode 请求时 CPU 与设备请求边界必然一致，复用更廉价的统一扁平元数据路径。**效果**：Hopper 启动失败修复，4x H200 上 DeepSeek-V4-Flash-0731 以 TP2/DP2/EP + DSpark 7 spec tokens + 概率化 drafting + 自适应验证完成启动、服务与 GSM8K 评估。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "投机解码自适应验证向 SM90 的支持扩展，属投机解码范畴。",
+      "tags": ["feature", "medium-risk", "spec-decode", "adaptive-verification", "deepseek-v4", "sm90", "cuda-graph"],
+      "pr_number": 52795
+    },
+    {
+      "sha": "df3b3422b495a33fd10d0b2f06c051144d6bb2c2",
+      "comment": "**背景**：Rust 前端缺少 HY3 模型的输出解析与 XGrammar 引导解码支持；HY3 的推理与工具调用 marker 共享一个 tokenizer 特定后缀，检测需要访问 tokenizer，而拆分式 tool-parser 工厂仅由 tools 构造、拿不到 tokenizer。**方法**：新增统一工厂同时持有 tokenizer 与 tools，检测一次后缀并传入推理与工具构造器，运行时复用共享 `CombinedParser`（推理委托 `DelimitedReasoningParser`，工具调用委托既有 winnow 解析器）；把 HY3 模型特定的结构标签构建器移入 vLLM，从同一组检测 marker 生成语法，用 `xgrammar-structural-tag` 原语表达工具协议（必选/可选参数与 marker 界定的 `any_text_excluding`）；从 HF 与 Fastokens 后端暴露新增词表并在解析器创建时校验 HY3 语法 marker；附带真实 `tencent/Hy3` tokenizer/模板往返测试；同时接受 vLLM 兼容的 `top_k` 取值（`-1`/`0` 关闭 top-k 采样）。**效果**：HY3 在 Rust 前端获得覆盖推理、工具调用与引导解码的端到端能力（+849/-86，17 个文件）。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端解析器与结构化输出/工具调用能力新增，属核心前端范畴。",
+      "tags": ["feature", "medium-risk", "rust-frontend", "hy3", "xgrammar", "guided-decoding", "tool-call"],
+      "pr_number": 53054
+    },
+    {
+      "sha": "c6e19b3be24338759a443e03c8325d76da9ee202",
+      "comment": "**背景**：DSpark 投机解码 + 推理解析器场景下，推理结束标记出现在 step 窗口内时，其后未经投机验证的 draft token 可能不满足语法，`StructuredOutputManager` 直接对其调用 `accept_tokens` 推进语法会产生虚假的 `Failed to advance FSM` 错误日志（DSV4-Flash + DSpark 实际触发）。**方法**：窗口内推理已结束（`post_reasoning_end_in_window`）时先用 `validate_tokens` 校验 draft token，仅校验通过才 `accept_tokens` 推进语法；其余路径行为不变。**效果**：虚假 FSM 错误消除，语法不再穿越未验证 draft 前进，xgrammar/guidance 双后端测试补充 caplog 断言（+8/-2）。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "投机解码 draft 窗口内未验证 token 与结构化输出 FSM 交互的修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "structured-output", "spec-decode", "fsm", "reasoning-parser"],
+      "pr_number": 53046
+    },
+    {
+      "sha": "83c5d59209d2a3629cafaa1ceca0893530442835",
+      "comment": "**背景**：Rust 前端生成 gRPC 绑定依赖外部 `protoc` 可执行文件，为本地构建、CI 作业、wheel 构建器与 Docker 构建阶段引入宿主工具依赖。**方法**：用纯 Rust 的 `protox` 编译 `control.proto` 与 `inference.proto`，将生成的描述符集传给 `tonic-prost-build`；移除过时的 `--experimental_allow_proto3_optional` 参数，并删除 Buildkite、macOS wheel 构建与 Rust Docker 阶段专门为 Rust 前端添加的 `protoc` 安装器与安装步骤；原生/C++ 构建路径的 protobuf 工具链不受影响。**效果**：构建 Rust 前端不再需要安装 `protoc`（`PROTOC` 指向不存在的可执行文件时 `cargo check` 与 339 项 server 库测试全部通过），clippy/fmt/sort/shell 语法与 pre-commit 检查全部干净。",
+      "sig": "sig-ci",
+      "sig_reason": "Rust 前端构建工具链以纯 Rust 方案取代外部依赖，属构建/CI 范畴。",
+      "tags": ["build", "low-risk", "rust-frontend", "protobuf", "protox", "docker", "buildkite"],
+      "pr_number": 52892
+    },
+    {
+      "sha": "91a893de64722019ea2faf852e06cabe143b3490",
+      "comment": "**背景**：#52288 让未指定后端的 DSpark draft 继承目标模型后端，该回退对 DeepSeek V4 必要（目标与 draft 层共享 KV cache 布局），但对其他 DSpark 架构无效：如 Kimi MLA 目标配 Qwen3/SWA DSpark draft 时，继承的 `FLASHINFER_MLA` 因不支持滑动窗口注意力使 draft 初始化直接失败。**方法**：仅当规范化后的 DSpark draft `model_type == deepseek_v4` 时继承目标后端，其余 draft 后端留空，让自身 attention kind 参与正常自动选择；显式指定 draft 后端的覆盖行为保留。**效果**：非 DSV4 组合恢复独立选择，4x B300 上 Kimi-K3 MLA 目标 + `RedHatAI/Kimi-K3-speculator.dspark` 正常启动（此前 main 复现失败），附覆盖 DSV4 继承/非 DSV4 自动选择/显式覆盖三种情形的回归测试。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DSpark draft 模型后端选择逻辑的回归修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "dspark", "attention-backend", "kimi-k3", "deepseek-v4"],
+      "pr_number": 52809
+    },
+    {
+      "sha": "d29f7f5c9294be8e489dac34d45a939b95a06336",
+      "comment": "**背景**：#51665 之后 checkpoint 检查会故意把 `tie_word_embeddings` 翻转为 `False`，以便加载后将物理 head 与输入 embedding 比对，但 `GemmaForCausalLM` 未构造 `lm_head`，含物理 `lm_head.weight` 的 GPTQ Gemma checkpoint（如 `TechxGenus/gemma-1.1-2b-it-GPTQ`）加载失败：`There is no module or parameter named lm_head`。**方法**：为 Gemma 构造输出头，常规 tied 配置下将其绑定到输入 embedding，并用该 head 计算 logits。**效果**：声明 tied 但含物理 `lm_head` 权重的 checkpoint 正常加载，H200 上 Quantized Models 套件 22 通过 0 失败，此前失败的两个 GPTQ Gemma 用例恢复，附 CPU 聚焦回归测试。",
+      "sig": "sig-core",
+      "sig_reason": "Gemma 模型加载与输出头权重绑定修复，属核心模型加载范畴。",
+      "tags": ["bugfix", "low-risk", "gemma", "lm-head", "tied-embeddings", "gptq"],
+      "pr_number": 53170
+    },
+    {
+      "sha": "f32b17b6d616605eb5ed498777f150242bd1bc30",
+      "comment": "**背景**：Rust 前端缺少与 Python 对齐的 `--generation-config auto|vllm` 行为，模型 generation config 中的采样默认值总是被继承。**方法**：`auto` 从模型 generation config 继承采样默认值；`vllm` 跳过模型提供的 temperature、top-p、top-k、min-p、repetition-penalty 与 max-token 默认值，由请求下推层应用 vLLM 回退值；EOS 与额外 stop token id 在两种模式下均保持生效；自定义 generation-config 目录给出聚焦的不支持报错，`override_generation_config` 显式不支持；该设置归前端所有，因为托管的 Python 引擎收到的是完全下推后的 engine-core 请求。**效果**：Rust 前端与 Python 的 generation-config 语义对齐，vllm-text/cmd/managed-engine/server/chat 五个 crate 共 787 项测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 generation-config 采样默认值语义支持，属核心前端范畴。",
+      "tags": ["feature", "low-risk", "rust-frontend", "generation-config", "sampling-defaults"],
+      "pr_number": 53044
+    },
+    {
+      "sha": "0a5a55136fa0552a19816b211c4a57f1a341d830",
+      "comment": "**背景**：#52994 只固定了 x86 CUDA 13.0 的 manylinux 构建镜像，aarch64 CUDA 13.0 与双架构 CUDA 12.9 路径仍跟踪浮动 tag，编译器、glibc 与 CUDA 工具链可在无 vLLM commit 的情况下变化，发布构建失败难以归因与 bisect。**方法**：将剩余引用全部 pin 到 PyTorch `release/2.13` 生成工作流使用的 commit-tagged 镜像（`78e737ad29420ffc4800e677c51e2a852caf8359`），覆盖发布 wheel/镜像、常规 arm64 镜像构建、GH200 CI 与 arm64 构建文档示例。**效果**：全仓库搜索确认三个浮动 builder tag 均不再存在，构建基于不可变且已知良好的工具链。",
+      "sig": "sig-ci",
+      "sig_reason": "发布流水线与 CI 构建镜像的不可变固定，属 CI 范畴。",
+      "tags": ["build", "low-risk", "docker", "manylinux", "aarch64", "cuda", "reproducibility"],
+      "pr_number": 53172
+    },
+    {
+      "sha": "7cfb97e33791a348cd5d7b622cca521d82d8399f",
+      "comment": "**背景**：投机解码的接受情况此前只能通过 `/metrics` 的服务器级均值观察，无法得知单个请求的表现，AIPerf 等工具需要自行包装引擎才能拿到按请求的数字。**方法**：在响应顶层 `metrics` 对象（与 #46768 的计时指标同处）下新增 `speculative_decoding`：`mean_acceptance_length`、`draft_acceptance_rate`、密集直方图 `acceptance_histogram`（下标 j 为恰好接受 j 个 draft token 的验证步数）及 `num_spec_steps` 等计数字段；默认关闭，以 `--per-request-spec-decode-metrics summary|detailed` 开启，`detailed` 额外提供 `per_step_accepted`/`per_step_drafted` 数组；仅对单序列请求报告（`n>1` 为 null），采用类型化模型 `SpeculativeDecodingMetrics` 并标记 experimental；延续 #47322 的设计并署名原设计者为共同作者。**效果**：按请求接受统计直接暴露于 OpenAI API 响应（+798/-76，25 个文件，覆盖 Python 前端/核心、Rust engine-core-client、文档与测试）。",
+      "sig": "sig-core",
+      "sig_reason": "跨前端与核心的按请求可观测性功能，主体在 OpenAI API 响应与核心统计链路。",
+      "tags": ["feature", "medium-risk", "spec-decode", "metrics", "openai-api", "observability"],
+      "pr_number": 48915
+    },
+    {
+      "sha": "2f41c894e320a07a46a360ee72149dd84d6f4bec",
+      "comment": "**背景**：CPU 上 `TopKTopPSampler.forward_cpu` 用 `len(generators) != logits.shape[0]` 判断是否走无种子快路径，但 `generators` 只为有种子请求建条目——批次里只要有一个无种子请求该条件即为真，整批落入快路径，所有按请求的 `torch.Generator`（包括有种子请求的）被丢弃，有种子请求的确定性取决于同批请求是否碰巧都有种子（#51226）。**方法**：条件改为 `not generators`，仅当批次中零个有种子请求时才走快路径。**效果**：一行修复，有种子请求无论与什么批次混跑都保留自己的 generator。",
+      "sig": "sig-core",
+      "sig_reason": "CPU 采样器种子确定性修复，属核心采样器范畴。",
+      "tags": ["bugfix", "low-risk", "sampler", "seed", "determinism", "cpu"],
+      "pr_number": 51866
+    },
+    {
+      "sha": "54ba80d9611d3a9cce7ba348e8719e24b5d9211c",
+      "comment": "**背景**：`BUILD_BASE_IMAGE` 跟踪浮动 tag `pytorch/manylinux2_28-builder:cuda13.0`，该 tag 上游会重建，CUDA 13.0 wheel 构建底下的编译器、glibc 与 CUDA 工具链可能在 vLLM 零 commit 的情况下变化——同一 vLLM SHA 今天能构建明天失败，且 bisect 永远找不到原因。**方法**：pin 到 PyTorch 自家 `release/2.13` 分支 manywheel 工作流使用的确切镜像 `cuda13.0-78e737ad29420ffc4800e677c51e2a852caf8359`（commit `78e737ad`，2026-06-26，即已发布 PyTorch 版本所用工具链），更新 `docker/Dockerfile` 默认值、以仓库自带生成器重生成 `docker/versions.json`、nightly 镜像构建脚本与 release pipeline 共五处引用。**效果**：CUDA 13.0 x86 构建基于不可变且已知良好的工具链，构建可归因、可 bisect。",
+      "sig": "sig-ci",
+      "sig_reason": "Docker 与发布流水线基础镜像固定，属 CI/构建范畴。",
+      "tags": ["build", "low-risk", "docker", "manylinux", "cuda13", "reproducibility"],
+      "pr_number": 52994
+    },
+    {
+      "sha": "bfb6c134997aace3e801c9ae3251728bd5312003",
+      "comment": "**背景**：模块化 BF16、BF16 LoRA 与 MXINT4 的 FlashInfer CUTLASS expert 路径让 FlashInfer 使用默认 `tune_max_num_tokens=8192`，即使 vLLM 的有效 MoE 输入上界更大——启动自动调优停在 8192，更大的 prefill 批次复用了为较小桶选择的 tactic（B300 上 `--max-num-batched-tokens 16384` 的 FP8 与 BF16 调优缓存均只有止于 8192 的 21 个桶）。**方法**：把这些路径统一改为传入 vLLM 并行感知的最大 token bucket（`fi_moe_largest_bucket`，同时计入 `max_num_tokens` 与 DP 因子，保留 8192 为最小调优范围），与其他 FlashInfer TRT-LLM expert 实现一致，并附 CUTLASS 转发行为的聚焦回归断言。**效果**：自动调优覆盖与调度器实际 token 上界对齐，消除大批次复用小桶 tactic 的性能损失，端到端性能复测待做。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer CUTLASS MoE kernel 自动调优参数修复，属模型性能范畴。",
+      "tags": ["bugfix", "medium-risk", "moe", "flashinfer", "cutlass", "autotuning"],
+      "pr_number": 52989
+    },
+    {
+      "sha": "4f6885fffc931ce030d55a97ffb03bbeb0934d10",
+      "comment": "**背景**：DeepSeek V4 每个 MoE 层先启动路由 FP4 MegaMoE kernel，再串行执行共享 FP8 gate/up 与 down 投影及一次单独的加法，共享专家无法与路由计算重叠（#45861 的一部分）。**方法**：在 NVIDIA 专属模型路径中把复制式 FP8 共享专家融合进 DeepGEMM 持久 SM100 MegaMoE kernel，由原生 kernel 统一调度共享 L1、路由 dispatch/MMA、共享 L2 与最终 FP32 累积；保留 checkpoint 的 FP8 共享权重，输出一次 BF16 存储。**效果**：DeepSeek-V4-Flash-0731 TP8+EP 上 batch-1（128 入/256 出）输出吞吐 130.02→149.50 tok/s（+14.98%）、平均 TPOT -13.19%、中位 ITL -13.32%；1024 入/128 出场景吞吐 +13.68%、平均 TTFT -11.77%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSV4 共享专家与 MegaMoE kernel 的融合优化，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "deepseek-v4", "moe", "megamoe", "shared-experts", "deepgemm", "sm100"],
+      "pr_number": 53040
+    },
+    {
+      "sha": "3b829cf176aa4ef357b7edd61eb9352419a8adbd",
+      "comment": "**背景**：kernels root misc 测试组的两个测试在 ROCm 上触达 CUDA-only 代码：`test_fp32_router_gemm` 用 `torch.cuda.is_available()` 守卫（ROCm 构建下为真），gfx950 的设备能力报告 `(9,5)` 骗过 SM90 检查后调用仅 CUDA 构建的 kernel；`test_kimi_k3_gemm_rs` 在模块级导入 cute_dsl `GemmRS` 拉入 ROCm 上不存在的 cutlass，收集失败直接带崩整个 pytest run，文件自身的 skip 守卫根本没机会执行。该修复需在 #50519 于 AMD CI 启用该组之前落地。**方法**：`test_fp32_router_gemm` 改用 `current_platform.is_cuda()` 门控（CUDA 上保留 SM90 检查，其余平台跳过）；`GemmRS` 导入移入 worker 内部（与 `kda.py` 既有做法一致）。**效果**：MI355（gfx950，ROCm 7.2.3）上从收集错误 + 218 失败变为 219 项全部干净跳过。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 上 CUDA-only kernel 测试的守卫修复，属 CI 范畴。",
+      "tags": ["test", "low-risk", "rocm", "ci", "test-gating", "cutlass"],
+      "pr_number": 53113
+    },
+    {
+      "sha": "d56bbf3995b820864a94971264cd5d2e5265261a",
+      "comment": "**背景**：安装 `mistral-common` 且 `TOKENIZER_MAPPING_NAMES` 将 `model_type` 映射到 `MistralCommonBackend` 的 Mistral 系模型（mistral/ministral/ministral3/mistral3/mixtral/pixtral/voxtral/voxtral_realtime），在 `resolve_tokenizer_args` 未选 `tokenizer_mode=mistral` 时进入该类，结构化输出两种语法后端分别失败：xgrammar 后端懒构建时 `from_huggingface()` 抛 `ValueError` 致 HTTP 500（服务器可启动、普通补全正常，首个结构化输出请求才炸）；outlines 则静默构建错误词表——`convert_tokens_to_string` 回退为字符串拼接，`Mistral-Nemo-Instruct-2407` 上 409/129044 个词表条目映射到错误 token id 并坍缩到 3 个共享 id。**方法**：在 `StructuredOutputManager` 获取 tokenizer 处一次性把 `MistralCommonBackend` 包装进既有的 `MistralTokenizer`（其构造函数已支持），覆盖所有后端并保持单一实例——outlines/lm-format-enforcer 按 tokenizer 对象缓存的词表不会失效；`backend_xgrammar.py` 与 `backend_outlines.py` 零改动。**效果**：两种语法后端在 MistralCommonBackend tokenizer 下正常工作，附新测试文件。",
+      "sig": "sig-core",
+      "sig_reason": "结构化输出对 MistralCommonBackend tokenizer 的兼容修复，属核心结构化输出范畴。",
+      "tags": ["bugfix", "low-risk", "structured-output", "mistral", "tokenizer", "xgrammar", "outlines"],
+      "pr_number": 52720
+    },
+    {
+      "sha": "7c8b68b9ce30c45ea17063cc040b2473e152fa7d",
+      "comment": "**背景**：MiniMax-M3 在 eager CUDA-graph break 之外分配 FP8 query buffer，但分配条件依赖在 eager attention 段内重新求值的请求元数据——捕获时无 CUTLASS MSA plan 的 graph 在重放时可能带上有效 plan，eager CUTLASS 路径收到 `query_fp8=None` 并在 `assert query_fp8 is not None` 处失败。**方法**：把分配条件改为静态的配置实现是否支持 CUTLASS decode（捕获与重放间不变），提取 `_allocate_query_fp8`；每请求 CUTLASS-vs-Triton 决策保留在 eager 段内——支持 CUTLASS 的配置可能为最终回退 Triton 的请求形状也产出 FP8 query，以此换取 graph 输出稳定而不改变动态后端选择。**效果**：重放时 eager 段在稳定 CUDA 地址收到非空 FP8 query，附真实 `BreakableCUDAGraphCapture` 下捕获无 plan、重放前加 plan 并反复重放的 SM100 测试。",
+      "sig": "sig-quantization",
+      "sig_reason": "MiniMax-M3 FP8 query 量化路径在 CUDA graph 捕获/重放下的稳定性修复，属量化范畴。",
+      "tags": ["bugfix", "medium-risk", "minimax-m3", "fp8", "cuda-graph", "cutlass", "attention"],
+      "pr_number": 51203
+    },
+    {
+      "sha": "00f7f258282ad3ea400a760ba3bc4679ef4e40fe",
+      "comment": "**背景**：`language_model_only=True` 与 `mm_encoder_cudagraph=True` 组合使用会在后续产生难以定位的奇怪错误（#52734）。**方法**：配置层新增校验，直接拒绝两者同时启用。**效果**：启动时给出明确报错，避免下游诡异失败。",
+      "sig": "sig-core",
+      "sig_reason": "配置系统的新校验规则，属核心配置范畴。",
+      "tags": ["bugfix", "low-risk", "config-validation", "multimodal", "encoder-cudagraph"],
+      "pr_number": 53127
+    },
+    {
+      "sha": "ae256289956945c750d5b3cd13848dc734501a6d",
+      "comment": "依赖升级：`requirements/tpu.txt` 中 tpu-inference 升级至最新稳定版 v0.27.0，已在 tpu-inference CI 上验证通过。",
+      "sig": "sig-ci",
+      "sig_reason": "TPU 推理依赖版本升级，属 CI/依赖范畴。",
+      "tags": ["build", "low-risk", "tpu", "dependency-upgrade"],
+      "pr_number": 53088
+    }
+  ]
+}
