@@ -1,0 +1,142 @@
+{
+  "date": "2026-08-23",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-23T20:00:00+08:00",
+  "daily_summary": "当日 16 条变更以多模态 prompt 更新管线简化和性能优化为主线。多模态方向连落两子：将 `PromptSeq = str | list[int]` 统一为 `list[int]` 并移除 tokenizer 依赖（+830/-854，53 文件），随后移除 `renderer_applies_updates` 标志改为直接方法覆写；Mistral3 修复 `longest_edge` 覆盖下图像占位符网格不匹配的运行时错误。性能上 Mamba prefix caching 支持 prefill 内部 checkpoint，避免第二次完整模型前向，Kimi-K3 TTFT 改善 9%~25%。RL 生态新增两项：gpt-oss 路由专家逐个加载与 sparse checkpoint 更新通过原生权重加载器的通用桥梁。投机解码方向新增 Qwen3-Omni DSpark 草稿架构支持。Rust 前端修复 pooling benchmark 端点并暴露引擎 world size（含 PCP）。CI 侧修复 arm64 Cython 3.3 兼容、AMD Docker 超时预算、ROCm attention 测试覆盖与 rocprofiler-sdk 1.3.2 修复 torch.profiler HIP graph 崩塌。另有离线验证异常类型迁移、无效标志移除与 mypy 类型修复。",
+  "sig_summaries": {
+    "sig-core": "多模态 prompt 更新管线经历两轮简化：#53372 将 `PromptSeq = str | list[int]` 统一为 `list[int]`，移除 tokenizer 依赖与所有 text 匹配方法（+830/-854，53 文件），#53385 进一步移除 `renderer_applies_updates` 标志改为直接覆写 `_maybe_apply_prompt_updates`。Mistral3 图像占位符网格修复：从 `pixel_values` 形状直接推导网格而非依赖 `vision_config.image_size`，解决 `longest_edge` 覆盖下占位符数量不匹配的运行时错误（#52874）。离线推理输入验证迁移：`OfflineInferenceMixin` 三个长度不匹配错误从 `ValueError` 改为 `VLLMValidationError`，与 pooling 侧对齐（#53432）。移除已无效的 `use_prefill_decode_attention` 标志——#36702 后该标志无任何读取者（#52557）。Rust 前端：gRPC `ParallelismInfo` 暴露引擎权威 world size（含 PCP，#53204）；benchmark pooling 端点从 `/v1/pooling` 修正为 `/pooling`（#53352）。gpt-oss 新增路由专家逐个加载路径支持 RL 逐专家同步（#52209）。Mamba prefix caching 支持 prefill 内部 checkpoint，避免第二次完整模型前向，Kimi-K3 TTFT 改善 9%~25%（#52789）。mypy 类型修复覆盖 `model_executor/models` 下 E/F 开头文件（#53381）。",
+    "sig-ci": "arm64 镜像构建：tilelang sdist 因 Cython 3.3 拒绝 `Py_LIMITED_API` 而失败，仅在 aarch64 设置 `cython<3.3` 约束修复（#53358）。AMD CI：runner 消费既有 `CONTAINER_TIMEOUT_S` 预算，单节点 Docker 工作负载到期发 `TERM`→`KILL`，保留清理与诊断窗口（#52547）。ROCm attention 测试：#51718 KV-cache 布局重构后恢复 FlexAttention 与 AITER MLA 覆盖，MLA 参数按平台正向构建使收集从 2911 降至 591 例（#53351）。ROCm 基础镜像：构建 rocprofiler-sdk 1.3.2 叠加到 `/opt/rocm`，修复 `torch.profiler` 下 `hipGraphLaunch` 崩塌（GPU 占用 39.9%→97.8%），无需 torch 重建（#53182）。",
+    "sig-spec-decode": "Qwen3-Omni 新增 DSpark 投机解码草稿架构支持：注册专用 `Qwen3OmniDSparkModel` 并复用 `Qwen3DSparkForCausalLM` 运行时实现，暴露 DeepStack 后辅助隐藏状态，启动时校验 target/draft hidden size、attention 几何与词表契约，使 draft 与 target 词表不同时的共享安全化（#52560）。",
+    "sig-rl": "新增稀疏 checkpoint 更新 API：在线 RL 训练器常以 checkpoint 坐标（checkpoint 名、完整形状、flat 索引+值）产出更新，与 vLLM 运行时参数坐标不同（可能跨 TP rank 拆分或映射到 EP 权重）。新增模型加载器 API 保持原生 `model.load_weights()` 路径作为桥梁，稀疏补丁通过临时替换 `torch.Tensor.copy_` 并以 NaN 掩码合并实现（#50723）。"
+  },
+  "commits": [
+    {
+      "sha": "39eba6ac368133ab4e69a0589fcd53c481dddc44",
+      "comment": "**背景**：`OfflineInferenceMixin`（`vllm/entrypoints/offline_utils.py`）中三个由调用方引起的长度不匹配错误仍使用原始 `ValueError`，而对应的 pooling 侧 `PoolingIOProcessor` 已在 #51931 迁移至 `VLLMValidationError`，导致同一错误在不同入口下抛出不同异常类型。**方法**：将 `_params_to_seq`、`_lora_request_to_seq` 和 `_priority_to_seq` 三个辅助函数中的 `ValueError` 替换为 `VLLMValidationError`，错误消息与验证行为保持不变。**效果**：离线调用方可捕获语义化异常类型而非裸 `ValueError`，generate 侧与 pooling 侧异常类型一致；仅影响离线路径（`LLM`，非 `AsyncLLM`），无 HTTP 状态码变化。",
+      "sig": "sig-core",
+      "sig_reason": "离线推理入口的输入验证异常类型统一，属核心 API 范畴。",
+      "tags": ["refactor", "low-risk", "offline-inference", "validation", "error-handling"],
+      "pr_number": 53432
+    },
+    {
+      "sha": "b26039b09fc97aa00f095a99eda503b7dad594ec",
+      "comment": "**背景**：gpt-oss 模型加载时要求一次性 all-gather 所有路由专家，RL 框架（如 verl）在 actor-rollout 同步时需要逐个同步专家而非整批收集，现有加载流程不支持此模式。**方法**：在模型加载器中新增路由专家加载路径，允许逐个同步专家而非一次性全量收集，并新增单元测试与 verl 端到端 RL 测试验证。**效果**：RL 引擎可逐个同步 gpt-oss 专家，避免 actor-rollout 同步期间的全量 all-gather 通信开销。",
+      "sig": "sig-core",
+      "sig_reason": "模型加载器新增路由专家加载能力，属核心模型加载范畴。",
+      "tags": ["feature", "medium-risk", "gpt-oss", "expert-loading", "model-loader", "rl"],
+      "pr_number": 52209
+    },
+    {
+      "sha": "e25c586b9030a10702d78856b43ccae9481cc28c",
+      "comment": "**背景**：aarch64 构建基础镜像是 manylinux 2_28（glibc 2.28），无法安装 tilelang 的 `manylinux_2_34` aarch64 wheel，uv 从 sdist 构建 tilelang 时解析到 Cython 3.3，而 Cython 3.3 拒绝 tilelang 硬编码的 `Py_LIMITED_API=0x03080000`（要求 Python Limited API 3.9+），导致 arm64 镜像构建失败。**方法**：仅在 aarch64 上为 uv 的隔离构建约束设置 `cython<3.3`，x86_64 继续安装 tilelang wheel 不受影响。**效果**：arm64 镜像构建恢复通过（39m34s），tilelang sdist 构建与完整 vLLM 镜像构建/推送均成功。",
+      "sig": "sig-ci",
+      "sig_reason": "Docker 镜像构建依赖版本固定修复，属 CI/构建范畴。",
+      "tags": ["build", "low-risk", "docker", "arm64", "cython", "tilelang"],
+      "pr_number": 53358
+    },
+    {
+      "sha": "ebcd60646741be239026db75358715ba707eb50f",
+      "comment": "**背景**：多模态 prompt 更新中 `PromptSeq = str | list[int]` 的双类型设计使匹配器依赖 tokenizer 进行 `str` 转换，增加了不必要的复杂度——`vllm/renderers/hf.py` 已传 `tokenizer=None`，证明引擎只需 token ID 路径。**方法**：将 `PromptSeq` 统一为 `list[int]`，删除 `PromptSeq` 类型别名、`_S` TypeVar、`PromptUpdateDetails(Generic[_S])` 等泛型基础设施，移除 `_seq2text`/`_seq2tokens`/`_cached_encode`/`_cached_decode` 等共享 API 与所有 text 匹配相关方法（`iter_text_matches`、`apply_text_matches` 等），匹配器签名去掉 tokenizer 参数；保留 BPE 回退逻辑但私有化。**效果**：大幅简化 prompt 更新管线（+830/-854，53 文件），消除 tokenizer 依赖与 `str`/`list[int]` 双路径维护负担。",
+      "sig": "sig-core",
+      "sig_reason": "多模态 prompt 更新管线的核心重构，属核心引擎范畴。",
+      "tags": ["refactor", "medium-risk", "multimodal", "prompt-updates", "type-cleanup"],
+      "pr_number": 53372
+    },
+    {
+      "sha": "a3561ef8e49d3545c4078df43444beb4c98ae124",
+      "comment": "**背景**：`Mistral3MultiModalProcessor._get_prompt_updates` 通过 `PixtralHFEncoderInfo.get_patch_grid_size` 计算图像占位符网格，使用 `vision_config.image_size` 作为最大边长，忽略了 `mm_processor_kwargs` 中的 `size.longest_edge` 覆盖和 `preprocessor_config.json` 中 `size.longest_edge` 差异，导致占位符数量与 HF `PixtralProcessor` 输出的 `pixel_values` 几何不匹配并报 `RuntimeError`。**方法**：直接从 `out_mm_kwargs` 中 `pixel_values.data.shape[-2:]` 除以 `patch_size * spatial_merge_size` 推导 `ncols`/`nrows`，使用 HF `PixtralImageProcessor` 已对齐的有效后处理网格步长（floor divide 精确匹配）。**效果**：各种 `longest_edge` 覆盖与图像尺寸组合下占位符数量与 `pixel_values` 几何精确匹配，不再触发运行时错误；无 checkpoint 或 API 变化。",
+      "sig": "sig-core",
+      "sig_reason": "Mistral3 模型多模态处理器占位符计算修复，属核心模型范畴。",
+      "tags": ["bugfix", "low-risk", "mistral3", "multimodal", "image-placeholder", "processor"],
+      "pr_number": 52874
+    },
+    {
+      "sha": "d569e71bd031693ac945c590731a36f0e70789cc",
+      "comment": "**背景**：AMD CI 模板计算 `CONTAINER_TIMEOUT_S`（比 Buildkite 步骤超时提前一分钟）并导出给 runner，但 runner 未消费该预算，单节点 Docker 工作负载可能在 runner 重新获得控制权前触及硬步骤超时，无法执行既有容器清理与诊断。**方法**：让 runner 消费 `CONTAINER_TIMEOUT_S` 预算，从中扣除 runner 设置时间后在前台执行 Docker 工作负载，到期时发送 `TERM` 信号、10 秒后升级为 `KILL`；保留正常 Docker 退出状态，超时报告为状态 124 并输出聚焦的超时生命周期日志。**效果**：单节点 AMD Docker 工作负载受既有时钟预算约束，runner 恢复控制权执行容器清理与诊断。",
+      "sig": "sig-ci",
+      "sig_reason": "AMD CI Docker 工作负载超时管理修复，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "amd", "docker", "timeout", "buildkite"],
+      "pr_number": 52547
+    },
+    {
+      "sha": "9dba2c9b374af3a47c1cef952195ee114bab94c7",
+      "comment": "**背景**：拓扑消费者仅能从 TP 和 PP 重建引擎 world size，遗漏了 prefill-context 并行（PCP），导致重建值不准确。**方法**：通过 Rust gRPC `ParallelismInfo` 暴露每个引擎进程的权威 world size，文档注明 EngineCore 握手 world size 包含 TP、PP 和 PCP，新增控制服务测试覆盖传播路径。**效果**：拓扑消费者无需从 TP/PP 推断 world size，直接获取包含 PCP 的权威值；仅修改控制面元数据，不影响模型执行或输出。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 gRPC 控制面拓扑元数据暴露，属核心前端范畴。",
+      "tags": ["feature", "low-risk", "rust-frontend", "grpc", "world-size", "topology"],
+      "pr_number": 53204
+    },
+    {
+      "sha": "30b34171b113887e0e08d7f6d06e2e5a5c33b9d2",
+      "comment": "**背景**：#51718 统一 KV-cache 布局时改变了多个 ROCm 测试路径，FlexAttention 测试与生产不对齐，MLA prefill 参数在 ROCm 上生成 CUDA-only 矩阵导致测试收集不完整且覆盖缺失。**方法**：按平台正向构建 MLA prefill 后端参数（CUDA 用 CUDA 后端，ROCm 用 `ROCM_AITER_FA`），将 `ROCM_AITER_MLA` 加入主后端矩阵同时为 prefill 保留 `ROCM_AITER_FA`；恢复 ROCm FlexAttention 直接掩码覆盖并为 sliding-window/非因果 attention 保留慢路径覆盖；恢复 MiniMax M3 AITER 多 KV head 守卫测试。**效果**：ROCm attention 测试覆盖恢复并适度降低测试资源（参数收集从 2911 降至 591 例），回归覆盖得到改善。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm attention 测试覆盖恢复与对齐，属 CI 范畴。",
+      "tags": ["test", "low-risk", "rocm", "attention", "ci", "mla", "flexattention"],
+      "pr_number": 53351
+    },
+    {
+      "sha": "bbe8b23e1a2b32a96240b27f63255170d09ef144",
+      "comment": "**背景**：`--attention-config.use_prefill_decode_attention` 标志被接受、文档化但无任何效果——#36702 将 `ROCM_ATTN` 设为 ROCm 优先列表的无条件首项并移除了读取该标志的分支，标志的原始目的已成为默认行为。**方法**：从 `AttentionConfig` 删除 `use_prefill_decode_attention` 字段，从 `RocmAttn` 测试配置中移除该参数（显式后端选择不变），删除 `test_arg_utils.py` 中的解析断言。**效果**：传递该标志现在会报错而非被静默忽略，暴露了本就无效的设置；无行为变化（标志效果已是默认行为）。",
+      "sig": "sig-core",
+      "sig_reason": "注意力配置系统无效标志的清理移除，属核心配置范畴。",
+      "tags": ["deprecation", "low-risk", "attention-config", "rocm", "cleanup"],
+      "pr_number": 52557
+    },
+    {
+      "sha": "2f55ef254c70e110d637beeedf48238977ebb683",
+      "comment": "**背景**：Qwen3-Omni 缺少 DSpark 投机解码草稿架构支持，无法利用 DSpark 加速推理。**方法**：注册专用 `Qwen3OmniDSparkModel` 草稿架构并复用共享 `Qwen3DSparkForCausalLM` 运行时实现；暴露目标 thinker 的 DeepStack 后辅助隐藏状态供 DSpark 使用；在 msModelSpec 配置转换中保留专用架构与 DSpark 采样字段；启动时校验 target/draft hidden size、attention 几何、target-layer 选择、词表契约与 DSpark 算法设置；使 draft 与 target 词表不同时的 embedding/lm-head 共享安全化；依赖 #53017 的 draft-logits cache stride 修复而非维护模型特定 workaround。**效果**：Qwen3-Omni 获得 DSpark 框架级支持（+731/-22，11 文件），附 registry/config/model-contract/config-bridge 测试。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "新增 DSpark 投机解码草稿架构支持，属投机解码范畴。",
+      "tags": ["feature", "medium-risk", "qwen3-omni", "dspark", "spec-decode", "draft-model"],
+      "pr_number": 52560
+    },
+    {
+      "sha": "a014e35f38c80fb0652387740193ad2147fed6a3",
+      "comment": "**背景**：Rust `vllm-pooling` benchmark 默认使用 `/v1/pooling` 端点，而 vLLM 服务端仅提供 `/pooling` 路由，导致文档命令返回 404。**方法**：将 Rust 客户端默认端点与文档从 `/v1/pooling` 更新为 `/pooling`，与服务端路由对齐。**效果**：benchmark 命令正常工作，164 项 cargo 测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 benchmark 端点修复，属核心前端范畴。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "pooling", "benchmark", "endpoint"],
+      "pr_number": 53352
+    },
+    {
+      "sha": "811d12ee26fa119cf8faae44d80330becf1e7fe3",
+      "comment": "**背景**：`vllm/model_executor/models/` 下以 E/F 开头的模型文件存在 mypy 类型检查错误，阻碍 pre-commit 通过。**方法**：修复相关类型注解与类型错误，更新 `tools/pre_commit/mypy.py` 中的文件 glob 模式以覆盖这些文件。**效果**：`pre-commit run --hook-stage manual mypy-3.13 -a` 通过。",
+      "sig": "sig-core",
+      "sig_reason": "模型执行器文件的 mypy 类型修复，属核心模型代码范畴。",
+      "tags": ["build", "low-risk", "mypy", "type-checking", "model-executor"],
+      "pr_number": 53381
+    },
+    {
+      "sha": "236f78cc5c39362f80c0c7df1ffe810466525f33",
+      "comment": "**背景**：在线 RL 训练器常以 checkpoint 坐标（checkpoint 名、完整形状、密集张量或 flat 索引+值）产出更新，这些坐标与 vLLM 的运行时参数坐标不同——一个 checkpoint 张量可能跨 TP rank 拆分、与另一 checkpoint 张量打包或映射到专家并行运行时权重，现有 `sparse_nccl` 后端要求已解析的运行时参数名和 rank 局部索引，无法作为 checkpoint 坐标更新的通用桥梁。**方法**：新增小型模型加载器 API，保持模型原生 `model.load_weights()` 路径作为桥梁——原生加载器继续拥有 checkpoint 名映射、TP/EP 放置与打包/模型特定布局；稀疏补丁通过在序列化加载调用期间临时替换 `torch.Tensor.copy_` 实现合并（对同形状浮点源与目标，用 `where(isnan(source), destination, source)` 合并后调用原始 `copy_`）。**效果**：RL 框架可通过原生权重加载器以 checkpoint 坐标进行稀疏更新（+383/-0，2 文件）。",
+      "sig": "sig-rl",
+      "sig_reason": "为 RL 训练器新增稀疏 checkpoint 更新 API，属 RL 生态范畴。",
+      "tags": ["feature", "medium-risk", "rl", "weight-loader", "sparse-checkpoint", "model-loader"],
+      "pr_number": 50723
+    },
+    {
+      "sha": "9eb9d9d3953959695108600c8ed33d36bc6a1e5f",
+      "comment": "**背景**：Mamba prefix caching 此前在最后一个块边界分割 prefill，8k 输入需先做 7680 token 的完整模型前向+FlashKDA，再做 320 token 的第二次完整模型前向+FlashKDA，产生冗余的 attention/MoE/路由/TP 集合通信开销。**方法**：支持在模型前向内部保存 prefill checkpoint——先做完整 8000 token 模型前向，FlashKDA 处理 7680 token 后保存 checkpoint，再处理剩余 320 token，避免第二次完整模型前向；新增 `csrc/flashkda_registration.cpp` 与 cmake 配置。**效果**：Kimi-K3 TP8 上 TTFT 显著改善：并发 1 时 435→394 ms（+9.4%）、并发 4 时 1451→1081 ms（+25.5%）、并发 16 时 2648→2100 ms（+20.7%）。",
+      "sig": "sig-core",
+      "sig_reason": "核心调度逻辑支持 Mamba prefill 内部 checkpoint 优化，属核心引擎范畴。",
+      "tags": ["perf", "medium-risk", "mamba", "prefix-caching", "flashkda", "kimi-k3", "ttft"],
+      "pr_number": 52789
+    },
+    {
+      "sha": "020829f66baa231a3ed549c7f6b4a3171ef1c759",
+      "comment": "**背景**：`renderer_applies_updates` 标志是不必要的间接层，可以通过直接覆写 `_maybe_apply_prompt_updates` 实现相同目的。**方法**：移除 `renderer_applies_updates` 标志，改为直接覆写 `_maybe_apply_prompt_updates` 方法。**效果**：简化多模态 prompt 更新管线（+80/-86，8 文件），减少不必要的间接层。",
+      "sig": "sig-core",
+      "sig_reason": "多模态 prompt 更新管线的标志清理简化，属核心引擎范畴。",
+      "tags": ["refactor", "low-risk", "multimodal", "prompt-updates", "renderer"],
+      "pr_number": 53385
+    },
+    {
+      "sha": "610bfc58e93c652fc8a075bc814ba1617f5fcf2b",
+      "comment": "**背景**：ROCm ≤ 7.2.3 基础镜像搭载 rocprofiler-sdk 1.1.0，torch 2.12 起 PyTorch Kineto GPU 后端链接 `librocprofiler-sdk`，1.1.0 在 `torch.profiler` 下破坏 `hipGraphLaunch` 并禁用 HIP graph 快速路径，导致 GPU 占用率从 97.8% 崩塌至 39.9%、`hipGraphLaunch` 平均从 893 µs 膨胀至 16.6 ms，vLLM profile 在 gfx942/gfx950 上不可用。**方法**：在专用构建阶段编译 rocprofiler-sdk 1.3.2（`ROCm/rocm-systems @ 2b22ab0`）并叠加到最终基础镜像的 `/opt/rocm`，torch/Kineto 按 soname 链接 `librocprofiler-sdk.so.1`，仅替换运行时库即可，无需 torch 重建。**效果**：GPU 占用率恢复至 97.8%、`hipGraphLaunch` 降至 893 µs；待 ROCm 7.14 原生搭载 ≥ 1.3.2 后可移除此补丁。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm 基础镜像 rocprofiler-sdk 版本修复，属 CI/构建范畴。",
+      "tags": ["build", "low-risk", "rocm", "docker", "rocprofiler-sdk", "profiler", "hip-graph"],
+      "pr_number": 53182
+    }
+  ]
+}

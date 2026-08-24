@@ -1,0 +1,71 @@
+{
+  "date": "2026-08-24",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-24T20:00:00+08:00",
+  "daily_summary": "当日 7 条变更围绕多模态与 RL 训练生态展开：媒体输入安全收紧——超尺寸远程媒体改为按 `Content-Length` 头预检、无头部时有界分块流式读取，内联 base64 按编码长度在解码前拒绝，杜绝客户端借远程响应迫使服务端全量分配内存；Dots3 NOTE Omni 修复 KV cache `BLHNC` 布局并系统性优化 vision/audio encoder。RL 侧落成第四个 weight-transfer 后端 `sharded_rdt`：推理 worker 通过 op 链重放只拉取自己消费的分片，Qwen3-235B（472 GB）warm sync 从 6.1 s 降至 3.3 s。量化方面 ModernBERT 补齐 FP8 支持（`quant_config` 穿透 encoder 线性层并修复 `weight_scale` 注册缺失）；投机解码为 Nemotron VL 修复 MTP 引擎初始化失败；API 层新增 `--sse-keep-alive-interval` 以 SSE 注释行防止代理切断长空闲流式响应，Cohere 请求校验迁移至结构化 `VLLMValidationError`。",
+  "sig_summaries": {
+    "sig-quantization": "ModernBERT 此前未把 `vllm_config.quant_config` 传给 encoder 线性层，加载 llmcompressor `FP8_DYNAMIC` checkpoint 时不注册 `weight_scale` 参数，按 loader 版本不同或在加载 scale 时失败、或静默产生非有限 embeddings（#47683）；现把 `quant_config` 沿 `ModernBertEncoderLayer -> ModernBertLayer -> ModernBertAttention / ModernBertMLP` 传入 `Wqkv`、attention `Wo` 与 MLP `Wo`，MLP `Wi` 换成 `MergedColumnParallelLinear` 保持两个融合逻辑投影的独立分片边界与 `[input, gate]` 输出布局，并附先验证四个 encoder 投影均使用 `Fp8PerTensorOnlineLinearMethod` 再查 STS12 精度的 Online FP8 MTEB 回归测试（#53101）。",
+    "sig-omni": "多条媒体路径在远程响应或内联音频已完整读成 `bytes` 之后才检查大小，批量语音请求还会在应用 per-row 限制前并发下载多个超限行，客户端可迫使 API/批处理消耗由远程响应决定的内存与带宽甚至 OOM；现远程下载有 `Content-Length` 时先查头部、否则按有界分块读取并在累计超限时立即停止，超限内联 base64 按编码长度在解码前拒绝，`VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` 为共享远程媒体设统一上限，同步/异步读取器在缓存或解码前检查头部与流式字节（PTP-VLLM-037/038/094 三处全过，#51896）。",
+    "sig-core": "新增 `--sse-keep-alive-interval`（默认 0 关闭）：`with_sse_keep_alive` 包裹最终 SSE generator，空闲超过阈值即发送符合规范的 `: keep-alive` 注释行（SSE 客户端忽略但对 Cloudflare Tunnel/NGINX/AWS ALB 等代理读超时计为字节），统一覆盖排队等待、长 prefill 与 decode 间隙三类静默期，已在提交方生产环境验证（#51034）；Cohere `CohereChatV2Request` 的三个客户端校验器（空 `model`、负 `max_tokens`、空 `messages`）从裸 `ValueError` 迁移到 `VLLMValidationError`，错误标明所属参数、被拒值作为结构化元数据，Cohere router 测试 app 注册与真实服务器相同的 handler 保持 Cohere 形状 HTTP 400 响应（#52467）；Dots3 NOTE 强制 padded sparse attention 后端使用 `BLHNC` KV-cache 布局使混合 DSA/MLA/SWA 的 cache page size 正确表示，vision encoder 单次准备序列元数据、grid 元数据留 CPU 避免设备同步、RoPE cos/sin 全层预计算一次并跳过 checkpoint 加载前的冗余 `nn.Linear` 初始化，audio encoder 批量化 log-Mel 频谱与音频段、speech encoder 微批次限 16 段控临时显存（#53460）。",
+    "sig-spec-decode": "Nemotron VL 模型（如 NemotronH_Omni_Reasoning_V3）开 `--speculative_config.method mtp` 在引擎初始化即失败：`num_hidden_layers` 位于多模态模型的 `llm_config` 之下而非顶层；现从 `llm_config` 读取层数、补 `image_token_index` 属性，并修复 `NemotronHMTP.load_weights` 使 MTP 权重正确加载（不修则为静默 bug）；Nemotron VL 以 MTP 正常产出，Nemotron-3-Super GSM8K（带/不带 MTP）与无 MTP 的 Nemotron-3-Nano-Omni 均回归通过（#53121）。",
+    "sig-rl": "新增第四个 weight-transfer 后端 `sharded_rdt`：既有后端把完整参数推给每个推理 worker（每人 `total_bytes`），新后端在初始化时对零存储占位 tensor 跑一次 `model.load_weights` 并记录 vLLM 各 weight loader 的实际操作（`narrow`/`t`/`view` 等）为每个目标分片的可重放 op 链，此后每次同步纯重放——worker 经 NIXL/Ray Direct Transport 只拉取自己消费的分片直接落入 layerwise reload 缓冲，从不物化完整 HF tensor；Qwen3-235B-A22B（472 GB）8 trainer -> 8 推理 GPU（H100）warm sync 仅 3.3 s（DP8+EP8，43 GiB/s，对比 TP8 的 6.1 s），GLM-4.5-Air 同速率，Kimi K2（1T，FP8）从原始分片 checkpoint 验证（+8409/-29，含设计文档、示例脚本与 CI 接入，#43375）。"
+  },
+  "commits": [
+    {
+      "sha": "e8888b2d68bd7c6cce0aada7f0e214e55020e20d",
+      "comment": "**背景**：ModernBERT 未把 `vllm_config.quant_config` 传给 encoder 线性层，加载 llmcompressor `FP8_DYNAMIC` checkpoint 时不注册对应的 `weight_scale` 参数，按 loader 版本不同或在加载 scale 时失败、或静默产生非有限 embeddings（#47683）。**方法**：把 `quant_config` 沿 `ModernBertEncoderLayer -> ModernBertLayer -> ModernBertAttention / ModernBertMLP` 传入 `Wqkv`、attention `Wo` 与 MLP `Wo`；MLP `Wi` 由普通 `nn.Linear` 换为 `MergedColumnParallelLinear`（两个融合逻辑投影保持独立分片边界、保留原 `[input, gate]` 输出布局）；pooling/classifier 头与 embedding 不变。**效果**：新增 Online FP8 MTEB 回归测试先验证四个 encoder 投影均使用 `Fp8PerTensorOnlineLinearMethod` 再查 STS12 精度，ModernBERT 的 FP8 checkpoint 可正确加载与服务。",
+      "sig": "sig-quantization",
+      "sig_reason": "ModernBERT encoder 线性层 FP8 量化支持补齐，属量化范畴。",
+      "tags": ["feature", "low-risk", "modernbert", "fp8", "quantization", "llmcompressor", "encoder"],
+      "pr_number": 53101
+    },
+    {
+      "sha": "2ec6f0d71ea3b350952630e310efcda1c744ff4d",
+      "comment": "**背景**：多条媒体路径在远程响应或内联音频已完整读成 `bytes` 后才检查大小——1 MiB 限制下 `async_get_bytes()` 先全量读取 2 MiB body 再过 limit；批量语音请求还会在应用 per-row 限制前并发下载多个超限行，客户端可借远程响应迫使 API/批处理消耗任意内存与带宽甚至 OOM。**方法**：远程下载有 `Content-Length` 时先查头部、否则按有界分块读取并在累计超限时立即停止；超限内联 base64 音频按编码长度在解码前拒绝；共享远程媒体经 `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` 设统一默认上限，同步/异步读取器在缓存或解码前检查头部与流式字节；覆盖 PTP-VLLM-037（chat audio）、038（batch speech，限制传入每个并发行下载）、094（共享远程媒体）三处，PTP-VLLM-041 刻意不含（main 的 Rust 前端已有更强的逐模态校验，旧补丁会削弱该行为）。**效果**：PTP-VLLM-037 从 4 失败变为全过、038 从 3 失败 1 过变为全过（+718/-24，13 个文件，含安全文档更新）。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态/音频媒体下载的尺寸预检与内存安全加固，属多模态输入范畴。",
+      "tags": ["security", "medium-risk", "multimodal", "audio", "media-download", "streaming", "resource-limit"],
+      "pr_number": 51896
+    },
+    {
+      "sha": "585bb07c7001ce52737ff0d18183d7a4b663cce4",
+      "comment": "**背景**：反向代理与隧道（Cloudflare Tunnel、NGINX `proxy_read_timeout`、AWS ALB 等）在流式连接一段时间无字节时将其关闭；SSE 响应的三个静默期——排队等 GPU、长 prefill 出首 token 前、decode 间隙（抢占或慢 span）——在网络边界看来完全相同，均为 generator 一段时间不产出。**方法**：新增 `--sse-keep-alive-interval`（整数秒，默认 0 关闭）；`with_sse_keep_alive(generator, interval)` 在交给 FastAPI `StreamingResponse` 前包裹最终 SSE generator，原样转发每个 chunk，空闲超过 interval 秒即发送符合规范的 SSE 注释行 `: keep-alive`——注释被 SSE 客户端忽略但对代理读超时逻辑计为字节；单一空闲定时器统一覆盖三类静默期，不触碰调度器、prefill 或引擎。**效果**：`/v1/chat/completions` 与 `/v1/completions` 的长空闲流式连接不再被代理切断，实现已在提交方多个生产服务器验证（+381/-2）。",
+      "sig": "sig-core",
+      "sig_reason": "OpenAI API 流式响应的 SSE keep-alive 机制，属核心 API 前端范畴。",
+      "tags": ["feature", "low-risk", "sse", "streaming", "openai-api", "proxy-timeout", "keep-alive"],
+      "pr_number": 51034
+    },
+    {
+      "sha": "a7195188a4b45dec40030467ec6b69b4f1283c8e",
+      "comment": "**背景**：#52929 后续。Nemotron VL 模型（如 NemotronH_Omni_Reasoning_V3）开 `--speculative_config.method mtp` 在引擎初始化即失败：`NemotronH_Omni_Reasoning_V3_Config` 无顶层 `num_hidden_layers`——多模态模型的层数在 `llm_config` 之下。**方法**：从 `llm_config` 读取层数并补上 `image_token_index` 属性；修复 `NemotronHMTP.load_weights` 使 MTP 权重正确加载（不修则为静默 bug）。**效果**：Nemotron VL 以 MTP 正常产出，GSM8K（Nemotron-3-Super NVFP4 带/不带 MTP）与无 MTP 的 Nemotron-3-Nano-Omni 基本功能均回归通过。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "Nemotron VL 模型的 MTP 投机解码支持修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "mtp", "spec-decode", "nemotron", "multimodal", "weight-loading"],
+      "pr_number": 53121
+    },
+    {
+      "sha": "cd329413e2bb2086c2c97c373dcc3bd1ff29fa9f",
+      "comment": "**背景**：#48227 的独立文件级 Step 5 迁移（同 #51753、#51931）。`CohereChatV2Request` 的三个客户端校验器（空 `model`、负 `max_tokens`、空 `messages`）仍抛裸 `ValueError`。**方法**：迁移到 `VLLMValidationError`，校验消息与接受输入不变，每个错误标明所属请求参数，被拒的 `max_tokens` 值作为结构化元数据携带；Cohere router 测试 app 注册与真实服务器相同的 `VLLMError` handler，在走新语义异常路径的同时保持 Cohere 形状的 HTTP 400 响应。**效果**：185 项 Cohere 测试通过，全部 pre-commit 检查干净。",
+      "sig": "sig-core",
+      "sig_reason": "Cohere 前端请求校验错误类型迁移，属核心 API 前端范畴。",
+      "tags": ["refactor", "low-risk", "cohere", "validation", "error-handling", "api"],
+      "pr_number": 52467
+    },
+    {
+      "sha": "185cada36bb25aa55f762d004d54c5ca1e3fc753",
+      "comment": "**背景**：Dots3 NOTE Omni 推理存在正确性与效率问题：padded sparse attention 后端的 KV cache 布局未强制 `BLHNC`，混合 DSA/MLA/SWA 的 cache page size 表示错误；vision/audio encoder 多处低效。**方法**：强制 Dots3 NOTE padded sparse attention 后端使用 `BLHNC` KV-cache 布局；vision encoder 每次前向只准备一次序列元数据、grid 元数据留在 CPU 避免设备同步、所有 vision 层的 RoPE cos/sin 预计算一次、跳过 checkpoint 加载前的冗余 `nn.Linear` 初始化；audio encoder 批量化 log-Mel 频谱计算、跨输入批量化音频段、每个 speech encoder 微批次限 16 段控制临时显存。**效果**：Dots3 NOTE Omni FP8 在 8x H100 DP8+EP 端到端评估通过，16K 上下文、8K 最大输出、8K chunked prefill 的图像推理可用（+211/-90，内部实现变更、不改用户 API）。",
+      "sig": "sig-core",
+      "sig_reason": "Dots3 NOTE 模型 KV cache 布局修复与编码器优化，属核心模型实现范畴。",
+      "tags": ["bugfix", "medium-risk", "dots3-note", "kv-cache-layout", "vision-encoder", "audio-encoder", "multimodal", "perf"],
+      "pr_number": 53460
+    },
+    {
+      "sha": "6cd9713463f98442a60f21f9388d16884144f62f",
+      "comment": "**背景**：既有三个 weight-transfer 后端都把完整参数推给每个推理 worker——大 MoE 每人传输 `total_bytes` 而非自身分片，RLHF 训练每步同步代价高昂。**方法**：新增第四个后端 `sharded_rdt`：初始化时对零存储占位 tensor 跑一次 `model.load_weights` 并记录 vLLM 各 weight loader 的实际操作（`narrow`/`t`/`view` 等）为每个目标分片的可重放 op 链；此后每次同步纯重放——worker 经 NIXL/Ray Direct Transport 向 trainer rank 只拉取自己 TP/EP 消费的切片，直接落入 layerwise reload 缓冲，worker 上从不物化完整 HF tensor。**效果**：Qwen3-235B-A22B（472 GB）8 trainer -> 8 推理 GPU（H100）warm sync 仅 3.3 s（DP8+EP8，43 GiB/s，对比同模型 TP8 的 6.1 s）；GLM-4.5-Air 保持同一线速，Kimi K2（1T，FP8）从原始分片 checkpoint 验证（+8409/-29，含一页设计文档、RL 示例脚本与 CI 接入）。",
+      "sig": "sig-rl",
+      "sig_reason": "RL 训练-推理权重同步的分片拉取后端，属 RL 生态范畴。",
+      "tags": ["feature", "high-risk", "rl", "weight-transfer", "rdt", "nixl", "ray", "expert-parallel", "moe"],
+      "pr_number": 43375
+    }
+  ]
+}
