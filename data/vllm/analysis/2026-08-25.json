@@ -1,0 +1,177 @@
+{
+  "date": "2026-08-25",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-25T20:00:00+08:00",
+  "daily_summary": "当日 20 条变更以核心引擎与 CI 基建为主。最重量级的是 Model Runner V2 的 batch-sharded sampling：TP 下沿 batch 维切分 logits 与 sampler 输入并以 all-to-all 替代 all-gather，峰值 target logits 显存降为 1/P 且采样并行化（+1781 行）；模型面一次性移除 10 个废弃架构（净删约 5,500 行）。安全方面修复 `--hf-token` 明文泄漏到启动日志、`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` 音频限制补齐到全部入口路径（GHSA-jcq2-4gch-5qhf）。正确性修复包括 HunyuanOCR 前缀缓存命中即拖垮整个服务的 XD-RoPE grid 元数据丢失、XPU 稀疏 MLA 元数据缺失崩溃、TP>1 投机解码 draft 模型更宽时的 workspace 初始化崩溃，以及混合批下 CLIP/SigLIP 文本 embedding 塌缩。性能侧为 Qwen3.6 打通融合 QK-norm+partial MRoPE+gate 算子并为 adaptive verification 支持 varlen trtllm-gen decode；CI 侧新增 torch-nightly 结果上报 PyTorch CRCR 及多项稳定性调整。",
+  "sig_summaries": {
+    "sig-core": "八条变更：安全上把 `hf_token` 加入 `_SENSITIVE_ARG_FIELDS`，启动日志 non-default args 中与 `api_key` 一同脱敏为 `***`（#53625）；修复 XD-RoPE 模型（HunyuanOCR）前缀缓存命中时 `strip_covered_mm_data()` 丢弃 `image_grid_thw` 导致 `EngineCore` fatal error 拖垮整个 API server 的问题，把 M-RoPE 的元数据保留例外扩展到 XD-RoPE（#53456）；一行恢复 LFM2-VL 的 `supports_tower_connector_lora` 标志，找回 #53092 重构时遗漏的 tower/connector LoRA 能力（#53519）；Model Runner V2 落地 batch 维分片采样，logits 显存从 `O(batch*(spec+1)*vocab)` 降为 1/P（#50465）；移除十个废弃模型架构并入册 `_PREVIOUSLY_SUPPORTED_MODELS`（净删约 5,500 行，#53608）；另清理过期弃用参数/别名（#53559）、determinism 代码目录化（#53619）与 warmup 重复 `VLLM_USE_DEEP_GEMM` 检查（#48687）。",
+    "sig-large-scale-serving": "NIXL KV 传输下 Mamba 模型的 producer 侧 N-1 prefill 截断发生在 scheduler 前缀缓存查找之后，本地缓存命中计算时请求长度仍在变化并触发 zero-new-token 断言（#53514）；现把截断移入 `on_new_request` 使其先于前缀缓存查找执行，命中计算所见的请求长度保持稳定，断言不再触发（#53523）。",
+    "sig-model-performance": "三条：XPU 稀疏 MLA 后端 `XPUMLASparseMetadata` 缺少共享 MLA 层无条件读取的 `num_decodes`/`num_prefills`/`num_decode_tokens` 字段，DeepSeek/GLM DSA 在 XPU 上直接 AttributeError 崩溃，补齐三字段并把全部 token 记为 decode 走稀疏 MQA 路径（无关联 PR）；融合 QK-norm + RoPE + gate 算子扩展支持 `[3, M]` T/H/W 位置、partial MRoPE、gated 布局与原始 GemmaRMSNorm 权重，让 Qwen3.6 视觉请求吃上融合路径，ChartQA 千题三种子配对评测精度无回归（#52676）；BailingMoeV3 KDA 注意力在 CUDA graph profiling dummy run 时对被 #53306 省略的 Mamba 族元数据直接索引抛 KeyError，改用与其他 GDN/KDA 路径一致的缺失守卫（#53593）。",
+    "sig-spec-decode": "两条：TP>1 下 draft_model 投机解码在 draft 模型 hidden_size 大于 target 时，TRT-LLM 融合 allreduce+RMSNorm 的 workspace 只按 target 尺寸分配导致初始化崩溃，现取两者 hidden dim 的最大值，2×H100 的 A/B/C 矩阵全过（#52193）；FlashInfer trtllm-gen decode 接上 `cum_seq_lens_q`/`max_q_len` 支持 varlen，SM100 上以设备侧 `qo_indptr` 为唯一事实源，为 adaptive verification 打通每请求不同 query 长度的 decode batch，B200 kernel 回归全过、Gemma4-12B NVFP4 + DSpark E2E GSM8K 98%（#52157）。",
+    "sig-omni": "两条：`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` 此前只在 STT 上传路径强制，`AudioMediaIO.load_file()` 是最后一个未设防入口，现对 `load_bytes`/`load_base64`/`load_file`/HTTP 下载全部音频路径一致检查，并修复既有测试 mock 的 `Content-Length` 大小写错误（GHSA-jcq2-4gch-5qhf，#53561）；CLIP/SigLIP pooling 只按整批是否含多模态 embedding 存单一 `_is_text_input` 标志，混合图像+文本批会跳过文本请求的 text encoder 致 embedding 塌缩，现记录 per-token `is_multimodal` 掩码、有文本 token 即运行 text encoder 并用 `torch.where` 恢复多模态位置的 vision embedding（#53165）。",
+    "sig-ci": "三条：新增 CI 步骤把 torch-nightly 结果自报给 PyTorch CRCR（hud.pytorch.org/crcr），Buildkite OIDC 鉴权、脚本内选 lane、全失败路径 exit 0 加 `soft_fail: true` 绝不影响构建、拒绝非 main 分支上报（#51830）；#53500 使 launchers 阶段测试从 29 涨到 55 个后 main 在 26m01s 被标记超时，H200 Entrypoints Unit 超时从 25 提到 40 分钟（#53618）；The Rock 7.14（ROCm 运行时差异）上 MI355 的 FLEX_ATTENTION pooling 打分稳定偏差 0.00852 超出 abs_tol=0.006，提高容差消除持续失败（#53646）。",
+    "other": "纯文档修复：`routed_experts.py` 中 `build_expert_params_mapping` 两个参数描述的 docstring 续行缩进由 2 空格改为 Google 风格要求的 4 空格，清除 docs 构建的 6 条 Griffe 警告，文本内容不变（#53604）。"
+  },
+  "commits": [
+    {
+      "sha": "d3e2888c7588fe3a7be93606c7c626dbfd304d2e",
+      "comment": "**背景**：`--hf-token` 以明文落入服务启动日志——`log_non_default_args` 打印所有用户改动的参数，#52523 加的 `_redact_sensitive_args` 只把 `api_key` 列入敏感字段，`hf_token` 走同一路径仍原样打印；HF token 可读 gated 仓库、写权限还能推送，而运维常把日志转发到聚合器或贴进 bug 报告。**方法**：把 `hf_token` 加入 `_SENSITIVE_ARG_FIELDS`，与 `api_key` 一同打印为 `***`；作者排查了其余 serve 参数，确认这两个是仅有的携带凭证的参数。**效果**：新增 `test_hf_token_not_in_log` 断言 token 不出现在日志行，修复前 2 个用例失败、修复后 15 项全过。",
+      "sig": "sig-core",
+      "sig_reason": "服务启动日志敏感参数脱敏修复，属核心前端范畴。",
+      "tags": ["security", "low-risk", "hf-token", "logging", "redaction", "serve"],
+      "pr_number": 53625
+    },
+    {
+      "sha": "b2dd9ce73dce2ad09007d1db5c171454118981d7",
+      "comment": "琐碎文档修复：`routed_experts.py` 中 `build_expert_params_mapping` 的 `lora_base_layer_prefix` 等参数描述使用了 2 空格悬挂缩进，Google 风格 docstring 要求 4 空格，Griffe 无法关联续行与参数，docs 构建产生 6 条警告。统一改为 4 空格后警告清零，文本内容不变。",
+      "sig": "other",
+      "sig_reason": "纯 docstring 缩进修复，不涉及任何 SIG 领域。",
+      "tags": ["docs", "low-risk", "docstring", "griffe", "mkdocs"],
+      "pr_number": 53604
+    },
+    {
+      "sha": "d4c4ceb31e3d35222a15f01ac2349d4a39141738",
+      "comment": "**背景**：NIXL KV 传输下 Mamba 模型的 producer 侧 N-1 prefill 截断发生在 scheduler 前缀缓存查找之后，计算本地缓存命中时请求长度仍在变化，触发 zero-new-token 断言（#53514）。**方法**：把 N-1 截断移入 `on_new_request`，使其先于 scheduler 前缀缓存查找执行。**效果**：命中计算所见的请求长度保持稳定，断言不再触发；附 KV connector 测试覆盖。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL KV 传输（PD 分离）下 Mamba prefill 截断时序修复，属大规模服务范畴。",
+      "tags": ["bugfix", "medium-risk", "nixl", "kv-transfer", "mamba", "prefill", "prefix-cache"],
+      "pr_number": 53523
+    },
+    {
+      "sha": "cbe3966f9cc62848d6271a92819e51470f74fbbd",
+      "comment": "**背景**：XPU 稀疏 MLA 后端的 `XPUMLASparseMetadata` 缺少共享 MLA 层（`mla_attention.py::forward_impl`）无条件读取的 `num_decodes`/`num_prefills`/`num_decode_tokens` 字段——CUDA 后端经 `SparseMLACommonMetadataBuilder` 携带这些字段而 XPU 后端自建元数据时遗漏，稀疏 MLA（DeepSeek/GLM DSA）在 XPU 上以 `'XPUMLASparseMetadata' object has no attribute 'num_decode_tokens'` 崩溃。**方法**：补齐三个字段并在构建时把全部 token 记为 decode（`num_decode_tokens == num_actual_tokens`、`num_prefills == 0`），因为该后端 prefill 与 decode 都走 top-k 稀疏 MQA 路径，这样保证 `num_mha_tokens` 恒为 0、永不进入后端缺乏字段的 dense-MHA prefill 分支。**效果**：XPU 上稀疏 MLA 不再崩溃，`forward_mqa` 路径元数据完整。",
+      "sig": "sig-model-performance",
+      "sig_reason": "XPU 稀疏 MLA 注意力后端元数据缺失崩溃修复，属模型性能/后端范畴。",
+      "tags": ["bugfix", "low-risk", "xpu", "mla", "sparse-attention", "dsa", "metadata"],
+      "pr_number": null
+    },
+    {
+      "sha": "7b7e5cbfcd99bc286ba2ae13e1f967b66a1a5c00",
+      "comment": "**背景**：#51498 为 LFM2-VL 添加了 tower/connector LoRA 支持，#53092 又把基于 helper 的能力检测替换为显式 `supports_tower_connector_lora` 模型标志，但 LFM2-VL 未被列入 opt-in 名单，开启该功能被静默忽略并告 unsupported-model 警告。**方法**：一行改动，为现有 LFM2-VL 实现声明 `supports_tower_connector_lora`。**效果**：能力探针从 False 变 True，tower/connector LoRA 恢复可用，registry 导入与 model runner 映射测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "LFM2-VL tower/connector LoRA 能力标志回归修复，属核心模型实现范畴。",
+      "tags": ["bugfix", "low-risk", "lora", "lfm2-vl", "multimodal", "regression"],
+      "pr_number": 53519
+    },
+    {
+      "sha": "34c3824a113c2691644673723acdcf6407d5eaf8",
+      "comment": "琐碎 CI 调整：#53500 把 `test_run_batch.py` 移入 `tests/entrypoints/launchers` 后该阶段选中测试从 29 涨到 55 个，main #85369 三个阶段全部通过（129 passed / 1 skipped、5 passed、55 passed）却在 26m01s 被标记超时。将 H200 Entrypoints Unit 的 Buildkite 超时从 25 分钟提到 40 分钟（AMD 镜像保持 35 分钟不变），在保留扩容覆盖的同时为正常运行时波动留出余量。",
+      "sig": "sig-ci",
+      "sig_reason": "Buildkite CI 超时预算调整，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "buildkite", "timeout", "entrypoints"],
+      "pr_number": 53618
+    },
+    {
+      "sha": "07ef21bc69842665cf5056371ea15a6d014f3b05",
+      "comment": "**背景**：Qwen3.6 视觉请求使用 per-head `[q | gate]` 布局、零中心 GemmaRMSNorm 与部分交错 MRoPE，既有融合 Q/K norm + RoPE + gate 算子均不支持，只能走慢速 fallback。**方法**：扩展该融合算子支持 `[3, M]` T/H/W 位置、partial MRoPE、gated 布局与原始 GemmaRMSNorm 权重；不支持的输入保持既有 fallback。**效果**：kernel 套件 6/6 通过（RoPE 与 MRoPE，`M=1/4/37`）；RTX PRO 6000 上以 Qwen3.6-35B-A3B-FP8 生产编译路径（VLLM compile + CUDA graphs）对 1,000 题 ChartQA 三种子配对评测 relaxed accuracy +0.233 pp（95% CI [-0.633, +1.100] pp），2,500 题全量敏感性检查亦无显著差异（McNemar p>0.4）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Qwen3.6 融合 QK-norm/partial MRoPE/gate 算子性能优化，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "fused-kernel", "qwen3.6", "mrope", "qk-norm", "rope", "gate", "vision"],
+      "pr_number": 52676
+    },
+    {
+      "sha": "9bf0d4717ecd5ad9e6c5fe3eb933cf654a256321",
+      "comment": "**背景**：HunyuanOCR（任意 XD-RoPE 模型）在第二条命中前缀缓存的请求上直接把整个服务打崩——`strip_covered_mm_data()` 丢弃占位符 span 完全落在缓存覆盖区内多模态项的 tensor 数据，但只为 M-RoPE 模型保留 CPU 侧 grid 元数据，XD-RoPE 模型同样按 grid 维度计算位置，结果 `image_grid_thw` 为空而 prompt 里仍有 `image_start` token，`get_xdrope_input_positions()` 索引越界，`EngineCore` fatal error 随即终止 API server 进程。**方法**：把该元数据保留例外扩展到 XD-RoPE：`strip_covered_mm_data()` 接受 `uses_xdrope`，`NewRequestData.from_request()` 透传，scheduler 从模型配置推导；`image_grid_thw` 本已标记 `keep_on_cpu=True`，元数据只需在 strip 中存活。**效果**：命中前缀缓存的请求不再崩溃、服务进程存活；附调度器单测与工具层测试。",
+      "sig": "sig-core",
+      "sig_reason": "调度器多模态数据剥离对 XD-RoPE 模型的 grid 元数据保留修复，属核心调度范畴。",
+      "tags": ["bugfix", "low-risk", "prefix-cache", "xdrope", "multimodal", "hunyuan-ocr", "crash"],
+      "pr_number": 53456
+    },
+    {
+      "sha": "09fddeb4ce7ee8cd0c46f1da9c45aafb9a17e89a",
+      "comment": "**背景**：#53306 把 Mamba 族组从 dummy-run 注意力元数据中省略后，`BailingMoeV3KimiDeltaAttention` 仍直接索引自己的条目，V2 引擎初始化 warmup dummy run（CUDA graph profiling）时抛 KeyError。**方法**：改用与其他 GDN/KDA 路径一致的缺失条目守卫（同 #53581）。**效果**：CUDA graph profiling 不再 KeyError，BailingMoeV3 KDA 引擎初始化正常。",
+      "sig": "sig-model-performance",
+      "sig_reason": "BailingMoeV3 KDA 注意力在 CUDA graph profiling 时的元数据缺失修复，属模型性能范畴。",
+      "tags": ["bugfix", "low-risk", "bailingmoe", "kda", "cuda-graph", "mamba"],
+      "pr_number": 53593
+    },
+    {
+      "sha": "e3dde1ee9bfab341592fbfae1f170795568b83ac",
+      "comment": "**背景**：PyTorch 此前无法自动得知某晚 torch nightly 是否弄坏了 vLLM，跨仓库回归排查全靠人工。**方法**：新增 CI 步骤把本仓库 torch-nightly 结果自报给 PyTorch Cross-Repo CI Relay（CRCR），在 hud.pytorch.org/crcr 与其他下游仓库并列展示：Buildkite OIDC token 鉴权（relay 对 JWKS 验证并映射到 GitHub 仓库身份），lane 选择在脚本内完成（非 nightly 构建直接 exit 0），所有失败路径 exit 0 加 `soft_fail: true` 保证上报绝不把 nightly 变红，拒绝在非 main 分支上报以防 fork PR 冒名，payload 用 Python 构造以免 job 标签中的引号/emoji 破坏 JSON。**效果**：待 relay 侧基建（`CRCR_CALLBACK_URL`、`BUILDKITE_API_TOKEN`、仓库映射）就绪后即生效，nightly 结果对 PyTorch 社区可见。",
+      "sig": "sig-ci",
+      "sig_reason": "torch-nightly CI 结果上报 PyTorch CRCR 基建，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "feature", "crcr", "torch-nightly", "buildkite", "oidc"],
+      "pr_number": 51830
+    },
+    {
+      "sha": "7ca336929c169fee1210dd5293029d78811fba27",
+      "comment": "**背景**：延续原生模型面收敛清理（Persimmon、Grok、Baichuan、MiniMax 等已先后移除），十个废弃架构近三个月使用量趋零（最高的 HCXVision 也仅 29.7 小时，MPT 为 0）。**方法**：完整移除 Arctic、Chameleon、Cheers、Fairseq2Llama、FireRedLID、GritLM、HCXVision、MPT 的实现、vendored config/processor、文档、测试与示例；移除三个 registry 别名（`RWForCausalLM`、`StableLMEpochForCausalLM`、`PrithviGeoSpatialMAE`——原生实现不动，Prithvi-EO checkpoint 本就报 Terratorch 架构继续可用）；每个架构记入 `_PREVIOUSLY_SUPPORTED_MODELS` 为 `0.28.0`，报错从裸 not supported 变为带版本号的明确提示。**效果**：净删约 5,500 行（+49/-6620，46 个文件），受影响 checkpoint 获得可操作的错误信息。",
+      "sig": "sig-core",
+      "sig_reason": "移除十个废弃模型架构的模型面收敛清理，属核心模型注册范畴。",
+      "tags": ["cleanup", "medium-risk", "model-removal", "deprecation", "model-registry"],
+      "pr_number": 53608
+    },
+    {
+      "sha": "a0f1b9ad05452ae5e73764dcf4cc11463be7807c",
+      "comment": "琐碎 CI 调整：The Rock 7.14（ROCm 运行时与上游镜像不同）上 MI355 的 `(MI355) Entrypoints Integration (Pooling)` 测试组中 FLEX_ATTENTION cross-encoder 打分稳定偏差 0.00852（如 actual=0.108924 vs expected=0.100404）超出 abs_tol=0.006，五个用例持续失败；作者以相同 torch/triton pin 自建镜像复现并定位到 ROCm 运行时（hipBLASLt）差异，提高 abs tol 覆盖该偏差。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm（The Rock）平台测试容差调整，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "rocm", "the-rock", "flex-attention", "tolerance", "mi355"],
+      "pr_number": 53646
+    },
+    {
+      "sha": "d154d90d6c4bcf26a0c78ac4f3e43621c14333ba",
+      "comment": "**背景**：采样前引擎会物化完整 target logits，分配 `O(batch_size * (num_spec_tokens + 1) * vocab_size)` 的显存，大词表大批量下开销显著；这也是后续分片 draft logits（speculator 前向预分配的最坏情况缓存）的前置。**方法**：TP 下沿 batch 维切分 logits 与 sampler 输入：请求按 `idx_mapping % tp_size` 确定性分配到 rank，`BatchSharder.shard_sampler_inputs` 派生本 rank 所拥有请求的 `InputBatch` CPU 数组与 GPU tensor；模型实现 `compute_logits_local` 只计算自己 `vocab_size // P` 的切片，再以 batch 维 all-to-all（而非 all-gather）让每个 rank 得到 `[num_tokens // P, vocab_size]`，各 rank 对自己的子批并行采样。**效果**：峰值 target logits 显存降为 1/P，top-k/top-p/block verification 等重采样操作并行化利于 TPOT；`Sampler` 与 `RejectionSampler` 无需改动（+1781/-22，19 个文件，含 e2e 与单测）。",
+      "sig": "sig-core",
+      "sig_reason": "Model Runner V2 的 TP batch 维分片采样，属核心引擎范畴。",
+      "tags": ["feature", "high-risk", "tensor-parallel", "sampling", "logits", "memory", "model-runner-v2", "perf"],
+      "pr_number": 50465
+    },
+    {
+      "sha": "0d7d5ed0b2b61da53f682534f1754fe7d0251a34",
+      "comment": "**背景**：`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` 此前只在 speech-to-text 上传路径强制，多模态 chat 音频输入可绕过限制；`AudioMediaIO.load_file()` 是最后一个未设防的入口——直接把文件路径交给 `load_audio` 而不先查磁盘大小（GHSA-jcq2-4gch-5qhf）。**方法**：在 `load_file()` 中加入 `self._validate_encoded_size(filepath.stat().st_size)`，使 `load_bytes`/`load_base64`/`load_file`/HTTP 下载四类音频入口一致受检；更新安全文档与 env 注释表明限制覆盖全部音频输入；顺带修复既有测试 mock 的 `content-length` 大小写错误（代码读取 `Content-Length`，导致 HTTP 预检用例此前静默通过而未真正走到目标路径）。**效果**：6 项音频大小预检测试全过（含 `load_bytes`/`load_file` 拒绝的两个新用例）。",
+      "sig": "sig-omni",
+      "sig_reason": "音频媒体文件大小限制全路径强制，属多模态输入范畴。",
+      "tags": ["security", "low-risk", "audio", "media-size", "multimodal", "resource-limit"],
+      "pr_number": 53561
+    },
+    {
+      "sha": "23ab0cfdbc432888549d6f30bb65906aac5cdcda",
+      "comment": "**背景**：TP>1 下用 draft_model 做投机解码时，若 draft 模型 hidden_size 大于 target 模型（如 Qwen3-30B-A3B 配 Qwen3-4B draft），TRT-LLM 融合 allreduce+RMSNorm 的 workspace 只按 target 尺寸分配，引擎初始化即崩溃（#52023）。**方法**：workspace 尺寸改为取 target 与 draft 模型 hidden dim 的最大值（已确认 workspace 创建发生在 eager 且初始化时可拿到 draft config）。**效果**：2×H100 上 A/B/C 矩阵全过——TP=2 且 draft 更宽（原崩溃场景）、TP=1、TP=2 且 draft 更窄三种组合均正常 serve 且无 workspace 校验错误，追踪确认融合 pass 以 draft 宽度构建共享 workspace。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "TP>1 投机解码 draft/target hidden size 差异导致的 workspace 崩溃修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "tensor-parallel", "trtllm", "allreduce", "workspace"],
+      "pr_number": 52193
+    },
+    {
+      "sha": "f59bb0bd8c5ad8a0144ae9abb123df9b2e9425a6",
+      "comment": "琐碎重构：把 batch invariance（确定性）相关代码从单一纯文件拆成独立目录 `vllm/model_executor/determinism`，同步更新 CODEOWNERS、`tests/v1/determinism`、RL 示例与各处 import；无行为变化，由既有 CI 覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "确定性/batch invariance 代码目录化重构，属核心代码组织范畴。",
+      "tags": ["refactor", "low-risk", "determinism", "batch-invariance", "code-structure"],
+      "pr_number": 53619
+    },
+    {
+      "sha": "6a9c69fa851389dcf1ee5d3a2363e27af665d26d",
+      "comment": "**背景**：adaptive verification 需要 decode batch 中每个请求的 query 长度不同（#51871），而 FlashInfer trtllm-gen decode 原只支持统一长度。**方法**：为 trtllm-gen decode 接上 `cum_seq_lens_q`/`max_q_len`（varlen 时 `q_len_per_req` 必须为 `None`）；SM100 上翻转 `supports_device_cpu_query_lens_mismatch`——设备侧 `qo_indptr` 是唯一事实源，CPU 长度仅为上界；并加守卫：无 trtllm-gen kernel 时 adaptive verification 在初始化即快速失败。**效果**：B200 上 4 个 varlen + 16 个统一长度回归全过；Gemma4-12B NVFP4 + DSpark（q=8）走 varlen 路径 E2E GSM8K 98%、0% invalid、17.6 q/s；varlen 相对统一 padding 有小额固定 kernel 开销（batch=32 时 70.5us vs 65.4us），其价值在于支撑 ragged batch 而非加速统一 batch。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "trtllm-gen varlen decode 支持 adaptive verification，属投机解码范畴。",
+      "tags": ["feature", "medium-risk", "spec-decode", "adaptive-verification", "trtllm-gen", "varlen", "flashinfer", "sm100"],
+      "pr_number": 52157
+    },
+    {
+      "sha": "342b8ebd8bd4595826f29ff95dfc48679a03a95a",
+      "comment": "**背景**：CLIP/SigLIP pooling 此前只按整批是否含多模态 embedding 存一个 `_is_text_input` 标志，混合图像+文本批里文本请求会被跳过 text encoder，completion 式 `input` 的 embedding 在有图像负载时塌缩（#53091）。**方法**：`embed_input_ids` 改为记录 per-token 的 `is_multimodal` 掩码——只要存在文本 token 就运行 text encoder，多模态位置再用 `torch.where` 恢复 vision embedding。**效果**：混合批的文本 embedding 与纯文本一致（CLIP 混合文本不再等于空串向量）；新增 CPU 路由单测（text-only/vision-only/mixed）及 CLIP/SigLIP pooling 混合批断言。",
+      "sig": "sig-omni",
+      "sig_reason": "CLIP/SigLIP 混合批文本编码路由修复，属多模态 embedding 范畴。",
+      "tags": ["bugfix", "medium-risk", "clip", "siglip", "pooling", "multimodal", "embedding"],
+      "pr_number": 53165
+    },
+    {
+      "sha": "4f686e182a3460b28df9b8e26b377a5069d519fa",
+      "comment": "**背景**：多处已到期的弃用垫片仍留在代码里：`VLLM_TRITON_ATTN_USE_TD`（已改名 `VLLM_TRITON_USE_TD`，v0.25 移除）、`group_mm_kwargs_by_modality`（已改名 `group_and_batch_mm_kwargs`，v0.19 移除）、IO Processor 插件的 `parse_request`/`validate_or_generate_params` 旧名兼容回退等。**方法**：删除这些过期别名、弃用告警函数与回退逻辑，同步更新 bge_m3_sparse 测试插件、pooling 入口与引擎调用点到新 API，并修正若干仍在宽限期内项的弃用消息表述（如 `indexer_kv_dtype` 移除版本改为 v0.29）。**效果**：净删 77 行（+16/-93，12 个文件），弃用面收敛到仍在宽限期内的项。",
+      "sig": "sig-core",
+      "sig_reason": "过期弃用参数/别名清理，属核心代码清理范畴。",
+      "tags": ["cleanup", "low-risk", "deprecation", "env-vars", "io-processor", "api-cleanup"],
+      "pr_number": 53559
+    },
+    {
+      "sha": "6648eb118d77ad001a411cf52f9c6c4719476c83",
+      "comment": "琐碎清理：`vllm/model_executor/warmup` 中在调用 `is_deep_gemm_supported` 前有一处重复的 `VLLM_USE_DEEP_GEMM` 环境变量检查（后者内部已含该判断），删去这 3 行冗余代码。",
+      "sig": "sig-core",
+      "sig_reason": "warmup 路径重复 DeepGEMM 环境变量检查清理，属核心代码清理范畴。",
+      "tags": ["cleanup", "low-risk", "deep-gemm", "warmup"],
+      "pr_number": 48687
+    }
+  ]
+}
