@@ -1,0 +1,161 @@
+{
+  "date": "2026-08-26",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-26T20:00:00+08:00",
+  "daily_summary": "当日 18 条变更以核心引擎修复与 Blackwell 性能调优为主。性能侧三条：FlashInfer all-reduce 阈值针对 SM103 单节点 TP8 重新调优（Kimi K3 的 ITL 最高 +3.5%）、Kimi K3 低延迟 decode GEMM 路由扩展到 SM100/B200（TP16 shapes 最高 +60%）、batch invariance Triton kernel 在 Blackwell 自动调优（E2E 延迟 -33.6%）。正确性修复覆盖确定性（TP 下禁用非确定的 `fuse_allreduce_rms` 融合）、MRV2 cudagraph 内存 profiling 改用一次性 graph pool（修复 B200 DSV4-Flash nightly 崩溃）、Kimi K3 profiling 后 `_mamba_ctx` 未释放的 CUDA IMA，以及 KV offload 级联对在途写入 key 的永久丢弃。前端与 API 侧集中修 HTTP 语义与安全：Rust frontend 启动日志凭证脱敏、Cohere 端点补 `VLLM_MAX_STOP_STRINGS` 上限、畸形 base64 音频与 DeepSeek V4 空消息改回 400 而非 500。CI 方向包括 Rust Docker 缓存跨提交保留与 AMD MXFP4 DeepSeek 的 GSM8K 精度门禁。",
+  "sig_summaries": {
+    "sig-core": "八条变更：Kimi K3 在 profiling 结束后未释放 `_mamba_ctx`，与 #53306/#52388 组合触发 CUDA illegal memory access，现于 profiling 后释放（#53773）；`VLLM_BATCH_INVARIANT=1` 在 TP>1 下因 FlashInfer `fuse_allreduce_rms` 融合 kernel 归约顺序逐次变化而破坏 bit 稳定性，现请求 batch invariance 时禁用该融合，与 #50505 互补保住约 97% 吞吐（#51292）；MRV2 的 cudagraph 内存 profiling 捕获会污染持久全局 graph pool 并触发 c10 allocator 内部断言，现 profiling 全程指向一次性 throwaway pool，修复 B200 DeepSeek-V4-Flash nightly 崩溃（#53682）；B12X 模块此前用 `functools.cache` 包裹 import、Dynamo trace 时才加载导致必须关编译，改为模块加载时解析后可与 torch.compile 共用（#53326）；前端三连——Rust frontend 启动日志泄漏 `api_key`/`hf_token` 明文（#53738）、Cohere 端点补上 stop string 数量上限（#53750）、DeepSeek V4 tokenizer 裸 assert 改 `ValueError` 使畸形输入返回 400 而非 500（#53747）；另有 model_executor models [gG] 的 143 处 mypy 清理（#53616）。",
+    "sig-large-scale-serving": "KV offload 分层管理器的 request-level cascade 只保留主层 `HIT` 的 key，`HIT_PENDING`（写入仍在途）的 key 被永久丢弃，P2P producer 侧只能等 `_LOAD_TIMEOUT_S` 超时重算；现把 `HIT_PENDING` 视为「尚未」而非「永不」，park 到 request 上每步重试直到写入成败落定，请求 finalize 随之暂缓（#53329）。",
+    "sig-model-performance": "三条：FlashInfer all-reduce 阈值按 SM103 单节点 TP8 重新调优，Kimi K3（8K 输入/1K 输出）并发 256-1024 下 ITL 提升 2.98%-3.46%、TPOT 提升 2.23%-3.86%，GSM8K 0.9674 无回归（#53606）；Kimi K3 BF16 低延迟 decode GEMM 选择器此前只认 SM103，B200 上全部回退 cuBLAS，现新增 SM100 独立实测表（24 shapes）按 compute capability 路由，TP16 shapes 在 B200 提升 33%-60%、B300 不受影响（#53534）；Blackwell 上对 batch invariance Triton kernel 自动调优，Qwen3-1.7B 平均延迟 0.770s→0.576s（-33.6%）（#53649）。",
+    "sig-spec-decode": "为 SM100 `FlashInferMLASparseTRTLLMBackend` 打通 adaptive DSpark 验证：新增从设备侧 query 边界派生请求映射、声明变长 CUDA graph 支持的 sparse-MLA 元数据构建器，并把 target CUDA graph 能力检查收窄到 target attention 层（draft attention 由自身 graph manager 检查）；GLM-5.2-NVFP4 + DSpark speculator 在 4×B300 端到端验证通过，SPEED Bench 扫描零失败请求（#52783）。",
+    "sig-omni": "`AudioMediaIO.load_base64` 解码时未开严格校验，pybase64 静默丢弃 base64 字母表外的字符并把残缺字节交给 libsndfile，`LibsndfileError` 继承自 `RuntimeError` 落到 500；其余三类媒体 loader 均已 `validate=True`，现补齐音频，畸形 base64 负载与图片路径一致返回 400（#53744）。",
+    "sig-ci": "三条：Rust Docker 构建此前把 .git 绑进镜像导致 BuildKit checksum 随每次提交变化、全量编译缓存失效，现以稳定占位版本一次性编译、Git 敏感版本号放进小的 child stage 重链接，覆盖 CUDA/CPU/XPU（#53290）；新增 amd/DeepSeek-V4-Flash-MXFP4 的 lm-eval GSM8K 精度 CI 测试，阈值取 4×MI350X 实测 0.95（#50632）；修复 kimi_k3 测试 `Aligned Mamba state indices must be precomputed` 断言失败（#53766）。",
+    "other": "为 agent 环境新增 CUDA illegal memory access 调试 skill（`.agents/skills/debug-ima` 与 `.claude/skills/debug-ima`，+14 行），指导 agent 面对异步报告的模糊 IMA 栈时如何定位真实出错 kernel；纯文档新增，无运行时代码变更（#53702）。"
+  },
+  "commits": [
+    {
+      "sha": "88e1b113131903936c4ee333a21d77deaacd50ee",
+      "comment": "**背景**：FlashInfer all-reduce 与其他后端的切换阈值未针对 SM103 单节点 TP8 实测调优，较大并发下选错后端拖慢 decode。**方法**：基于 K3 TP8（随机数据集、8192 输入/1024 输出、`--ignore-eos`）实测重新校准 all-reduce 字节阈值，涉及编译 pass、device communicators 与分布式测试三处。**效果**：并发 256-1024（AR 3.5-14 MiB）下 ITL 提升 2.98%-3.46%、TPOT 提升 2.23%-3.86%、吞吐 +1.8%-3.0%，GSM8K 0.9674 无回归。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer all-reduce 阈值在 SM103 TP8 的性能调优，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "flashinfer", "all-reduce", "tp8", "sm103", "thresholds"],
+      "pr_number": 53606
+    },
+    {
+      "sha": "d125b540b71a6d406ff6ceed53aaa028005c7fe9",
+      "comment": "琐碎新增：为 `.agents/skills/debug-ima` 与 `.claude/skills/debug-ima` 添加 CUDA illegal memory access 调试 skill（+14 行），指导 agent 面对 CUDA 异步上报的模糊 IMA 栈时如何定位真实出错 kernel；纯 agent 文档，不涉及运行时代码。",
+      "sig": "other",
+      "sig_reason": "agent 调试 skill 纯文档新增，不属于任何 SIG 领域。",
+      "tags": ["tooling", "low-risk", "agents", "skill", "cuda", "debugging"],
+      "pr_number": 53702
+    },
+    {
+      "sha": "a447955acad919a6902d65f0af2d4f76c0335ed3",
+      "comment": "**背景**：Kimi K3 TP8 服务在 profiling 后遭遇 `torch.AcceleratorError: CUDA error: an illegal memory access`，是 #53306 与 #52388 组合引入的 bug——profiling 结束后 `_mamba_ctx` 未被释放。**方法**：profiling 完成后释放 `_mamba_ctx`（+2 行）。**效果**：TP8 + fastsafetensors + prefix caching 配置下 worker 不再崩溃，服务正常运行。",
+      "sig": "sig-core",
+      "sig_reason": "profiling 后 Mamba 上下文未释放导致的 CUDA IMA 崩溃修复，属核心 worker 生命周期范畴。",
+      "tags": ["bugfix", "medium-risk", "kimi-k3", "mamba", "cuda", "profiling", "crash"],
+      "pr_number": 53773
+    },
+    {
+      "sha": "bc2d63e650f698aab24fd4d91889e0dcf16876f0",
+      "comment": "**背景**：Kimi K3 BF16 decode GEMM 选择器被 `_is_sm103()` 门槛挡住且只有一张 B300 实测表，B200（SM100）上每个 decode projection 都回退 cuBLAS——尽管两个候选后端（CuTe DSL skinny GEMM、`dsv3_fused_a_gemm`）均非 SM103 专属；直接复用 SM103 表会既漏掉若干 shape 的收益、又在 6288x7168 等格子劣于 cuBLAS。**方法**：新增单独实测的 SM100 表（`KIMI_K3_PROJECTIONS_SM100`，24 shapes，逐格三方实测、CUDA graph replay、对 cuBLAS 数值校验）并按 compute capability 路由；因两块芯片赢家集合在后端与 token 覆盖上真实不同而保持两表独立，`select_kimi_k3_backend` 仍读 SM103 表，既有行为与测试不动。**效果**：B200 多个 shape 优于 cuBLAS（如 7168x8448 26.19→20.81us、20480x7168 51.28→43.05us），TP16 shapes 增益 +33%-60%，B300 无变化；附 bf16 skinny GEMM 测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi K3 低延迟 decode GEMM kernel 路由扩展到 SM100，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "kimi-k3", "gemm", "sm100", "b200", "cute-dsl", "cublas", "kernel-selection"],
+      "pr_number": 53534
+    },
+    {
+      "sha": "bc39ded3c4e7b0453af76c617883e5cd88092222",
+      "comment": "**背景**：`TieringOffloadingManager` 的 request-level cascade 只保留主层 `lookup` 为 `HIT` 的 key，`HIT_PENDING`（key 已在主层但写入仍在途）被永久丢弃——`prepare_store` 已将其视为存在、`complete_store` 不会级联、cascade 又因不可读而剔除，scheduler 随后推进 `next_stored_chunk_idx` 越过该 chunk，再无路径提供该 key（#53062）；P2P producer 场景下对端只能等 `_LOAD_TIMEOUT_S` 超时后重算。**方法**：把 `HIT_PENDING` 视为「尚未」而非「永不」：将其 park 到 request 上，从 `on_schedule_end()` 每步重试一次（紧邻 `_flush_pending_promotions()`），任一 parked key 存在时暂缓请求 finalize；写入失败经 `complete_store(success=False)` 在下次重试解析为 `MISS`、成功解析为 `HIT`，park 集合自然有界无需超时，`has_pending_work()` 上报 parked keys 让引擎持续 tick。**效果**：三个新测试锁定行为（含 supply/defer/drop 行为表测试与写入失败驱逐测试）；该路径当前在 main 尚不可达（无二级层返回 `OffloadPolicy.REQUEST_LEVEL`），待 #52912 落地后才触达用户。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV 分层 offload 级联丢弃在途写入 key 的修复，属大规模服务 KV 管理范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "tiering", "cascade", "p2p", "scheduling"],
+      "pr_number": 53329
+    },
+    {
+      "sha": "80771bbbddf9e5153eea3aca8055049ee5aaaed1",
+      "comment": "**背景**：`VLLM_BATCH_INVARIANT=1` 单卡 bit 稳定，但 TP>1 下同一 byte 级相同负载重复运行会得到不同 logprobs（近并列时甚至不同 token，#51290）；根因是 FlashInfer 的融合 all-reduce+RMSNorm pass（`fuse_allreduce_rms`）在 TP 下归约顺序逐次运行不同，而它恰好在 Hopper/Blackwell + flashinfer + TP>1 时默认启用——正是 batch invariance 被期望成立的场景。**方法**：请求 batch invariance 时禁用该融合（8 行 early return），与 `ParallelConfig` 中既有的 `disable_custom_all_reduce = True` 守卫同构；TP=1 与非 batch-invariant 运行不受影响。禁用融合后 all-reduce 落回 #50505 钉住的确定性 1-stage 自定义路径（约 97% 吞吐），两 PR 互补把修复扩展到 Hopper/Blackwell（A100 因 cc<90 本就不受影响）。**效果**：同一负载对同一引擎跑 8 次输出 bit 级一致。",
+      "sig": "sig-core",
+      "sig_reason": "TP 下 batch invariance 被融合 all-reduce kernel 破坏的确定性修复，属核心配置范畴。",
+      "tags": ["bugfix", "low-risk", "batch-invariant", "determinism", "allreduce", "rmsnorm", "tensor-parallel", "flashinfer"],
+      "pr_number": 51292
+    },
+    {
+      "sha": "0e30bd62fedfad509e045b01e4aed1ef82ff6dbf",
+      "comment": "琐碎测试修复：`tests/models/kimi_k3/test_kda_metadata.py` 的 `test_internal_checkpoint_metadata_targets_last_aligned_boundary` 在 main 上失败（`AssertionError: Aligned Mamba state indices must be precomputed`），调整测试使其先行预计算对齐的 Mamba state indices，修复后 1 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "kimi_k3 模型测试断言失败修复，属 CI/测试范畴。",
+      "tags": ["ci", "low-risk", "test-fix", "kimi-k3", "mamba", "kda"],
+      "pr_number": 53766
+    },
+    {
+      "sha": "384d07969771a988eef0e2030ef6ac92b0e8b75e",
+      "comment": "**背景**：batch invariance（确定性）路径的 Triton kernel 在 Blackwell 上未做自动调优，配置保守导致延迟明显偏高。**方法**：为 Blackwell 平台的 batch invariance Triton kernel 引入 autotune 并实测选取配置，改动位于 `vllm/model_executor/determinism`。**效果**：`VLLM_BATCH_INVARIANT=1 vllm bench latency --model=Qwen/Qwen3-1.7B` 平均延迟从 0.770s 降至 0.576s，E2E 降低 33.6%，10%-99% 各分位一致改善；附 determinism 测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "batch invariance Triton kernel 在 Blackwell 的自动调优，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "triton", "autotune", "batch-invariant", "blackwell", "determinism", "latency"],
+      "pr_number": 53649
+    },
+    {
+      "sha": "e6cc0899b6e29ad613efae572eb98e0d776afe4d",
+      "comment": "**背景**：MRV2 的内存 profiling 在真实 KV cache 分配前捕获 CUDA graph 并在结束时丢弃，任何落入持久全局 graph pool 的捕获在释放时把 pool 的 use_count 打到 0，后续真实捕获重开该 pool 即触发 c10 allocator 的 `create_or_incref_pool` 内部断言（`use_count > 0 INTERNAL ASSERT FAILED`）；这是 #53306 之后 nightly B200 DeepSeek-V4-Flash（TP2+EP、fp8 KV、deepgemm mega-MoE、MTPx2）失败的根因（#53679）。**方法**：整个 profiling 阶段把平台的全局 graph pool 单例指向一次性 throwaway pool，使延迟绑定 pool 的对象（profiling 期间 `initialize_kv_cache` 里创建的 speculator cudagraph manager、捕获中途创建的 breakable-CG runner）天然落在 throwaway pool；对绑定更早的 piecewise wrapper 与 decoder manager 显式换池并在结束后还原，teardown 时丢弃全部 profiling 捕获。**效果**：GB200 以 nightly 同款配置复现——改前崩溃、改后引擎干净完成初始化；附 worker 测试。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 cudagraph 内存 profiling 污染全局 graph pool 的崩溃修复，属核心 worker 范畴。",
+      "tags": ["bugfix", "medium-risk", "cuda-graph", "memory-profiling", "model-runner-v2", "b200", "allocator", "crash"],
+      "pr_number": 53682
+    },
+    {
+      "sha": "c9331d8064808e3402ec79ae8631f48cebdc827a",
+      "comment": "**背景**：#52593 为修正内嵌包版本把 .git 绑进 Rust 构建，代价是 BuildKit checksum 随每次提交变化，昂贵的 Rust 全量编译缓存持续失效。**方法**：以稳定占位版本一次性编译全部 Rust 源（缓存命中与 Git 元数据无关），再在小的 Git-aware child stage 里仅重链接版本敏感的 crates（`vllm-build-info`、`vllm-server`、`vllm-bench`、`vllm-cmd`），保住精确包版本；覆盖 CUDA/CPU/XPU 三份 Dockerfile，附回归测试并更新生成的 stage 依赖图。**效果**：本地 CUDA 两段构建实测——全量编译 191.1s 只发生一次，Git-aware child 仅 80.4s；导出的 `vllm-rs` 报告精确版本 `0.26.1rc1.dev1041+gdf3b3422b` 且不含占位符。",
+      "sig": "sig-ci",
+      "sig_reason": "Rust Docker 构建缓存跨提交保留的 CI 基建优化，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "docker", "rust", "build-cache", "buildkit"],
+      "pr_number": 53290
+    },
+    {
+      "sha": "299ebd094a9cea1a16077dc2a4419192b85a777c",
+      "comment": "**背景**：畸形 base64 音频负载返回 HTTP 500，而同样负载作为图片返回 400——`AudioMediaIO.load_base64` 解码未开严格校验，pybase64 静默丢弃 base64 字母表外的字符并把残缺字节交给 libsndfile，抛出的 `LibsndfileError` 继承自 `RuntimeError`，`create_error_response` 落到 else 分支答 500；其余三类媒体 loader 均已传 `validate=True`（`binascii.Error` 是 `ValueError` 子类、映射 400），音频是最后一个遗漏。**方法**：`AudioMediaIO.load_base64` 解码时同样传 `validate=True`。**效果**：新增 `test_audio_media_io_load_base64_rejects_malformed`（合法负载掺入非字母表字符断言抛 `ValueError`），客户端上传损坏音频不再看到服务器错误、行为不再随媒体类型漂移；base64 合法但内容非媒体仍返 500 的问题留在 scope 外。",
+      "sig": "sig-omni",
+      "sig_reason": "base64 音频输入严格校验与 HTTP 状态码对齐修复，属多模态输入范畴。",
+      "tags": ["bugfix", "low-risk", "audio", "base64", "validation", "http-400", "multimodal"],
+      "pr_number": 53744
+    },
+    {
+      "sha": "7de96050c530009eb8e81065aea76570fc6ed15b",
+      "comment": "**背景**：adaptive DSpark 验证在 SM100 `FlashInferMLASparseTRTLLMBackend` 上启动即失败，两个独立原因：sparse-MLA 元数据构建器从 CPU query 边界派生 token-to-request 映射，而 adaptive 验证只在设备侧改变边界、不同步回 CPU；target CUDA graph 能力检查把 draft 模型的 FlashAttention 后端也算进来，但 draft attention 由自身 graph manager 捕获检查、从不消费 target 的 adaptive query 长度（#52785，#51303 系列扩展）。**方法**：新增 SM100 FlashInfer sparse-MLA 元数据构建器——从设备侧 query 边界派生 request IDs 并声明变长 CUDA graph 支持；把 target CUDA graph 与 query 长度兼容性检查收窄到 target attention 层（保留 draft prefill 所需的 draft groups）；新增 B300 真机 kernel 回归（GLM-5.2 维度，设备侧长度 `[1,7,3,5]` 对比故意过期的 CPU 长度 `[4,4,4,4]` 的 FlashInfer sparse MLA vs SDPA）与 draft-only group 排除单测。**效果**：`nvidia/GLM-5.2-NVFP4` + `RedHatAI/GLM-5.2-speculator.dspark` 在 4×B300 端到端可用，SPEED Bench 定性扫描（16K 上下文、512 输出、多并发点）零失败请求。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "adaptive DSpark 验证扩展到 SM100 稀疏 MLA 后端，属投机解码范畴。",
+      "tags": ["feature", "medium-risk", "spec-decode", "dspark", "adaptive-verification", "sparse-mla", "sm100", "cuda-graph", "flashinfer"],
+      "pr_number": 52783
+    },
+    {
+      "sha": "70021a0081cc10d8862f7458c36353b72ea9b5f4",
+      "comment": "类型清理：修复 `vllm/model_executor/models/` 下 g/G 开头 25 个文件的 143 处 mypy 错误（如 `glm_ocr_mtp.py` 的 `str | None` 赋值、`gemma4_unified.py` 的可空 embedder 与 `None` not callable），同步调整 `tools/pre_commit/mypy.py`；`pre-commit run --hook-stage manual mypy-3.13 -a` 由 Found 143 errors 变 Passed，无行为变化。",
+      "sig": "sig-core",
+      "sig_reason": "model_executor 模型实现的 mypy 类型修复，属核心代码质量范畴。",
+      "tags": ["cleanup", "low-risk", "mypy", "type-checking", "model-executor"],
+      "pr_number": 53616
+    },
+    {
+      "sha": "217a0b5cefec3f0f4a011cb498afcbf211f8bc25",
+      "comment": "**背景**：`VLLM_MAX_STOP_STRINGS`（#51447）限制单请求 stop string 数量以防采样器被无界工作压垮，但 Cohere Chat V2 端点未应用——`CohereChatV2Request.stop_sequences` 是普通 `list[str]`，直接传给 `SamplingParams` 且无任何计数，默认限制下 Anthropic 拒绝 1000 条 stop sequences 而 Cohere 照单全收；每个 stop string 都要在请求生命周期内每步与生成文本匹配，数量直接驱动每步开销。**方法**：与 `AnthropicMessagesRequest` 及共享 OpenAI 协议一致，把该字段包上 `Annotated[list[str], Field(max_length=envs.VLLM_MAX_STOP_STRINGS)]`。**效果**：新增 `test_stop_sequences_bounded_by_env_limit`（从 envs 读限制、恰好 N 条接受、N+1 条 `ValidationError`），Cohere 协议测试 21 passed。",
+      "sig": "sig-core",
+      "sig_reason": "Cohere 前端 stop string 数量上限补齐，属核心 API 协议范畴。",
+      "tags": ["bugfix", "low-risk", "cohere", "frontend", "stop-strings", "api-limit", "sampler"],
+      "pr_number": 53750
+    },
+    {
+      "sha": "3e833933dcaa8456ce8eb0541b8df06ffa8d06a3",
+      "comment": "**背景**：`RustFrontendProcessManager` 打印完整启动命令，其中 `--args-json` 以明文携带全部非默认参数——`VLLM_USE_RUST_FRONTEND=1` 时 `api_key` 与 `hf_token` 直接落入日志；#53625 已加 `_redact_sensitive_args` 修复 `log_non_default_args` 的同类泄漏，但这条自建日志行没有用上它。**方法**：构建该日志行时同样调用脱敏 helper（因两个模块共用而更名为 `redact_sensitive_args`）；子进程仍收到真实值，仅日志行变化。**效果**：新增 `test_rust_frontend_launch_log_redacts_credentials`（stub `subprocess.Popen`，断言 `--hf-token`/`--api-key` 值不落日志且日志行仍完整渲染），相关测试 23 passed；子进程 argv 中凭证对本地 `ps` 可见的问题需改 frontend 握手、留在 scope 外。",
+      "sig": "sig-core",
+      "sig_reason": "Rust frontend 启动日志凭证明文泄漏修复，属核心前端日志/安全范畴。",
+      "tags": ["security", "low-risk", "rust-frontend", "credentials", "redaction", "logging", "hf-token"],
+      "pr_number": 53738
+    },
+    {
+      "sha": "19406fae287380991908d2f27fe3975ba047147d",
+      "comment": "**背景**：`vllm/tokenizers/deepseek_v4_encoding.py` 仍用裸 `assert` 做校验（姊妹 encoder 已在 #32884 移除，V4 落地较晚又带回旧风格），两个后果：`AssertionError` 既非 `ValueError` 也非 `VLLMError`，空 `developer` 消息经 chat-template 路径返回 500 而非 V3.2 的 400；`python -O` 下 assert 全部消失，校验形同虚设。**方法**：五处断言全部改为 `ValueError`，措辞对齐 #32884 对 V3.2 的处理。**效果**：空 `developer` 内容返回 400 与 V3.2 一致；新增经 `apply_chat_template` 的可达路径测试与直调 `encode_messages` 的内部不变量测试，35 passed。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4 tokenizer 裸 assert 校验修复，属核心 tokenizer 范畴。",
+      "tags": ["bugfix", "low-risk", "deepseek", "tokenizer", "assert", "error-handling", "http-400"],
+      "pr_number": 53747
+    },
+    {
+      "sha": "3454335f7b64e31fd385e36eb590d76d08c84a92",
+      "comment": "**背景**：B12X 访问器此前用 `functools.cache` 包裹 `importlib.import_module`，TorchDynamo 会展开缓存函数并在内存 profiling forward 期间 trace 到 import 语句，导致 B12X linear kernel 只能配合编译模式 `NONE` 运行、开启 vLLM 模型编译即失败。**方法**：把 import 提前到 `vllm.utils.b12x` 模块加载时完成，运行时访问器只做字典查找，对 Dynamo 安全。**效果**：B12X linear kernel 可与 vLLM 模型编译（torch.compile）共同启用；新增 `test_b12x_module_lookup_is_dynamo_safe` 在 `fullgraph=True` 的 compile 函数内调用访问器并通过；仅改 import 时机，kernel 选择与模型输出不变。",
+      "sig": "sig-core",
+      "sig_reason": "B12X 模块 import 时机对 Dynamo/torch.compile 的兼容性修复，属核心工具范畴。",
+      "tags": ["bugfix", "low-risk", "b12x", "dynamo", "torch-compile", "import", "compilation"],
+      "pr_number": 53326
+    },
+    {
+      "sha": "bc11ecaf4e6aeaa0d6a18567d59d75a90207444e",
+      "comment": "CI 新增：为 AMD-Quark MXFP4 DeepSeek-V4-Flash checkpoint 注册 lm-eval-harness GSM8K 正确性测试——该模型在 ROCm 上经 `deepseek_v4_fp8` 路径 + AITER MXFP4 MoE 后端 + 融合 shared experts 服务（#48044 后续）；阈值取 4×MI350X 实测 0.95（AITER_MXFP4_BF16 strict 0.9545/flexible 0.9538，TRITON_UNFUSED 回退 0.9522/0.9515），依赖 harness 默认 `rtol=0.08` 的下界检查。",
+      "sig": "sig-ci",
+      "sig_reason": "AMD MXFP4 DeepSeek 的 GSM8K 精度 CI 门禁新增，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "gsm8k", "amd", "mxfp4", "deepseek", "lm-eval", "rocm"],
+      "pr_number": 50632
+    }
+  ]
+}
