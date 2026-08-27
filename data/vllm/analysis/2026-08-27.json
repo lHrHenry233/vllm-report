@@ -1,0 +1,112 @@
+{
+  "date": "2026-08-27",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-27T20:00:00+08:00",
+  "daily_summary": "当日 12 条变更以正确性修复为主轴，横跨工具调用协议、分布式引擎与 KV 传输。工具调用链路两处修复：GPT-OSS 的 strict tool-call grammar 放宽以接受真实 Harmony 渲染，chat 后处理对 tool call 参数 JSON 解析加守卫使历史中的畸形参数不再令会话不可恢复。分布式与引擎侧：#53311 引入的 all2all 默认后端变更在 L4/MI300 多个 nightly 上爆发后恢复 `allgather_reducescatter` 可移植默认，DP `pause_generation()` 完成处补设备屏障使返回时设备真正空闲，Rust frontend 修复 `LogprobsTensors` 五字段 wire schema 不匹配。性能与规模侧：Kimi K3 MTP `eh_proj` 启用 m=1/m=2 低延迟 GEMM（kernel 提升 12.9%~25.2%），ROCm AITER FP8 asm MLA prefill 扩展到非 16 因数头数并消除 K3 长上下文 OOM，MoRIIO 分离式 KV 的 RDMA 注册回归得到修复；另有 DeepSeek V4 死代码清理、Granite 3.1 batch invariance 文档更新与两条 Intel GPU CI 调整。",
+  "sig_summaries": {
+    "sig-core": "六条变更：GPT-OSS strict tool-call grammar 因约束过严拒绝模型实际产生的 Harmony 渲染，放宽后 BFCL 多轮基准恢复正常且测试改用真实渲染样本（#52222）；#53311 将 all2all 默认后端改为 `flashinfer_nvlink_one_sided` 后 L4 distributed、LoRA TP、MI300 DP、L4 PP+DP 四类 nightly 集体失败，现恢复 `allgather_reducescatter` 可移植默认并加单测钉住（#53952）；Rust `WireLogprobs` 补 `#[serde(default)]` 第五位置字段修复 `LogprobsTensors` wire schema 不匹配并拒绝非 `None` 未知值（#53939）；`_postprocess_messages` 对回放 tool call 参数的 JSON 解析加守卫，历史中截断的畸形参数不再摧毁整个会话（#48922）；DP pause 完成处加设备屏障，`pause_generation()` 返回不再依赖时序侥幸（#52914）；另移除 DeepSeek V4 attention 中无引用的 `_global_topk_output_buffers` 死代码（#53697）。",
+    "sig-spec-decode": "Kimi K3 MTP 模块的 `eh_proj` 投影此前用普通 `nn.Linear` 而非 `LinearBase`，未被 `enable_kimi_k3_low_latency_gemm` 覆盖；现接入低延迟 skinny GEMM 并启用 m=1/m=2 两种小 batch 形态，kernel 性能较 cuBLAS 提升 12.9%~25.2%，精度由现有单测覆盖（#53942）。",
+    "sig-quantization": "ROCm AITER FP8 asm MLA prefill 路径以 `num_heads % 16 == 0` 为门槛，Kimi-K3 TP8 每卡 12 头只能回退 BF16 FMHA 解压路径，长上下文时 bf16 工作集耗尽 activation arena（约 197k token 处 OOM 而 KV 池用量不足 4%）；现填充 query 头到 16 再精确切片回、以 FP8 KV 为启用条件，并将 `num_head_k` 提到 16 减少 partial tiles 回收约 6 GiB PS workspace（#51040）。",
+    "sig-large-scale-serving": "MoRIIO 共享 KV 内存区注册回归修复：#51718 改为单共享 GPU buffer + 逐层 view 后，MoRIIO 仍按层 view 注册 RDMA，view 不按页对齐导致 `RegisterRdmaMemoryRegion errno:22` 失败、KV 写错地址，分离式 prefill/decode 在 nightly 上完全损坏（GSM8K 约 0/1319）；现对 backing 做 4KB 页对齐填充、整 buffer 注册单一 MR、按层记录偏移并缓存 WRITE 传输计划，DeepSeek-V3 TP8 1P1D 恢复正常（#53698）。",
+    "sig-ci": "两条 Intel GPU CI 调整：`tests/v1/kv_connector` 的 `extract_hidden_states` tp2 用例超时 120s→240s 缓解波动（#53862）；`lora/test_default_mm_loras.py` 的 5 个 LoRA Multimodal 用例因 B50 显存 OOM 迁至 B70 运行（#53841）。",
+    "other": "文档更新：Granite 3.1 系列（MoE 的 `GraniteMoeForCausalLM` 与 dense 的 `GraniteForCausalLM`）加入 batch invariance 已验证模型清单；H800 上 TP1/bf16 实测 dense 模型 19/19 全过、两个 MoE 模型仅负向控制（关闭 batch invariance 后仍 bitwise 一致）一例失败，与 #27433 相关（#53650）。"
+  },
+  "commits": [
+    {
+      "sha": "51d1b45182a1e9273ef19d2cbfb62055d3aee20f",
+      "comment": "**背景**：GPT-OSS 的 strict tool-call grammar 约束过严，会拒绝模型实际产生的合法 Harmony 渲染——这是在维护 BFCL 基准性能时发现的 bug，本 PR 是 #51020 的重做。**方法**：放宽 grammar 中过于严格的约束使其接受真实 Harmony 渲染（`vllm/parser/harmony.py`，+111/-81），并把测试样本从手写改为尽可能使用真实 Harmony 渲染。**效果**：64 个 harmony 测试全部通过；strict tool call 下 BFCL 多轮基准 multi_turn_base 54.50%、long_context 33.50%、miss_func 44.50%、miss_param 45.00%。",
+      "sig": "sig-core",
+      "sig_reason": "GPT-OSS Harmony 解析器的 strict tool-call grammar 修复，属核心工具调用/结构化输出范畴。",
+      "tags": ["bugfix", "medium-risk", "gpt-oss", "harmony", "tool-call", "grammar", "parser", "bfcl"],
+      "pr_number": 52222
+    },
+    {
+      "sha": "d1e5e66ee30ba4bc020ac8e14b05e7a8c41b9302",
+      "comment": "**背景**：#53311 把 all2all 默认后端改为 `flashinfer_nvlink_one_sided`，但其选定 CI 只覆盖 4 个 H200 job，随后多个 nightly 配置失败：L4 distributed 报 `No Unquantized MoE backend supports the deployment configuration`、L4 LoRA TP 报 fused MoE LoRA with EP 仅支持 `allgather_reducescatter`、MI300 DP 上 PowerMoE 引擎反复初始化失败（one-sided 后端不可用）、L4 PP+DP 上默认 one-sided manager 未实现 PP dispatch 路径。**方法**：恢复 `allgather_reducescatter` 为可移植默认（+5/-1），用户仍可显式选择 `flashinfer_nvlink_one_sided`，并新增单元测试钉住该默认值。**效果**：四类失败的 nightly 配置恢复正常。",
+      "sig": "sig-core",
+      "sig_reason": "all2all 默认后端配置回归的修复，属核心分布式配置范畴。",
+      "tags": ["bugfix", "low-risk", "all2all", "allgather-reducescatter", "parallel-config", "distributed", "regression", "ci-failure"],
+      "pr_number": 53952
+    },
+    {
+      "sha": "3fd72ffd7b78bc80f249cdfc28d67177dbab2b56",
+      "comment": "**背景**：#52242 给 Python 侧 `LogprobsTensors` 增加了第五个位置字段 `cu_num_generated_tokens_tensor`，而 `NamedTuple` 序列化即使值为 `None` 也会带上全部位置字段，导致序列化结果有五个元素，Rust 侧 `WireLogprobs` 仍按 `Deserialize_tuple` 期望四个字段，产生 wire schema 不匹配（#53932）。**方法**：给 `WireLogprobs` 追加带 `#[serde(default)]` 的可选第五字段以兼容既有四字段负载；在 `resolve()` 中拒绝非 `None` 的第五值而非静默接收当前解码器不处理的数据（错误信息不含该 opaque 值以防携带完整 tensor payload）；文档化位置 wire 兼容性要求。同时核对其他解码 Python 输出的 Rust tuple 类型——`EngineCoreOutputs` 8/8、`EngineCoreOutput` 17/17、`UtilityOutput` 3/3 均已匹配，`WireLogprobs` 是唯一不匹配处。**效果**：与直接 revert #52242 的 #53886 不同，本 PR 保留 #52242 并落地其自身推荐的更窄 Rust 侧修复；新增两个回归测试（五字段 `Nil` 解码成功、非 `Nil` 被拒绝），既有四字段用例继续通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust frontend 引擎输出 wire schema 兼容性修复，属核心 Rust frontend 范畴。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "logprobs", "wire-schema", "serde", "deserialization", "namedtuple"],
+      "pr_number": 53939
+    },
+    {
+      "sha": "a27e88c8627bcdd86f1cd35e0c84830944ad5b3c",
+      "comment": "琐碎 CI 调整：将 `tests/v1/kv_connector` 中 `extract_hidden_states` tp2 用例的超时从 120s 提高到 240s，缓解 XPU CI 上的超时波动。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU CI 测试超时阈值调整，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "xpu", "test-timeout", "kv-connector", "tp2"],
+      "pr_number": 53862
+    },
+    {
+      "sha": "f18d0ba90d972a852a351c98be3f42b31372cfe4",
+      "comment": "文档更新：将 Granite 3.1 系列（MoE 的 `GraniteMoeForCausalLM` top-8 路由与 dense 的 `GraniteForCausalLM`）加入 batch invariance 已验证模型清单（`docs/features/batch_invariance.md`，与 #27433 相关）。验证环境为 H800、TP1、bfloat16，跨 `FLASH_ATTN`/`TRITON_ATTN`/`FLEX_ATTENTION` 三后端：两个 dense 模型 19/19 全过，两个 MoE 模型 18 过 1 败——唯一失败是负向控制（关闭 batch invariance 后期望出现差异，但 MoE 在 FLEX_ATTENTION 下仍 bitwise 一致），属模型相关的控制测试特性而非缺陷。",
+      "sig": "other",
+      "sig_reason": "纯文档更新，仅扩充 batch invariance 已验证模型清单。",
+      "tags": ["docs", "low-risk", "batch-invariance", "granite", "model-validation", "determinism"],
+      "pr_number": 53650
+    },
+    {
+      "sha": "76cfe1cd88d30d525eec8be5bff75f8b77471c88",
+      "comment": "**背景**：Kimi K3 MTP 模块的 `eh_proj` 投影此前用普通 `nn.Linear` 而非 `LinearBase`，因此未被 `enable_kimi_k3_low_latency_gemm` 覆盖，m=1/m=2 的小 batch 低延迟 skinny GEMM 路径从未启用。**方法**：使 `eh_proj` 接入低延迟 GEMM 路径并启用 m=1 与 m=2 两种形态（N=7168、K=14336），附 bf16 skinny GEMM 测试。**效果**：相对 cuBLAS，`eh_proj` kernel 性能提升 12.9%~25.2%；数值精度由现有单测覆盖。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "Kimi K3 MTP（投机解码 draft 模块）eh_proj 投影的低延迟 GEMM 性能优化，属投机解码范畴。",
+      "tags": ["perf", "low-risk", "kimi-k3", "mtp", "eh-proj", "skinny-gemm", "low-latency-gemm", "cute-dsl"],
+      "pr_number": 53942
+    },
+    {
+      "sha": "161ffd37d207e7def333f07f650e90c67b8bd43b",
+      "comment": "**背景**：`vllm/entrypoints/chat_utils.py` 的 `_postprocess_messages` 会重新解析客户端回放的每条 assistant tool call 的 `arguments` 字符串且无守卫，一旦该值不是合法 JSON 对象整个请求即崩溃（#47761）；关键在于坏值存在于对话历史中，客户端每轮重放同一 assistant 消息、每轮收到同样错误，会话不可恢复只能丢弃。两条独立触发路径机制完全一致（报错偏移恰为未闭合引号位置）：Qwen3.6-35B 在 Chat Completions 流式下因 `max_tokens` 截断在字符串中间（18K/37K 字符负载）、DeepSeek-V4-Flash 在 Responses Simple 路径下于 EOS 停止时字符串仍未闭合（54 字节）；无任何单一上游修复能同时覆盖两条路径，`_postprocess_messages` 是唯一汇聚点。**方法**：在该汇聚点对 tool call 参数的 JSON 解析加守卫，解析失败不再以异常打断请求。**效果**：畸形参数不再摧毁请求与会话（+154/-3，附入口单测），对 vLLM 自身生成的截断输出具备韧性。",
+      "sig": "sig-core",
+      "sig_reason": "chat 消息后处理对 tool call 参数 JSON 解析的健壮性修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "tool-call", "chat-api", "json-parsing", "postprocessing", "error-handling", "conversation-history"],
+      "pr_number": 48922
+    },
+    {
+      "sha": "00ca27d0c1ca8c10caee9f00dd86a6fed3dd3769",
+      "comment": "琐碎 CI 调整：`lora/test_default_mm_loras.py` 的 5 个 LoRA Multimodal 用例在 Intel B50 上 OOM（RuntimeError），将其从 B50 迁移到显存更大的 B70 运行（`.buildkite/intel_jobs/lora_intel.yaml`）。",
+      "sig": "sig-ci",
+      "sig_reason": "Intel GPU CI 测试机型分配调整，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "xpu", "intel", "lora", "multimodal", "oom", "buildkite"],
+      "pr_number": 53841
+    },
+    {
+      "sha": "0a5ad6f0d42c1ace54f27d7dd6a852be86e42148",
+      "comment": "死代码清理：移除 `DeepseekV4Attention` 中无任何调用方的 `_global_topk_output_buffers` 方法（-7 行）——它引用了 eager workspace 复用优化被 revert 时已删除的 `self.eager_scratch_pool`，后在 KV-cache layout 重构中被意外重新带回；全仓搜索无引用，不影响模型输出、精度或服务行为。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4 模型实现中的无引用死代码清理，属核心模型代码质量范畴。",
+      "tags": ["cleanup", "low-risk", "deepseek-v4", "dead-code", "attention", "kv-cache-layout"],
+      "pr_number": 53697
+    },
+    {
+      "sha": "1a085dadf254b7cb2b5f904747a5750256d413fa",
+      "comment": "**背景**：AITER FP8 MLA prefill 路径（`mla_prefill_ps_asm_fwd` + `mla_reduce_v1`）以 `num_heads % 16 == 0` 为门槛；Kimi-K3 共 96 头、`kv_lora_rank=512`，TP8 下每卡 12 头非 16 的因数，FP8 prefill 只能回退 BF16 FMHA 解压路径——该回退构建的 bf16 工作集不在 FP8 KV 池记账内，长上下文时耗尽 activation arena（K3 在约 197k token 处 OOM 而 KV 池用量不足 4%）；这是 #50578（decode 侧 pad 12→16）的 prefill 对应。**方法**：放宽 `_fp8_prefill_enabled` 门槛允许 `0 < num_heads < 16` 并以 FP8 KV 为启用条件（bf16 KV 服务不再无谓预留 PS workspace）；在 `_mla_fp8_prefill_attn` 中用 `AiterMLAHelper.get_mla_padded_q` 将 Q/K/V 复制填充到 16 头、按 16 头跑 PS asm prefill + `mla_reduce_v1` 后切片回 `num_heads`（MLA 各 query 头对共享 latent KV 独立，填充精确无损）；置 `num_head_k = max(16, num_heads)` 使 work/reduce map 匹配填充张量并减少 partial tiles（`gcd(16,256)=16` 对 `gcd(12,256)=4`），回收约 6 GiB PS workspace。**效果**：K3 TP8 的 ROCm FP8 prefill 不再回退 BF16 路径，长上下文 activation arena OOM 消除；依赖已合并的 ROCm/aiter#4452（64 位 paged-KV 字节偏移）与 #50578，附 attention kernel 测试。",
+      "sig": "sig-quantization",
+      "sig_reason": "ROCm FP8 量化 MLA prefill 路径向非因数头数的扩展，属量化范畴。",
+      "tags": ["feature", "medium-risk", "rocm", "aiter", "fp8", "mla", "kimi-k3", "prefill", "head-padding", "oom"],
+      "pr_number": 51040
+    },
+    {
+      "sha": "17da48596c98946d3e3e6896e2ebd341e809f3bd",
+      "comment": "**背景**：`pause_generation()` 在设备真正空闲前就 resolve（#51476 第三问），且 DP 下 pause 路径本身就是让设备忙碌的来源：pause future 依据 CPU 侧 `has_work()` 与 gloo CPU all-reduce 共识判完成，全程不碰 CUDA stream；`DPEngineCoreProc._pause_complete` 强制每 rank 发射 dummy forward，最后一批 dummy 在共识迭代中启动、不在 `batch_queue` 里、对 `has_work()` 不可见，future resolve 时它可能仍在执行——RL 调用方 pause 后自行跑权重同步 kernel/NCCL 再 sleep，与引擎最后发射的工作竞态，此前仅靠 pause 与 sleep 之间约 0.5s 的偶然间隔幸存；实测（DP=2+EP、PowerMoE-3b、dummy batch 膨胀到约 110ms）空闲引擎上 `pause_generation()` 耗时 3.40s 且返回时设备仍在忙。**方法**：在 pause 完成处加设备屏障——`WorkerBase.synchronize_device()` 在注册了 accelerator 时经设备通用的 `torch.accelerator` API 同步（与 `sleep()` 依赖的同一屏障）。**效果**：无论在途工作量多少，pause 完成契约均正确成立、不再依赖时序侥幸（+164/-8，附 distributed/engine 测试）；与移除 DP dummy-batch 突发的独立姊妹 PR #52957 互补。",
+      "sig": "sig-core",
+      "sig_reason": "DP 引擎 pause 完成语义的设备同步修复，属核心 engine core/worker 范畴。",
+      "tags": ["bugfix", "medium-risk", "data-parallel", "pause-generation", "device-synchronization", "engine-core", "rl", "dummy-batch"],
+      "pr_number": 52914
+    },
+    {
+      "sha": "8d301f075b970427ae2486194f3694cdc04fde71",
+      "comment": "**背景**：#51718 让 MLA 模型把全部 KV 层放进一个共享 GPU buffer、各层作为其 view；MoRIIO 未同步更新，仍按层 view 注册 RDMA，而 view 不按页对齐导致 `RegisterRdmaMemoryRegion errno:22` 失败、KV 被拷贝到错误地址，MoRIIO 分离式 prefill/decode 在 nightly 上完全损坏（GSM8K 约 0/1319）。**方法**：对共享 KV backing 做 4KB 页对齐填充（`vllm/v1/worker/utils.py`）；对整个 buffer 注册单一页对齐 RDMA memory region 替代逐层 view（`moriio_connector.py`）；prefill 与 decode 两侧记录每层在该 MR 内的字节偏移；WRITE 传输路径应用这些偏移并按层缓存传输计划（`moriio_engine.py`）。**效果**：DeepSeek-V3 TP8 1P1D（proxy、`vllm-openai-rocm:nightly`、fp8 KV）分离式服务恢复正常（+97/-31，附 kv_connector 测试）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MoRIIO 分离式 prefill/decode 的 KV 传输 RDMA 内存注册回归修复，属大规模服务范畴。",
+      "tags": ["bugfix", "medium-risk", "rocm", "disagg", "moriio", "rdma", "kv-transfer", "kv-cache", "prefill-decode", "regression"],
+      "pr_number": 53698
+    }
+  ]
+}
