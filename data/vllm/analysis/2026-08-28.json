@@ -1,0 +1,233 @@
+{
+  "date": "2026-08-28",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-28T20:00:00+08:00",
+  "daily_summary": "当日 27 条变更中，模型性能侧形成 Kimi-K3 低延迟 GEMM 专项：修复 `fused_q_kv_rmsnorm` 输出在单序列 decode 时继承父缓冲行 stride、导致 `q_b_proj` 每步静默回退 cuBLAS 的隐性性能 bug（TP8 下每步最多多耗约 150 µs），将 MLA 门控 `g_proj` 合并进 QKV-A 投影为 fused AG-GEMM 铺路，并对 Hopper 低延迟 GEMM kernel 调优（提升 4%~97%）。架构里程碑是 MRV2 成为除 ROCm 个别模型外所有模型的默认 model runner。正确性修复密集：KV cache 外部 computed block 负数分配、groupwise RMSNorm 量化 kernel 的 shared-memory race、Humming MoE workspace 别名引起的 Kimi-K3 精度损失、多模态 renderer 预热与 engine-core fork 的死锁回退，以及 Rust gRPC LoRA 路径 allowlist 绕过。新能力包括 FlashInfer BF16 CuTeDSL 低延迟 GEMM 的 opt-in 集成、FlashInfer 原生 CP mask 使 MLA decode 支持 DCP、GLM-5 256/256 头维度启用 masked MHA prefill、dflash2 与 96 头 DSpark draft 配置支持；CI 侧新增 opt-in 的 Rubin Docker 构建路径。",
+  "sig_summaries": {
+    "sig-core": "九条变更。MRV2 成为除 ROCm 个别模型（DeepSeek V3.2/V4 留在编译 MRV1 路径）外所有模型的默认 model runner，MRV2 尚不支持的特性仍回退 MRV1（#53183）；KV cache 修复外部 computed block 负数分配——投机分配被拒后请求块数可超最终所需，负数请求使 `FreeKVCacheBlockQueue.num_free_blocks` 虚增而链表未摘节点、后续 pop 可越尾（#52707）；MRV2 将 `kv_cache` 内存池限定为 backing 分配，持久元数据不再在 level-1 sleep 中丢失（#53508）；revert #52764 恢复同步多模态 renderer 预热，消除 Whisper 预处理线程与 engine-core fork 的死锁（#54023）；reasoning-end 检测以 turn 边界 token 限定到当前轮，历史 `</think>` 不再污染新轮 reasoning 路由与 grammar bitmask（#54089）。Rust frontend 两项：gRPC `LoadLora` 补齐 HTTP 侧的 LoRA 源路径 allowlist 校验（#53756）、对齐七类 OpenAI 请求/响应边缘行为（#53218）；另有 Ray 引擎 TCPStore 端口碰撞修复（#53666）与 Responses API 畸形 namespace tools 改返 400（#53763）。",
+    "sig-model-performance": "Kimi-K3 低延迟 GEMM 专项三连：`fused_q_kv_rmsnorm` 显式分配 packed row-major 输出，修复单序列 decode 时 `q_b_proj` 因继承父缓冲行 stride 被低延迟 GEMM 分发拒绝、每步静默回退 cuBLAS 的性能 bug（#53109）；MLA 门控 `g_proj` 合并进 QKV-A 投影，bs<512 保留 side stream 权重切片路径、为 SP 的 fused AG-GEMM 铺路（#54015）；Hopper 低延迟 GEMM kernel 调优提升 4%~97%（#54088）。Humming MoE 两项：修复 workspace 别名（`activation_output` 残留使 `gate_up_output` 与 `quanted_down_input` 同槽）恢复 Kimi-K3 GSM8K 至 0.968（#54056）、换用原生 CUDA SwiGLU clamp kernel 使 DSv4 吞吐 +1.40%（#53685）。另有 FlashInfer BF16 CuTeDSL 低延迟 GEMM 集成为 opt-in `--linear-backend`（SM100，#50572）、GLM-5 256/256 头维度启用 masked MHA prefill 并配基准驱动路由阈值（#53785）、GDN decode 声明移入正确预处理守卫修复 Ampere 编译（#52743）。",
+    "sig-spec-decode": "dflash2 draft 模型支持以 speculators 格式加载，config 内 `dflash2` 覆写为 `dflash` 以符合 vllm 命名惯例（#53797）；`K3DSparkConfig` 改继承 `DeepseekV3Config`，避免 MHA-only 的 `hidden_size % num_attention_heads == 0` 校验在解析期拒绝 96 头的 Kimi-K3-DSpark-Block5（#54005）；adaptive verification 的兼容性检查（LoRA/enforce_eager/PP）从 MRV1 fallback 逻辑拆分为独立的 `_validate_adaptive_verification()`（#54108）。",
+    "sig-quantization": "groupwise RMSNorm 量化 kernel 修复 `warpReduceMaxSpecialized` 的 shared-memory race——各 reduction stage 无同步读取前一 stage 其他 lane 的写入，H200 CI 上引发 flaky，现改为寄存器 warp shuffle 仅回写 lane-0 结果，group-64 INT8 cold-L2 快 15%（#54111）；ROCm DeepSeek-V4 SWA 路径以单一 aiter HIP kernel 融合 q/kv RMSNorm 与 q 的 per-1x128 FP8 组量化，热路径 2 次 launch 减为 1 次、该段快 2.90x，attention 与 indexer 的 `wq_b` 直接消费预量化结果（#53540）。",
+    "sig-large-scale-serving": "MLA decode 的 DCP 支持改用 FlashInfer 0.6.17 CuTeDSL kernel 的原生 context-parallel masking（限 CuTeDSL 路径），接替此前已移除的手工 DSpark/DCP 展平；Kimi-K3 DCP8-DCP8 P/D 分离 + EAGLE3 下 DeepSWE 77/113 通过（68.14%）、加权 EAGLE 接受率 53.52%（#54012）。",
+    "sig-ci": "移除误加的 GSM8K e2e 测试（#54099）；tpu-inference 升级到 v0.28.0（#54020）；新增 opt-in 的 Rubin（SM107）Docker 构建路径——`INSTALL_RUBIN_PRERELEASE=true` 的 CUDA 13.4/13.5 构建、版本感知 ptxas 处理与通用源码 Triton 构建脚本，默认关闭不影响标准 Blackwell 镜像（#53443）。",
+    "other": "EXAONE 4.0 系列加入 batch invariance 已验证模型清单（#27433 系列）：1.2B 在 RTX 4090 与 H200 上 19/19 全过（含 FLEX_ATTENTION），两个 32B checkpoint 的 5 个失败均为 FLEX_ATTENTION 引擎初始化期 Dynamo recompile limit 超限、而非确定性断言失败（#53839）。"
+  },
+  "commits": [
+    {
+      "sha": "53bf99050213da20fe29bb6dbb49eed5fad813dc",
+      "comment": "**背景**：`allocate_external_computed_blocks()` 把 `ceil(total_computed_tokens / block_size) - len(request_blocks)` 直接传给 block pool；投机分配被拒后 `len(request_blocks)` 可能大于最终 computed-token 数所需，该值为负。`BlockPool.get_new_blocks()` 只拒绝大于空闲数的请求，而 `popleft_n()` 会减去负数并迭代 `range(负数)`，导致 `FreeKVCacheBlockQueue.num_free_blocks` 在未摘除任何链表节点的情况下虚增，后续合法 pop 可越过链表尾。**方法**：当请求已持有的块数超过其最终 computed-token 数所需时，将外部 computed-block 分配钳制在零；新增投机超额分配后外部 computed-token 数变小的回归测试。**效果**：空闲块计数不再被污染（Kimi-K3 外部 KV 长跑负载为待复验项）；`test_single_type_kv_cache_manager.py` 12 项通过。",
+      "sig": "sig-core",
+      "sig_reason": "KV cache block pool 外部 computed block 负数分配的内存记账修复，属核心 KV cache 管理范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-cache", "block-pool", "external-computed-blocks", "negative-allocation", "regression-test"],
+      "pr_number": 52707
+    },
+    {
+      "sha": "b74ac0bc61d8b8f74848664b1a3b4e878f047861",
+      "comment": "**背景**：`fused_q_kv_rmsnorm` 用 `torch.empty_like(qr)` 分配输出，但 `qr`/`kv` 是融合 `qkv_a` 投影输出的列切片；PyTorch 保留 size-1 维的 stride，`num_tokens == 1`（单序列 decode）时 `empty_like` 返回携带父缓冲行 stride 的张量（如 `[1,1536]` 切片的 stride 为 `(2112,1)`），`low_latency_gemm._is_packed_row_major` 拒绝后 `q_b_proj` 在每个 decode step 静默回退 `F.linear`/cuBLAS；`num_tokens >= 2` 恰好产生 packed stride，故 prefill 与批量基准从未暴露。在 148 SM 的 SM103 机器上 cuBLAS 启发式对该 GEMM 选出约 10.9 µs/call 的 kernel（预期 `dsv3_fused_a` 仅 4.5 µs），TP8 下 Kimi-K3 的 24 个 MLA 层每 decode step 多耗约 150 µs，且代价随机器而异、易被漏检。**方法**：在 `vllm/models/common/ops/fused_qk_rmsnorm.py` 显式分配 packed row-major 输出；新增测试在 `num_tokens ∈ {1,16}` 下以真实列切片调用模式断言 packed stride 与数值正确性。**效果**：`q_b_proj` 在 decode 期间保持低延迟 GEMM 路径，packed 输出对所有下游消费者严格更优。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 MLA decode 低延迟 GEMM 路径的静默性能回退修复，属模型性能范畴。",
+      "tags": ["bugfix", "low-risk", "kimi-k3", "mla", "fused-q-kv-rmsnorm", "low-latency-gemm", "stride", "decode", "silent-perf-regression"],
+      "pr_number": 53109
+    },
+    {
+      "sha": "f3b91f1af2e27a267b0f7fdc3baba545765ff96a",
+      "comment": "琐碎清理：移除此前误加入的 GSM8K e2e 测试（`tests/evals/gsm8k`，-12 行）。",
+      "sig": "sig-ci",
+      "sig_reason": "误加测试文件的移除，属测试/CI 维护范畴。",
+      "tags": ["cleanup", "low-risk", "test-removal", "gsm8k", "e2e"],
+      "pr_number": 54099
+    },
+    {
+      "sha": "8cfba696eef712edbdc4b02aafd5ac73a818736d",
+      "comment": "**背景**：adaptive verification（自适应验证）的兼容性检查（不兼容 LoRA、不兼容 `enforce_eager`/`cudagraph_mode=none`、不兼容 PP>1）此前混在 MRV1 fallback 的 unsupported 特性列表构建逻辑里。**方法**：拆分为独立的 `_validate_adaptive_verification()`，启用时对任意 runner 直接抛 `ValueError`；MRV1 的 unsupported 列表改为整体声明 adaptive draft verification 不支持（`vllm/config/vllm.py`，+36/-30）。**效果**：配置校验职责分离、语义不变。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "DSpark 自适应验证（投机解码特性）的配置校验重构，属投机解码范畴。",
+      "tags": ["refactor", "low-risk", "adaptive-verification", "config-validation", "spec-decode", "mrv1"],
+      "pr_number": 54108
+    },
+    {
+      "sha": "5bbc58c0ad0fec0e836f2ace6c61659f60328339",
+      "comment": "**背景**：H200 kernel CI 上三处 flaky 的融合量化 RMSNorm 失败：两处 group-64 scale 失败源于 `warpReduceMaxSpecialized` 中真实的 shared-memory race——每个 reduction stage 无同步地读取前一 stage 其他 lane 写入的值，CUDA racecheck 报告数千个 hazard；剩余一处 CUDA BF16 per-token FP8 用例中 2,103,296 个值恰有一个孤立的 E4M3 单 ULP 差异。**方法**：用基于寄存器的 warp shuffle 替换该 reduction、仅将最终 lane-0 结果写回 shared memory（同时支持 CUDA warp-32 与 ROCm wave-32/wave-64，以及贡献数多于/少于 warp 宽度的组）；scale 比较保持严格，仅对该特定 CUDA/BF16/per-token/FP8 配置允许有界的孤立单 ULP 输出差异。**效果**：race 消除；H200 实测 BF16+residual group-64 INT8 融合算子 cold-L2 22.82→19.39 µs（快 15.0%）、hot CUDA graph 17.81→14.36 µs。",
+      "sig": "sig-quantization",
+      "sig_reason": "融合 RMSNorm+量化 kernel 的 shared-memory race 修复，属量化范畴。",
+      "tags": ["bugfix", "medium-risk", "cuda-kernel", "rmsnorm-quant", "warp-reduction", "race-condition", "flaky-test", "group-quant", "h200", "rocm"],
+      "pr_number": 54111
+    },
+    {
+      "sha": "6ec92bcbc8ef9af25cb4834ba3d922115792fbeb",
+      "comment": "**背景**：Kimi-K3 MLA 的 `g_proj`（输出门控）与 QKV_a 是两个独立 GEMM；合并成更大 GEMM 本身收益有限（原 QKV_a 已很大），主要目的是为即将到来、用于 SP 的 fused AG-GEMM 铺路——后者显著受益于更大的 GEMM。复杂点在于既有低延迟优化：`bs<512` 时 `g_proj` 在 side stream 上与 `qkv_a_proj`+MLA 重叠，实测 bs=1 时该 side-stream 优化比合并后的 `qkv_a_g` GEMM 更快，必须保留。**方法**：Q low-rank（Kimi-K3）路径下，`bs<512` 且 BF16 权重时对权重切片、维持 `(qkv_a+MLA) || (g)` 的 side stream 布局（量化权重需同步切 scale factor 并手动分发 GEMM 函数）；否则用合并 GEMM 替代顺序基线；Q full rank（Kimi-Linear）不变。**效果**：GB300 TP8 上 GSM8K 0.9636、OCRBench 89.4 持平；限制：仅支持 BF16 权重切片，`nvidia/Kimi-K3-NVFP4` 等第三方量化在 side stream 场景被禁用（可能影响其低延迟性能），`bs<512` 阈值沿用未重调。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 MLA 投影 GEMM 合并与 side stream 权重切片的性能优化，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "kimi-k3", "mla", "g-proj", "qkv-a", "gemm-fusion", "side-stream", "weight-slicing", "sp", "ag-gemm"],
+      "pr_number": 54015
+    },
+    {
+      "sha": "b2a6e9dca0c2e62142b96adafceb99fbeb3e60c3",
+      "comment": "**背景**：`fused_gdn_decode_post_conv_mtp` 在 `csrc/libtorch_stable/ops.h` 中被误置于 `VLLM_ENABLE_FUSED_KDA_DECODE` 预处理块内；KDA 限 SM90+（Hopper）以上，而 GDN 在 Ampere（SM 8.6）上受支持，导致 pre-Hopper 架构上 `torch_bindings.cpp` 尝试绑定 GDN 函数时声明缺失、源码编译失败（`fused_gdn_decode_post_conv_mtp was not declared in this scope`）。**方法**：把该声明移出 KDA 块、置于正确的 `VLLM_ENABLE_FUSED_GDN_DECODE` 守卫下（+3/-0）。**效果**：Ampere SM 8.6 系统 `pip install -e .` 编译安装成功。",
+      "sig": "sig-model-performance",
+      "sig_reason": "GDN 融合 decode kernel 声明的预处理守卫修正，属 kernel 构建修复范畴。",
+      "tags": ["bugfix", "low-risk", "build", "gdn", "kda", "ampere", "preprocessor-guard", "csrc"],
+      "pr_number": 52743
+    },
+    {
+      "sha": "d04d3e0a076b7411b6e8ff4b36b4ffb23665179b",
+      "comment": "**背景**：#52764 让多模态 renderer 预热与 engine-core 初始化重叠以缩短启动时间，但引入不安全的 fork 重叠：活跃 Python 后台线程做 multimodal 处理时主线程 fork engine-core 进程。主 build #85765 在 H200 与 MI300 的 `multi-modal-models-standard-4-other-whisper` 任务上复现同一启动挂起——H200 上 `test_moss_audio_generation_smoke` 解析 `MossAudioModel` 后 75 分钟无进展直至超时，MI300 栈显示预热 worker 卡在 Whisper 频谱预处理、主线程在 `multiprocessing.popen_fork`。**方法**：revert #52764（+24/-345），恢复 engine-core 初始化完成后的同步多模态 renderer 预热。**效果**：H200/MI300 whisper 任务的启动挂起消除。",
+      "sig": "sig-core",
+      "sig_reason": "多模态 renderer 预热与 engine-core fork 死锁的回退修复，属核心引擎启动范畴。",
+      "tags": ["bugfix", "low-risk", "revert", "renderer-warmup", "fork-deadlock", "multimodal", "whisper", "engine-core", "startup"],
+      "pr_number": 54023
+    },
+    {
+      "sha": "3cc015acd265d0e4e4c9d0a73bf7e5d5a5e66eef",
+      "comment": "**背景**：`VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES` 的 LoRA 源路径校验此前只在 HTTP 路由实施，gRPC `LoadLora` 可绕过 allowlist（#52840 评审的后续）。**方法**：把前缀解析、本地路径检测、规范化与 allowed-prefix 检查从 HTTP 路由移入共享 LoRA 模块；在 `LoraManager::load_lora` 内、registry 锁/ID 分配/engine 调用之前校验路径；gRPC 无效路径映射 `InvalidArgument`、无效服务器配置映射 `Internal`；保留远程 Hugging Face 仓库标识符并规范化本地路径，同时迁移并扩展路径策略与 gRPC LoRA 生命周期测试。**效果**：HTTP 与 gRPC 两种传输强制同一运行时 LoRA 源路径策略；vllm-server 344 项测试通过（含绕过回归测试）。",
+      "sig": "sig-core",
+      "sig_reason": "Rust frontend gRPC LoRA 路径 allowlist 绕过的修复，属核心 Rust frontend 范畴。",
+      "tags": ["bugfix", "medium-risk", "rust-frontend", "grpc", "lora", "path-validation", "allowlist", "security"],
+      "pr_number": 53756
+    },
+    {
+      "sha": "e5377e6727454f50d15d8b6225f84b76a8dee5f6",
+      "comment": "**背景**：`K3DSparkConfig` 继承 `DeepseekV2Config`，严格配置校验随之应用 MHA-only 的 `hidden_size % num_attention_heads == 0` 不变式，在 config 解析期即拒绝公开 checkpoint `Inferact/Kimi-K3-DSpark-Block5`（7168/96）；而 MLA 独立声明 query/value 头维度，该不变式并不适用（#53998）。**方法**：`K3DSparkConfig` 改继承 `DeepseekV3Config`（匹配 MLA 几何），为 Block5 推导 `qk_head_dim=192`、`head_dim=64`；config fixture 默认用 96 头，并保留已发布 64 头与 Block5 96 头两种布局的 TP8 几何覆盖。**效果**：两个 checkpoint 均可通过配置解析并 e2e 服务。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "K3 DSpark draft 模型配置对 96 头 MLA 几何的适配，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "dspark", "kimi-k3", "draft-model", "config", "mla", "96-heads"],
+      "pr_number": 54005
+    },
+    {
+      "sha": "7c877062acab618beb377ed6aae959faccc727c0",
+      "comment": "**背景**：FlashInfer 上游（flashinfer#4266）提供了 CuTeDSL BF16 低延迟 dense GEMM，vLLM 尚未集成（当前阻塞于 FlashInfer 0.6.18 发布）。**方法**：新增 `flashinfer_cutedsl` 作为 opt-in 的 `--linear-backend`；SM100 系列 GPU 上对符合条件的未量化 BF16 GEMM 走 `flashinfer.mm_bf16(..., backend=`cute-dsl`)`；FlashInfer 路径限支持的低 M 形状、其余回退既有 PyTorch linear；模型构造与编译期间保留已配置后端；配置的最大 batch 超过 32 token 时加入 M=32 的 FlashInfer autotune 预热。**效果**：TP16 Qwen3.8 服务基准（8K 输入/1K 输出、并发 1）10/10 请求完成、114.65 output tokens/s、平均 TPOT 7.8 ms；TP4DP4 + MoE EP16 精度 HMMT25 97.50%、HMMT26 90.15%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer CuTeDSL BF16 低延迟 GEMM 集成为可选 linear backend，属模型性能/kernel 范畴。",
+      "tags": ["feature", "low-risk", "flashinfer", "cutedsl", "bf16", "low-latency-gemm", "linear-backend", "sm100", "autotune"],
+      "pr_number": 50572
+    },
+    {
+      "sha": "f79a2f5582cb578d333eef73cf146929332f6414",
+      "comment": "**背景**：speculators 格式需要支持 dflash2 draft 模型加载。**方法**：在 `transformers_utils/configs` 增加 dflash2 的 speculators 格式加载逻辑；speculators 配置中用 `dflash2` 表示算法，加载进 vllm 后覆写为 `dflash` 以符合 vllm 命名惯例（+26/-0）。**效果**：由 speculators#1006 产出的模型可成功 serve。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "dflash2 draft 模型的 speculators 格式加载支持，属投机解码范畴。",
+      "tags": ["feature", "low-risk", "dflash2", "dflash", "speculators", "config", "draft-model"],
+      "pr_number": 53797
+    },
+    {
+      "sha": "479eeb32d2b432dbb4e442fbd3f94ca2eca35d67",
+      "comment": "**背景**：MRV2 的 KV-cache 内存池 context 此前覆盖了超出可丢弃 cache backing 分配的初始化工作；在该作用域内创建的持久元数据会继承 `kv_cache` tag，在 level-1 sleep 期间丢失内容却保留同一虚拟地址（#53343 系列工作，自 #53344 拆分）。**方法**：分配 context 穿过 MRV2 model runner、仅在 `allocate_kv_cache` 周围进入；`kv_cache` 池限定为 backing 分配，cache 共享、绑定与运行时 setup 保持在池外；新增 MRV2 分配边界测试与确定性 poisoned-remap allocator、CUDA Graph 复现器；MRV1 保持既有行为（本 PR 仅 MRV2）。**效果**：level-1 sleep 不再误丢持久元数据，分配边界测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 KV cache 内存池分配作用域与 level-1 sleep 交互的修复，属核心 model runner/内存管理范畴。",
+      "tags": ["bugfix", "medium-risk", "mrv2", "kv-cache", "memory-pool", "sleep-mode", "allocation-scope", "cudagraph"],
+      "pr_number": 53508
+    },
+    {
+      "sha": "d262964e8c8316c3ec2304a4698b8277b39ea4b9",
+      "comment": "琐碎依赖升级：`requirements/tpu.txt` 将 tpu-inference 升级到最新稳定版 v0.28.0，已在 tpu-inference CI 上验证。",
+      "sig": "sig-ci",
+      "sig_reason": "TPU 依赖版本升级，属 CI/依赖维护范畴。",
+      "tags": ["chore", "low-risk", "tpu", "dependency-upgrade", "requirements"],
+      "pr_number": 54020
+    },
+    {
+      "sha": "de9250ac9e9b249133fff14e15d9248a1ebbcdb8",
+      "comment": "**背景**：GLM-5 的 256/256 QK/V 头维度（64 头、KV rank 512、QK 192+64、V 256）此前不在 sparse-MLA 的 masked-MHA prefill 路由内，依赖上游 flash-attention#179 的 head-dim-256 `mask_mod` 支持。**方法**：临时将 FlashAttention pin 到含该支持的 `MatthewBonanni/flash-attention@8f844a0`；把 GLM-5 维度纳入既有 masked-MHA 路由（通用 FA4 head-dim-256 selector 保持禁用，paged decoder attention 仍有非页对齐 `max_seqlen_k` 不支持的场景）；按 masked-MHA 与 sparse-MQA 基准交叉点为 GLM-5 增加按后端特定的路由阈值（FlashMLA pure-prefill 实测 TP1/2/4/8 约 8.5K/20.8K/52.8K/116.8K token，取保守 8K/20K/48K/112K），DeepSeek 阈值不变；cached-context 用独立的 query/序列长度表（TP1 有上下文时保持 MQA）；扩展 sparse-MLA 参考测试覆盖 DeepSeek 192/128 与 GLM-5 256/256 含缓存上下文。**效果**：GLM-5 prefill 可走 masked MHA，128 MiB workspace 下超 32K 的纯 prefill 请求按容量守卫回退 sparse MQA。",
+      "sig": "sig-model-performance",
+      "sig_reason": "GLM-5 头维度启用 masked MHA prefill 路由与基准驱动阈值，属注意力后端性能范畴。",
+      "tags": ["feature", "medium-risk", "glm-5", "masked-mha", "sparse-mla", "flash-attention", "fa4", "prefill", "routing-thresholds", "head-dim-256"],
+      "pr_number": 53785
+    },
+    {
+      "sha": "3a9bfc209f9443203d795149da40a7e5b94f27dc",
+      "comment": "**背景**：`ParserEngine.is_reasoning_end()` 对完整 prompt（整个渲染对话）从后向前扫描、遇到第一个 `</think>` 即返回 True；两个调用方都会被历史轮次中的陈旧 `</think>` 误导——`DelegatingParser.parse_delta` 在流开始时播种 `reasoning_ended`，使新轮次整个 `</think>` 块被路由进 `content` 而非 `reasoning`（`include_reasoning=false` 时答案完全丢失）；`StructuredOutputManager.should_fill_bitmask` 据此从第一个生成 token 起应用 grammar bitmask、约束模型思考。**方法**：`ParserEngineConfig` 新增 `turn_boundary_tokens`，反向扫描在第一个轮次边界（ChatML 家族的 `<|im_start|>`/`<|im_end|>`）处停止；命中边界时回退 `initial_state != REASONING`（与空 prompt 同语义，保留模板在生成 prompt 中关闭 think block 的场景）；将 #44551（Cohere）等 per-parser 做法泛化到 engine 层。**效果**：向后兼容——默认边界集为空、词表外的边界 token 解析为空，非 ChatML 词表 parser（如 `SeedOssParser`）行为不变；两类误路由场景均有测试覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "reasoning 解析器的轮次边界限定修复（波及结构化输出 bitmask），属核心解析器/结构化输出范畴。",
+      "tags": ["bugfix", "low-risk", "reasoning-parser", "turn-boundary", "chatml", "structured-output", "bitmask", "multi-turn"],
+      "pr_number": 54089
+    },
+    {
+      "sha": "7d5769b2d9cf1e999e3f2fc2c1da265cf0d5d794",
+      "comment": "**背景**：DeepSeek-V4 Humming MoE 的 SwiGLU clamp 此前未使用原生 CUDA kernel。**方法**：改用原生 CUDA SwiGLU clamp kernel（+17/-0，附 kernel 单测）。**效果**：DeepSeek-V4-Flash-0731 TP4/EP、16K batch token、随机 1024/128 负载下 output token/s 三次均值 661.39→670.64（+1.40%）、总 token/s 5952.52→6035.75、TTFT 1361.48→1325.21 ms。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Humming MoE SwiGLU clamp 原生 CUDA kernel 性能优化，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "deepseek-v4", "humming-moe", "swiglu", "clamp", "cuda-kernel", "throughput"],
+      "pr_number": 53685
+    },
+    {
+      "sha": "9818bb3db8fd6fdb7742dfa7f8b5007f67a736fd",
+      "comment": "**背景**：Kimi-K3 在 Hopper（SM90）上的低延迟 GEMM kernel 计划仍有调优空间。**方法**：对 `KIMI_K3_PROJECTIONS_SM90` 覆盖的各投影形状调优 Hopper 低延迟 GEMM kernel（`vllm/models/kimi_k3`，+175/-35），并扩展 bf16 skinny GEMM 测试。**效果**：各投影形状相对调优前提升 4%~97%；精度由现有单测覆盖。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Kimi-K3 Hopper 低延迟 GEMM kernel 调优，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "kimi-k3", "low-latency-gemm", "hopper", "sm90", "kernel-tuning"],
+      "pr_number": 54088
+    },
+    {
+      "sha": "79378fe6e87687c63ceab9815c68bf027d491868",
+      "comment": "**背景**：`_select_tcpstore_port` 把 `local_dp_rank is None` 当作无 DP 的判据，但非 DP 配置将其置 0，于是同主机上 co-located 的每个引擎都选 100 端口，两个 replica 竞争、后者以 `EADDRINUSE` 死亡；Ray Serve 测试（每节点 2 replicas×TP=2）会重启崩溃 replica、其发现 100 被占后改用 101，应用转健康、测试照过——掩盖了 bug。**方法**：无 DP group 时向端口选择传 `None`（+32/-2），并新增 `ray_v2_executor` 单测。**效果**：同主机同时启动的两个 TP=2 Ray 引擎分别获得 50851/47047 端口，均正常服务。",
+      "sig": "sig-core",
+      "sig_reason": "Ray 引擎 TCPStore 端口选择对非 DP 配置的修复，属核心 executor 范畴。",
+      "tags": ["bugfix", "low-risk", "ray", "tcpstore", "port-collision", "co-located", "executor", "distributed"],
+      "pr_number": 53666
+    },
+    {
+      "sha": "9db222c6bea2623e18ce09a8f270ac9cb7d86981",
+      "comment": "**背景**：Rust frontend 的 Chat Completions 与 Completions 在多个独立的请求/响应边缘场景上与 Python vLLM 的 wire 行为不一致。**方法**：逐项对齐：absent/null/空 `model` 值选择默认 served model（仍校验非空 model ID）；`prompt_logprobs` 以 vLLM token-ID 键形状返回（含 `logprob`/`rank`/`decoded_token`）；Completions 接受 `logprobs=-1` 全词表请求；两 API 接受 `top_k` 哨兵 `-1` 与 `0`（null 继承模型默认）；接受 `min_tokens=0`；省略的 tool `type` 默认 `function`、省略的 function `parameters` 默认 null；拒绝空 `cache_salt`。每个兼容性改动独立成 commit 并有聚焦测试。**效果**：438 项测试通过（1 项按 profile 跳过）、clippy `-D warnings` 通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust frontend OpenAI API 边缘行为与 Python vLLM 的对齐，属核心 Rust frontend 范畴。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "openai-api", "chat-completions", "prompt-logprobs", "top-k", "min-tokens", "tool-calls", "cache-salt", "compatibility"],
+      "pr_number": 53218
+    },
+    {
+      "sha": "4aab2b0ebed20343efe543c633f71b3c1336d5b8",
+      "comment": "**背景**：MRV2 此前仅对部分模型家族默认启用（pooling、DSA 等已先行），全模型默认化的阻塞项（如 CUDA graph 显存计入 KV cache sizing）已在前序 PR 清除。**方法**：移除按架构的白名单机制，除 ROCm 上性能尚未修复的特定模型（`DeepseekV32ForCausalLM`、`DeepseekV4ForCausalLM` 留在编译 MRV1 路径）外，所有模型默认使用 MRV2；MRV2 尚不支持的特定特性仍自动回退 MRV1（+122/-117，含配置与测试调整）。**效果**：MRV2 成为默认 model runner，架构迁移里程碑；ROCm 例外保留既有编译路径默认。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 成为全模型默认 model runner 的架构切换，属核心 model runner 范畴。",
+      "tags": ["feature", "medium-risk", "mrv2", "model-runner", "default-enable", "rocm", "architecture-migration"],
+      "pr_number": 53183
+    },
+    {
+      "sha": "a18dbe49add8adcbf1d9f7b7429e2f249cfc625d",
+      "comment": "文档更新：EXAONE 4.0 系列（1.2B、32B、4.0.1-32B）加入 batch invariance 已验证模型清单（`docs/features/batch_invariance.md`，#27433 系列），是清单中首个 EXAONE 家族、也是首个 per-layer hybrid sliding/global attention 条目。1.2B 在 RTX 4090 与 H200 上 19/19 全过（含全部 `FLEX_ATTENTION`）；两个 32B checkpoint 14 过 5 败，失败全部位于 `FLEX_ATTENTION` 且失败于引擎初始化（Dynamo recompile limit 超限）而非确定性断言。",
+      "sig": "other",
+      "sig_reason": "纯文档更新，仅扩充 batch invariance 已验证模型清单。",
+      "tags": ["docs", "low-risk", "batch-invariance", "exaone", "model-validation", "flex-attention"],
+      "pr_number": 53839
+    },
+    {
+      "sha": "674c284dbd2012f4b3e0da362aa11b75044c5d0c",
+      "comment": "**背景**：高并发 lm_eval 下 Kimi K3 的 GSM8K 精度显著下降；humming fp8 路径上融合 SITU+量化 kernel 直接消费 `gate_up_output` 产出 `quanted_down_input`、从不物化 `activation_output`，但 `activation_output` 仍留在 required_buffers 链中，使 even/odd workspace 双着色偏移——`gate_up_output` 与 `quanted_down_input` 落到同一 workspace 形成别名，activation kernel 读写同一缓冲产生错误结果。**方法**：fused SITU+quant 启用时从 required_buffers 移除 `activation_output`（+9/-0），翻转着色使两者分属不同 workspace。**效果**：GSM8K 恢复至 flexible-extract 0.9682、strict-match 0.9689。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Humming MoE workspace 别名导致的精度损失修复，属 MoE kernel 正确性范畴。",
+      "tags": ["bugfix", "low-risk", "humming-moe", "buffer-aliasing", "workspace", "fp8", "accuracy", "kimi-k3"],
+      "pr_number": 54056
+    },
+    {
+      "sha": "d7b6a35967ba72ebece3dc8466b77d315cebdfec",
+      "comment": "**背景**：Responses API 的具名 tool-choice 校验在 Pydantic 校验之前检查 namespace tools，嵌套条目为 `null` 或字符串时抛 `AttributeError`、返回 HTTP 500。**方法**：改用与顶层 tools 相同的防御性名称查找（+9/-2），无效客户端输入返回 `VLLMValidationError`/HTTP 400。**效果**：`None`/`bad` 嵌套条目从 HTTP 500 变为 HTTP 400，合法的 `f` 与 `ns__f` 具名选择仍被接受；21+43 项相关测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Responses API namespace tools 畸形输入的错误处理修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "responses-api", "tool-choice", "namespace-tools", "validation", "http-400"],
+      "pr_number": 53763
+    },
+    {
+      "sha": "07242faa4667adcec25e40cb5f580cec60f2faac",
+      "comment": "**背景**：MLA decode 的 DCP 支持此前依赖已被 #53139 移除的手工 FlashInfer DSpark/DCP 展平；FlashInfer 0.6.17 在 CuTeDSL MLA decode kernel 中暴露了原生 context-parallel masking。**方法**：经 FlashInfer 原生 CP mask 为 MLA decode 增加 DCP 支持（限 CuTeDSL 路径），复用 #52188 的 DSpark/DCP slot mapping 与 draft metadata；与 #48392（dense GQA/MHA 的 DCP）互补、不重复。**效果**：Kimi-K3 DCP8-DCP8 P/D 分离 + EAGLE3 下 DeepSWE full113 113/113 完成、77/113 通过（68.14%）、零 evaluator 错误与重试，加权 EAGLE 接受率 53.52%。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MLA decode 的 DCP（解码上下文并行）原生 CP mask 支持，属上下文并行的大规模服务范畴。",
+      "tags": ["feature", "medium-risk", "dcp", "context-parallel", "mla", "flashinfer", "cutedsl", "decode", "kimi-k3", "pd-disagg"],
+      "pr_number": 54012
+    },
+    {
+      "sha": "32ad1400d7fa08872430de3f1d0f981dc8db5cb6",
+      "comment": "**背景**：DeepSeek-V4 ROCm 路径每个 decode step 的 SWA token 插入管线要跑三次 kernel：Triton `fused_q_kv_rmsnorm`（q-lora 与 kv latent 归一到 bf16）→ aiter per-1x128 动态量化（block-scaled FP8 `wq_b` GEMM 的输入量化）→ indexer 的 `wq_b` 与 attention 共享 q-lora、再量化一次。**方法**：用单一 aiter HIP kernel `fused_qk_rmsnorm_group_quant` 替换前两步：一次 pass 内以 fp32 累加 RMSNorm 两个 latent 并做 per-1x128、fp32 scale 的 q latent 量化；attention 与 indexer 的 `wq_b` 均直接消费预量化 `(qr_fp8, qr_scale)`、跳过各自输入量化（长上下文路径再省一次量化 launch）；kv 保持 bf16 喂既有 fused insert kernel；仅限 ROCm/AITER 路径，CUDA/XPU 不变。**效果**：热路径 2 次 launch 减为 1 次、bf16 q-lora 写读往返消失（量化直接读 fp32 累加器，单次舍入精度等价或更优）；该段 14.28 µs→4.92 µs（2.90x）；MI350X 上 A/B 基准与 GSM8K 验证通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "ROCm 路径 RMSNorm 与 FP8 组量化的融合 kernel 优化，属量化融合范畴。",
+      "tags": ["perf", "low-risk", "rocm", "aiter", "fp8", "group-quant", "rmsnorm-fusion", "deepseek-v4", "swa", "hip-kernel"],
+      "pr_number": 53540
+    },
+    {
+      "sha": "9650dc73e249688d9f4dac1f24a3f6f09e8c04a1",
+      "comment": "**背景**：Rubin（SM107）预发布硬件需要 CUDA 13.4/13.5 的 Docker 构建路径（#49735）。**方法**：新增 opt-in 的 `INSTALL_RUBIN_PRERELEASE=true` 构建开关（ARM64/AMD64，默认 false、标准 Blackwell 镜像保持公共依赖路径）；新增通用的 opt-in 源码 Triton 构建脚本（`TRITON_INSTALL_FROM_SOURCE_REPO/REVISION`，独立于 Rubin 开关）；Rubin 工具链版本感知——pinned Triton 自带的 `ptxas-blackwell` 13.3.33 拒绝 `sm_107a`，CUDA 13.4/13.5 构建改用匹配 SM107 的系统 `ptxas` 并经校验的包内运行时链接；cuRAND 10→11 兼容链接限 CUDA 13.4（13.5 须原生 `libcurand.so.11`）；镜像 CUDA 元数据规范化为所选 toolkit 版本；`rubin-prerelease.txt` 等私有输入由调用方在构建上下文提供、不入仓。**效果**：Rubin 预发布镜像可构建，常规镜像依赖路径不受影响（+429/-24）。",
+      "sig": "sig-ci",
+      "sig_reason": "Rubin 预发布硬件的 opt-in Docker 构建路径，属 CI/构建范畴。",
+      "tags": ["build", "low-risk", "docker", "rubin", "sm107", "cuda-13.5", "triton-from-source", "nvidia", "opt-in"],
+      "pr_number": 53443
+    }
+  ]
+}
