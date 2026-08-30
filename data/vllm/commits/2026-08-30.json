@@ -4,6 +4,600 @@
   "branch": "main",
   "commits": [
     {
+      "sha": "56058fd572f6a7fec6899385f4a4ed7f4b964477",
+      "author": {
+        "name": "Yongji Wu",
+        "email": "CherryLemon@users.noreply.github.com"
+      },
+      "date": "2026-08-30T22:15:36+08:00",
+      "message": "[Bugfix][Kernel] Keep packed GDN decode beta in FP32 (#53877)\n\nSigned-off-by: CherryLemon <lemon_cn@alumni.sjtu.edu.cn>\nCo-authored-by: Codex <codex@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nCo-authored-by: Jiangyun Zhu <riverclouds.zhu@qq.com>",
+      "parents": [
+        "87b9b5b8d9dadc3edb31efa6ea71ee7d49d0bdcd"
+      ],
+      "stats": {
+        "total_additions": 33,
+        "total_deletions": 2,
+        "files_changed": 35
+      },
+      "files": [
+        {
+          "filename": "tests/kernels/test_fused_recurrent_packed_decode.py",
+          "status": "modified",
+          "additions": 32,
+          "deletions": 1,
+          "patch": "@@ -70,7 +70,7 @@ def test_fused_recurrent_packed_decode_matches_reference(\n         x <= 20.0, torch.log1p(torch.exp(torch.clamp(x, max=20.0))), x\n     )\n     g = (-torch.exp(A_log.float()) * softplus_x).unsqueeze(1)\n-    beta = torch.sigmoid(b.float()).to(dtype).unsqueeze(1)\n+    beta = torch.sigmoid(b.float()).unsqueeze(1)\n \n     out_ref, state_ref = fused_recurrent_gated_delta_rule(\n         q=q,\n@@ -109,6 +109,37 @@ def test_fused_recurrent_packed_decode_matches_reference(\n     torch.testing.assert_close(state_packed, state_ref, rtol=rtol, atol=atol)\n \n \n+def test_packed_decode_keeps_beta_in_fp32():\n+    device = torch.device(DEVICE)\n+    dtype = torch.bfloat16\n+\n+    mixed_qkv = torch.ones((1, 3), device=device, dtype=dtype)\n+    a = torch.zeros((1, 1), device=device, dtype=dtype)\n+    b = torch.full((1, 1), 0.5, device=device, dtype=dtype)\n+    params = torch.zeros((1,), device=device, dtype=dtype)\n+    ssm_state_indices = torch.ones((1,), device=device, dtype=torch.int32)\n+\n+    state_packed = torch.zeros((2, 1, 1, 1), device=device, dtype=torch.float32)\n+    out_packed = torch.empty((1, 1, 1, 1), device=device, dtype=dtype)\n+\n+    fused_recurrent_gated_delta_rule_packed_decode(\n+        mixed_qkv=mixed_qkv,\n+        a=a,\n+        b=b,\n+        A_log=params,\n+        dt_bias=params,\n+        scale=1.0,\n+        initial_state=state_packed,\n+        out=out_packed,\n+        ssm_state_indices=ssm_state_indices,\n+    )\n+\n+    expected_beta = torch.sigmoid(b.float()).squeeze()\n+    torch.testing.assert_close(\n+        state_packed[1, 0, 0, 0], expected_beta, rtol=1e-6, atol=1e-6\n+    )\n+\n+\n def test_packed_decode_supports_large_batch_head_grid():\n     B, H, HV, K, V = 1024, 8, 64, 1, 1\n     device = torch.device(DEVICE)"
+        },
+        {
+          "filename": "vllm/third_party/flash_linear_attention/ops/fused_recurrent.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -326,7 +326,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(\n     x = a_val + dt_bias_val\n     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)\n     g_val = -tl.exp(A_log_val) * softplus_x\n-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)\n+    beta_val = tl.sigmoid(b_val)\n \n     b_h *= exp(g_val)\n     b_v -= tl.sum(b_h * b_k[None, :], 1)"
+        }
+      ]
+    },
+    {
+      "sha": "87b9b5b8d9dadc3edb31efa6ea71ee7d49d0bdcd",
+      "author": {
+        "name": "machero",
+        "email": "sr1123640465@126.com"
+      },
+      "date": "2026-08-30T21:49:41+08:00",
+      "message": "[Test][VLM] Add batch-invariance tests for Qwen3-VL (#53531)\n\nSigned-off-by: machero <sr1123640465@126.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "parents": [
+        "fe6db3ed5e1b426afc0f247d1aefea36c807bf50"
+      ],
+      "stats": {
+        "total_additions": 105,
+        "total_deletions": 0,
+        "files_changed": 105
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/misc.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -435,6 +435,7 @@ steps:\n     - pip install pytest-timeout pytest-forked\n     - pytest -v -s v1/determinism/test_batch_invariance.py\n     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py\n+    - pytest -v -s v1/determinism/test_batch_invariance_vlm.py\n     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA\n     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k FLASH_ATTN\n     - pytest -v -s v1/determinism/test_nvfp4_batch_invariant.py"
+        },
+        {
+          "filename": "docs/features/batch_invariance.md",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -102,6 +102,7 @@ Batch invariance has been tested and verified on the following models:\n \n - **DeepSeek series**: `deepseek-ai/DeepSeek-V3`, `deepseek-ai/DeepSeek-V3-0324`, `deepseek-ai/DeepSeek-R1`, `deepseek-ai/DeepSeek-V3.1`\n - **Qwen3 (Dense)**: `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-8B`, `Qwen/Qwen3-4B-AWQ`, `Qwen/Qwen3-8B-AWQ`\n+- **Qwen3-VL (Vision-Language)**: `Qwen/Qwen3-VL-2B-Instruct`, `Qwen/Qwen3-VL-4B-Instruct` (single image and video inputs)\n - **Qwen3 (MoE)**: `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-Next-80B-A3B-Instruct`, `Qwen/Qwen3-30B-A3B-Thinking-2507-FP8`\n - **Qwen2.5**: `Qwen/Qwen2.5-0.5B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-3B-Instruct`, `Qwen/Qwen2.5-7B-Instruct`, `Qwen/Qwen2.5-14B-Instruct`, `Qwen/Qwen2.5-32B-Instruct`\n - **Llama 3**: Llama3.1 and 3.2 series, `meta-llama/Llama-3.2-3B-Instruct` for example"
+        },
+        {
+          "filename": "tests/v1/determinism/test_batch_invariance_vlm.py",
+          "status": "added",
+          "additions": 103,
+          "deletions": 0,
+          "patch": "@@ -0,0 +1,103 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Batch-invariance regression tests for vision-language models (VLMs).\"\"\"\n+\n+import contextlib\n+import os\n+\n+import numpy as np\n+import pytest\n+import torch\n+from PIL import Image\n+from utils import _extract_step_logprobs, skip_if_not_cuda\n+\n+from vllm import LLM, SamplingParams\n+\n+VLM_TEST_MODEL = os.getenv(\"VLLM_VLM_TEST_MODEL\", \"Qwen/Qwen3-VL-2B-Instruct\")\n+\n+IMAGE_PROMPT = (\n+    \"<|im_start|>user\\n<|vision_start|><|image_pad|><|vision_end|>\"\n+    \"Describe this image.<|im_end|><|im_start|>assistant\\n\"\n+)\n+VIDEO_PROMPT = (\n+    \"<|im_start|>user\\n<|vision_start|><|video_pad|><|vision_end|>\"\n+    \"Describe this video.<|im_end|><|im_start|>assistant\\n\"\n+)\n+\n+\n+def _make_image(seed: int, size: int) -> Image.Image:\n+    rng = np.random.default_rng(seed)\n+    return Image.fromarray(rng.integers(0, 255, (size, size, 3), dtype=np.uint8))\n+\n+\n+def _make_inputs(input_type: str, num_reqs: int) -> list[dict]:\n+    inputs = []\n+    for i in range(num_reqs):\n+        if input_type == \"image\":\n+            prompt = IMAGE_PROMPT\n+            mm_data = {\"image\": _make_image(1000 + i, size=256)}\n+        else:\n+            frames = [_make_image(1000 + i + f, size=128) for f in range(4)]\n+            prompt = VIDEO_PROMPT\n+            mm_data = {\n+                \"video\": (\n+                    frames,\n+                    {\n+                        \"total_num_frames\": len(frames),\n+                        \"fps\": 1.0,\n+                        \"frames_indices\": list(range(len(frames))),\n+                        \"do_sample_frames\": False,\n+                    },\n+                )\n+            }\n+        inputs.append({\"prompt\": prompt, \"multi_modal_data\": mm_data})\n+    return inputs\n+\n+\n+def _assert_batch_invariant(llm: LLM, inputs: list[dict], sampling) -> None:\n+    bs1 = [\n+        _extract_step_logprobs(llm.generate([inp], sampling, use_tqdm=False)[0])\n+        for inp in inputs\n+    ]\n+    bsN = [_extract_step_logprobs(out) for out in llm.generate(inputs, sampling)]\n+\n+    failures = []\n+    for i, ((lp1, t1), (lpN, tN)) in enumerate(zip(bs1, bsN)):\n+        if lp1 is None or lpN is None:\n+            pytest.skip(\n+                \"Logits are not available on RequestOutput; \"\n+                \"enable logprobs return to run this test.\"\n+            )\n+        if t1 != tN:\n+            failures.append(f\"req {i}: token mismatch bs1={t1} bsN={tN}\")\n+        elif not torch.equal(lp1, lpN):\n+            d = (lp1 - lpN).abs().max().item()\n+            failures.append(f\"req {i}: logprob mismatch max_diff={d:.3e}\")\n+\n+    if failures:\n+        pytest.fail(\n+            f\"Batch invariance violated for {len(failures)}/{len(inputs)} \"\n+            f\"requests:\\n\" + \"\\n\".join(failures)\n+        )\n+\n+\n+@skip_if_not_cuda\n+@pytest.mark.parametrize(\"input_type\", [\"image\", \"video\"])\n+@pytest.mark.parametrize(\"mm_encoder_attn_backend\", [\"FLASH_ATTN\", \"TORCH_SDPA\"])\n+def test_vlm_batch_invariance_bs1_vs_bsN(input_type: str, mm_encoder_attn_backend: str):\n+    inputs = _make_inputs(input_type, num_reqs=4)\n+    sampling = SamplingParams(temperature=0.0, max_tokens=8, seed=1234, logprobs=5)\n+\n+    llm = LLM(\n+        model=VLM_TEST_MODEL,\n+        dtype=\"bfloat16\",\n+        enforce_eager=True,\n+        max_num_seqs=16,\n+        gpu_memory_utilization=0.85,\n+        mm_encoder_attn_backend=mm_encoder_attn_backend,\n+    )\n+    try:\n+        _assert_batch_invariant(llm, inputs, sampling)\n+    finally:\n+        with contextlib.suppress(Exception):\n+            llm.shutdown()"
+        }
+      ]
+    },
+    {
+      "sha": "fe6db3ed5e1b426afc0f247d1aefea36c807bf50",
+      "author": {
+        "name": "Taneem Ibrahim",
+        "email": "taneem.ibrahim@gmail.com"
+      },
+      "date": "2026-08-30T21:46:12+08:00",
+      "message": "[Bugfix] Validate scale-out transfer params (#54324)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>",
+      "parents": [
+        "488b6da105222f4f8130b3aae4a0e67cfc61f522"
+      ],
+      "stats": {
+        "total_additions": 7,
+        "total_deletions": 1,
+        "files_changed": 8
+      },
+      "files": [
+        {
+          "filename": "vllm/entrypoints/scale_out/token_in_token_out/serving.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 1,
+          "patch": "@@ -137,7 +137,13 @@ async def serve_tokens(\n                 f\"({max_num_seqs}), got {sampling_params.n}.\"\n             )\n         try:\n-            msgspec.msgpack.encode(sampling_params)\n+            msgspec.msgpack.encode(\n+                (\n+                    sampling_params,\n+                    request.kv_transfer_params,\n+                    request.ec_transfer_params,\n+                )\n+            )\n         except (OverflowError, TypeError, ValueError) as e:\n             return self.create_error_response(e)\n "
+        }
+      ]
+    },
+    {
+      "sha": "488b6da105222f4f8130b3aae4a0e67cfc61f522",
+      "author": {
+        "name": "Harry Mellor",
+        "email": "19981378+hmellor@users.noreply.github.com"
+      },
+      "date": "2026-08-30T21:21:22+08:00",
+      "message": "[Doc] Fix griffe warnings in HYV4 tool parser (#54412)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "parents": [
+        "5e71a11eb2b595ede15ecc39c7dddca38e03deb5"
+      ],
+      "stats": {
+        "total_additions": 12,
+        "total_deletions": 8,
+        "files_changed": 20
+      },
+      "files": [
+        {
+          "filename": "vllm/tool_parsers/hy_v4_tool_parser.py",
+          "status": "modified",
+          "additions": 12,
+          "deletions": 8,
+          "patch": "@@ -5,7 +5,8 @@\n \n import ast\n import json\n-from typing import Any, TypedDict\n+from collections.abc import Sequence\n+from typing import TYPE_CHECKING, Any, TypedDict\n \n import regex as re\n \n@@ -26,6 +27,9 @@\n from vllm.tool_parsers.abstract_tool_parser import ToolParser\n from vllm.tool_parsers.utils import partial_tag_overlap\n \n+if TYPE_CHECKING:\n+    from xgrammar import StructuralTag\n+\n logger = init_logger(__name__)\n \n # =============================================================================\n@@ -576,9 +580,9 @@ def extract_tool_calls_streaming(\n         previous_text: str,\n         current_text: str,\n         delta_text: str,\n-        previous_token_ids,\n-        current_token_ids,\n-        delta_token_ids,\n+        previous_token_ids: Sequence[int],\n+        current_token_ids: Sequence[int],\n+        delta_token_ids: Sequence[int],\n         tools: list[ToolSchema] | None,\n         *,\n         guided: bool = False,\n@@ -989,7 +993,7 @@ def get_structural_tag(\n         request: ChatCompletionRequest | ResponsesRequest,\n         *,\n         reasoning: bool = False,\n-    ):\n+    ) -> StructuralTag | None:\n         \"\"\"Build a structural tag matching HYV4's tool tokens.\n \n         Overridden only to pass the per-checkpoint ``token_suffix`` through to\n@@ -1106,9 +1110,9 @@ def extract_tool_calls_streaming(\n         previous_text: str,\n         current_text: str,\n         delta_text: str,\n-        previous_token_ids,\n-        current_token_ids,\n-        delta_token_ids,\n+        previous_token_ids: Sequence[int],\n+        current_token_ids: Sequence[int],\n+        delta_token_ids: Sequence[int],\n         request: ChatCompletionRequest,\n     ) -> DeltaMessage | None:\n         delta = self._extractor.extract_tool_calls_streaming("
+        }
+      ]
+    },
+    {
+      "sha": "5e71a11eb2b595ede15ecc39c7dddca38e03deb5",
+      "author": {
+        "name": "Kevin H. Luu",
+        "email": "khluu000@gmail.com"
+      },
+      "date": "2026-08-30T19:40:41+08:00",
+      "message": "[CI] Mark L4 GPU test steps with device: l4 for EKS migration (#54326)\n\nSigned-off-by: khluu <khluu000@gmail.com>",
+      "parents": [
+        "78fa18910ee2fe64b2624e9358f622e1b50b14bf"
+      ],
+      "stats": {
+        "total_additions": 35,
+        "total_deletions": 2,
+        "files_changed": 37
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/crcr_report.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -1,12 +1,13 @@\n group: CRCR Report\n depends_on:\n-  - image-build\n+  - image-build-cpu\n steps:\n   - label: \":satellite: Report nightly results to CRCR\"\n     key: crcr-report\n     if: build.env(\"TORCH_NIGHTLY\") == \"1\"\n     soft_fail: true\n     allow_dependency_failure: true\n     timeout_in_minutes: 15\n+    device: cpu-small\n     commands:\n       - bash /vllm-workspace/.buildkite/scripts/crcr-report.sh"
+        },
+        {
+          "filename": ".buildkite/test_areas/disaggregated.yaml",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 0,
+          "patch": "@@ -6,6 +6,7 @@ steps:\n   key: distributed-nixlconnector-pd-accuracy-4-gpus\n   timeout_in_minutes: 55\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -33,6 +34,7 @@ steps:\n   key: distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus\n   timeout_in_minutes: 55\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -45,6 +47,7 @@ steps:\n   key: push-nixlconnector-pp-prefill-pd-accuracy-4-gpus\n   timeout_in_minutes: 30\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -58,6 +61,7 @@ steps:\n   key: dp-ep-distributed-nixlconnector-pd-accuracy-tests-4-gpus\n   timeout_in_minutes: 30\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -85,6 +89,7 @@ steps:\n   key: crosslayer-kv-layout-distributed-nixlconnector-pd-accuracy-tests-4-gpus\n   timeout_in_minutes: 55\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -112,6 +117,7 @@ steps:\n   key: hybrid-ssm-nixlconnector-pd-accuracy-tests-4-gpus\n   timeout_in_minutes: 60\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -139,6 +145,7 @@ steps:\n   key: nixlconnector-pd-edge-cases-2-gpus\n   timeout_in_minutes: 40\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -155,6 +162,7 @@ steps:\n   key: hybrid-ssm-nixlconnector-pd-prefix-cache-2-gpus\n   timeout_in_minutes: 25\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -169,6 +177,7 @@ steps:\n   key: multiconnector-nixl-offloading-pd-accuracy-2-gpus\n   timeout_in_minutes: 40\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/\n@@ -214,6 +223,7 @@ steps:\n   key: multiconnector-nixl-offloading-pd-edge-cases-2-gpus\n   timeout_in_minutes: 25\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/"
+        },
+        {
+          "filename": ".buildkite/test_areas/distributed.yaml",
+          "status": "modified",
+          "additions": 9,
+          "deletions": 0,
+          "patch": "@@ -6,6 +6,7 @@ steps:\n   key: distributed-comm-ops\n   timeout_in_minutes: 25\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/distributed\n@@ -36,6 +37,7 @@ steps:\n   key: distributed-dp-tests-2-gpus\n   timeout_in_minutes: 35\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -78,6 +80,7 @@ steps:\n   key: distributed-compile-rpc-tests-2-gpus\n   timeout_in_minutes: 65\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/compilation/\n@@ -100,6 +103,7 @@ steps:\n   key: distributed-torchrun-shutdown-tests-2-gpus\n   timeout_in_minutes: 30\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -124,6 +128,7 @@ steps:\n   key: distributed-torchrun-examples-4-gpus\n   timeout_in_minutes: 45\n   working_dir: \"/vllm-workspace\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -166,6 +171,7 @@ steps:\n   key: distributed-dp-tests-4-gpus\n   timeout_in_minutes: 45\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -189,6 +195,7 @@ steps:\n   key: distributed-compile-comm-4-gpus\n   timeout_in_minutes: 70\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -307,6 +314,7 @@ steps:\n   key: pipeline-context-parallelism-4-gpus\n   timeout_in_minutes: 55\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/distributed/\n@@ -323,6 +331,7 @@ steps:\n   key: rayexecutorv2-4-gpus\n   timeout_in_minutes: 45\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/v1/executor/ray_executor_v2.py"
+        },
+        {
+          "filename": ".buildkite/test_areas/engine.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -97,6 +97,7 @@ steps:\n   key: v1-e2e-2-gpus\n   timeout_in_minutes: 25 # TODO: Fix timeout after we have more confidence in the test stability\n   optional: true\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/compilation/"
+        },
+        {
+          "filename": ".buildkite/test_areas/expert_parallelism.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -32,6 +32,7 @@ steps:\n   key: eplb-execution\n   timeout_in_minutes: 25\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/distributed/eplb"
+        },
+        {
+          "filename": ".buildkite/test_areas/lora.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -30,6 +30,7 @@ steps:\n - label: \":nvidia: (L4) LoRA TP (Distributed)\"\n   key: lora-tp-distributed\n   timeout_in_minutes: 60\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n   - vllm/lora"
+        },
+        {
+          "filename": ".buildkite/test_areas/misc.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -150,6 +150,7 @@ steps:\n - label: \":nvidia: (L4) Extract Hidden States Integration\"\n   key: extract-hidden-states-integration-2-gpus\n   timeout_in_minutes: 20\n+  device: l4\n   num_devices: 2\n   working_dir: \"/vllm-workspace\"\n   source_file_dependencies:\n@@ -234,6 +235,7 @@ steps:\n - label: \":nvidia: (L4) Metrics, Tracing\"\n   key: metrics-tracing-2-gpus\n   timeout_in_minutes: 25\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/config/"
+        },
+        {
+          "filename": ".buildkite/test_areas/model_runner_v2.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -65,6 +65,7 @@ steps:\n   key: model-runner-v2-distributed-2-gpus\n   timeout_in_minutes: 40\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n     - vllm/v1/worker/gpu/\n@@ -112,6 +113,7 @@ steps:\n   key: model-runner-v2-pipeline-parallelism-4-gpus\n   timeout_in_minutes: 50\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 4\n   source_file_dependencies:\n     - vllm/v1/worker/gpu/"
+        },
+        {
+          "filename": ".buildkite/test_areas/models_distributed.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -6,6 +6,7 @@ steps:\n   key: distributed-model-tests-2-gpus\n   timeout_in_minutes: 60\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/model_executor/model_loader/sharded_state_loader.py"
+        },
+        {
+          "filename": ".buildkite/test_areas/plugins.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -6,6 +6,7 @@ steps:\n   key: plugin-tests-2-gpus\n   timeout_in_minutes: 35\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   source_file_dependencies:\n   - vllm/plugins/\n@@ -96,6 +97,7 @@ steps:\n   key: bitsandbytes-plugin-2-gpus\n   timeout_in_minutes: 15\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   soft_fail: true\n   optional: true"
+        },
+        {
+          "filename": ".buildkite/test_areas/rust_frontend.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -140,6 +140,7 @@ steps:\n \n - label: \":nvidia: (L4) Rust Frontend Distributed\"\n   timeout_in_minutes: 25\n+  device: l4\n   num_devices: 4\n   working_dir: \"/vllm-workspace/tests\"\n   source_file_dependencies:"
+        },
+        {
+          "filename": ".buildkite/test_areas/torch_abi.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -1,10 +1,11 @@\n group: Torch ABI\n depends_on:\n-  - image-build\n+  - image-build-cpu\n steps:\n - label: \":nvidia: (L4) Torch Stable ABI Audit\"\n   key: torch-stable-abi-audit\n   timeout_in_minutes: 5\n+  device: cpu-small\n   source_file_dependencies:\n   - .buildkite/check-torch-abi.py\n   - csrc/"
+        },
+        {
+          "filename": ".buildkite/test_areas/weight_loading.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -6,6 +6,7 @@ steps:\n   key: weight-loading-multiple-gpu\n   timeout_in_minutes: 50\n   working_dir: \"/vllm-workspace/tests\"\n+  device: l4\n   num_devices: 2\n   optional: true\n   source_file_dependencies:"
+        }
+      ]
+    },
+    {
+      "sha": "78fa18910ee2fe64b2624e9358f622e1b50b14bf",
+      "author": {
+        "name": "Kevin H. Luu",
+        "email": "khluu000@gmail.com"
+      },
+      "date": "2026-08-30T19:35:01+08:00",
+      "message": "ci: add MIG slice size to H200 job labels (#54420)\n\nSigned-off-by: khluu <khluu000@gmail.com>",
+      "parents": [
+        "8c51b92654100aa1d698aeef862cad09c8cc5df8"
+      ],
+      "stats": {
+        "total_additions": 85,
+        "total_deletions": 85,
+        "files_changed": 170
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/basic_correctness.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Basic Correctness\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Basic Correctness\"\n+- label: \":nvidia: (H200 MIG 18GB) Basic Correctness\"\n   key: basic-correctness\n   timeout_in_minutes: 68\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/benchmarks.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Benchmarks\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Benchmarks CLI\"\n+- label: \":nvidia: (H200 MIG 18GB) Benchmarks CLI\"\n   key: benchmarks-cli-test\n   timeout_in_minutes: 45\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/cuda.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -2,7 +2,7 @@ group: CUDA\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) CUDA Platform\"\n+- label: \":nvidia: (H200 MIG 18GB) CUDA Platform\"\n   key: platform-tests\n   timeout_in_minutes: 20\n   device: h200_18gb\n@@ -30,7 +30,7 @@ steps:\n       - vllm/\n       - tests/cuda\n \n-- label: \":nvidia: (H200) CUDAGraph\"\n+- label: \":nvidia: (H200 MIG 35GB) CUDAGraph\"\n   device: h200_35gb\n   key: cudagraph\n   timeout_in_minutes: 30"
+        },
+        {
+          "filename": ".buildkite/test_areas/engine.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -2,7 +2,7 @@ group: Engine\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Engine Core\"\n+- label: \":nvidia: (H200 MIG 18GB) Engine Core\"\n   key: engine\n   timeout_in_minutes: 30\n   device: h200_18gb\n@@ -55,7 +55,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) E2E Scheduling\"\n+- label: \":nvidia: (H200 MIG 18GB) E2E Scheduling\"\n   key: e2e-scheduling-1-gpu\n   timeout_in_minutes: 53\n   device: h200_18gb\n@@ -72,7 +72,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) E2E Core\"\n+- label: \":nvidia: (H200 MIG 35GB) E2E Core\"\n   device: h200_35gb\n   key: e2e-core-1-gpu\n   timeout_in_minutes: 40"
+        },
+        {
+          "filename": ".buildkite/test_areas/entrypoints.yaml",
+          "status": "modified",
+          "additions": 11,
+          "deletions": 11,
+          "patch": "@@ -2,7 +2,7 @@ group: Entrypoints\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Entrypoints Unit\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Unit\"\n   device: h200_35gb\n   key: entrypoints-unit-tests\n   timeout_in_minutes: 40\n@@ -25,7 +25,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (LLM)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (LLM)\"\n   device: h200_35gb\n   key: entrypoints-integration-llm\n   timeout_in_minutes: 60\n@@ -48,7 +48,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (API Server)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (API Server)\"\n   key: entrypoints-integration-api-server\n   device: h200_35gb\n   timeout_in_minutes: 75\n@@ -72,7 +72,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (API Server OpenAI - Part 1)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (API Server OpenAI - Part 1)\"\n   device: h200_35gb\n   key: entrypoints-integration-api-server-openai-part-1\n   timeout_in_minutes: 68\n@@ -94,7 +94,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (API Server OpenAI - Part 2)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (API Server OpenAI - Part 2)\"\n   device: h200_35gb\n   key: entrypoints-integration-api-server-openai-part-2\n   timeout_in_minutes: 83\n@@ -117,7 +117,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (API Server Generate)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (API Server Generate)\"\n   device: h200_35gb\n   key: entrypoints-integration-api-server-generate\n   timeout_in_minutes: 50\n@@ -143,7 +143,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (Responses API)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (Responses API)\"\n   device: h200_35gb\n   key: entrypoints-integration-responses-api\n   timeout_in_minutes: 50\n@@ -163,7 +163,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (Speech to Text)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (Speech to Text)\"\n   device: h200_35gb\n   key: entrypoints-integration-speech_to_text\n   timeout_in_minutes: 45\n@@ -176,7 +176,7 @@ steps:\n   - export VLLM_WORKER_MULTIPROC_METHOD=spawn\n   - pytest -v -s entrypoints/speech_to_text\n \n-- label: \":nvidia: (H200) Entrypoints Integration (Multimodal)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (Multimodal)\"\n   device: h200_35gb\n   key: entrypoints-integration-multimodal\n   timeout_in_minutes: 45\n@@ -197,7 +197,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Entrypoints Integration (Pooling)\"\n+- label: \":nvidia: (H200 MIG 35GB) Entrypoints Integration (Pooling)\"\n   device: h200_35gb\n   key: entrypoints-integration-pooling\n   timeout_in_minutes: 75\n@@ -210,7 +210,7 @@ steps:\n   - export VLLM_WORKER_MULTIPROC_METHOD=spawn\n   - pytest -v -s entrypoints/pooling\n \n-- label: \":nvidia: (H200) OpenAI API Correctness\"\n+- label: \":nvidia: (H200 MIG 18GB) OpenAI API Correctness\"\n   key: openai-api-correctness\n   timeout_in_minutes: 20\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/expert_parallelism.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Expert Parallelism\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) EPLB Algorithm\"\n+- label: \":nvidia: (H200 MIG 18GB) EPLB Algorithm\"\n   key: eplb-algorithm\n   timeout_in_minutes: 20\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/jit_monitor.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: JIT Monitor\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) No Runtime JITs E2E\"\n+- label: \":nvidia: (H200 MIG 35GB) No Runtime JITs E2E\"\n   key: jit-monitor-no-runtime-jit\n   device: h200_35gb\n   timeout_in_minutes: 45"
+        },
+        {
+          "filename": ".buildkite/test_areas/kernels.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -2,7 +2,7 @@ group: Kernels\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) vLLM IR\"\n+- label: \":nvidia: (H200 MIG 18GB) vLLM IR\"\n   key: vllm-ir-tests\n   timeout_in_minutes: 35\n   device: h200_18gb\n@@ -14,7 +14,7 @@ steps:\n     - pytest -v -s tests/ir\n     - pytest -v -s tests/kernels/ir\n \n-- label: \":nvidia: (H200) Core Operation Kernels Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Core Operation Kernels Shard %N\"\n   device: h200_35gb\n   key: kernels-core-operation-test\n   timeout_in_minutes: 120\n@@ -225,7 +225,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Mamba Kernels\"\n+- label: \":nvidia: (H200 MIG 35GB) Mamba Kernels\"\n   device: h200_35gb\n   key: kernels-mamba-test\n   timeout_in_minutes: 60"
+        },
+        {
+          "filename": ".buildkite/test_areas/lm_eval.yaml",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 4,
+          "patch": "@@ -2,7 +2,7 @@ group: LM Eval\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) LM Eval Small Models\"\n+- label: \":nvidia: (H200 MIG 35GB) LM Eval Small Models\"\n   device: h200_35gb\n   key: lm-eval-small-models\n   timeout_in_minutes: 45\n@@ -291,7 +291,7 @@ steps:\n   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=evals/gsm8k/configs/humming/config-act-fp8.txt\n   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=evals/gsm8k/configs/humming/config-act-int8.txt\n \n-- label: \":nvidia: (H200) LM Eval TurboQuant KV Cache\"\n+- label: \":nvidia: (H200 MIG 18GB) LM Eval TurboQuant KV Cache\"\n   key: lm-eval-turboquant-kv-cache\n   timeout_in_minutes: 55\n   device: h200_18gb\n@@ -347,7 +347,7 @@ steps:\n     - uv pip install --system 'gpt-oss[eval]==0.0.5'\n     - pytest -s -v evals/gpt_oss/test_gpqa_correctness.py --config-list-file=configs/models-spark.txt\n \n-- label: \":nvidia: (H200) LM Eval KV-Offload\"\n+- label: \":nvidia: (H200 MIG 35GB) LM Eval KV-Offload\"\n   key: kv-offload-small\n   timeout_in_minutes: 30\n   device: h200_35gb\n@@ -388,7 +388,7 @@ steps:\n   commands:\n   - pytest -s -v evals/gsm8k/test_gsm8k_offloading.py -k \"deepseek-v4-flash\"\n \n-- label: \":nvidia: (H200) MRCR Eval Small Models\"\n+- label: \":nvidia: (H200 MIG 35GB) MRCR Eval Small Models\"\n   device: h200_35gb\n   timeout_in_minutes: 25\n   source_file_dependencies:"
+        },
+        {
+          "filename": ".buildkite/test_areas/lora.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: LoRA\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) LoRA Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) LoRA Shard %N\"\n   device: h200_35gb\n   key: lora\n   timeout_in_minutes: 40"
+        },
+        {
+          "filename": ".buildkite/test_areas/misc.yaml",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 8,
+          "patch": "@@ -2,7 +2,7 @@ group: Miscellaneous\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) V1 Sample + Logits\"\n+- label: \":nvidia: (H200 MIG 18GB) V1 Sample + Logits\"\n   key: v1-sample-logits\n   timeout_in_minutes: 83\n   device: h200_18gb\n@@ -40,7 +40,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) V1 Core + KV + Metrics\"\n+- label: \":nvidia: (H200 MIG 35GB) V1 Core + KV + Metrics\"\n   device: h200_35gb\n   key: v1-core-kv-metrics\n   timeout_in_minutes: 80\n@@ -132,7 +132,7 @@ steps:\n     - pytest -v -s -m 'cpu_test' v1/ec_connector/unit\n     - pytest -v -s -m 'cpu_test' v1/metrics\n \n-- label: \":nvidia: (H200) Extract Hidden States Integration\"\n+- label: \":nvidia: (H200 MIG 18GB) Extract Hidden States Integration\"\n   key: extract-hidden-states-integration\n   timeout_in_minutes: 20\n   device: h200_18gb\n@@ -162,7 +162,7 @@ steps:\n     - export VLLM_WORKER_MULTIPROC_METHOD=spawn\n     - pytest -v -s -m 'distributed' tests/v1/kv_connector/extract_hidden_states_integration\n \n-- label: \":nvidia: (H200) Regression\"\n+- label: \":nvidia: (H200 MIG 18GB) Regression\"\n   key: regression\n   timeout_in_minutes: 30\n   device: h200_18gb\n@@ -185,7 +185,7 @@ steps:\n   - pytest -v -s test_regression.py\n   working_dir: \"/vllm-workspace/tests\" # optional\n \n-- label: \":nvidia: (H200) Examples\"\n+- label: \":nvidia: (H200 MIG 35GB) Examples\"\n   device: h200_35gb\n   key: examples\n   timeout_in_minutes: 40\n@@ -268,7 +268,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Python-only Installation\"\n+- label: \":nvidia: (H200 MIG 18GB) Python-only Installation\"\n   key: python-only-installation\n   depends_on: ~\n   optional: true\n@@ -293,7 +293,7 @@ steps:\n       - setup.py\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Async Engine, Inputs, Utils, Worker\"\n+- label: \":nvidia: (H200 MIG 35GB) Async Engine, Inputs, Utils, Worker\"\n   device: h200_35gb\n   key: async-engine-inputs-utils-worker\n   timeout_in_minutes: 25\n@@ -440,7 +440,7 @@ steps:\n     - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py\n     - pytest -v -s v1/determinism/test_online_batch_invariance.py\n \n-- label: \":nvidia: (H200) Acceptance Length (Large Models)\"\n+- label: \":nvidia: (H200 MIG 35GB) Acceptance Length (Large Models)\"\n   device: h200_35gb\n   key: acceptance-length-test-large-models\n   timeout_in_minutes: 20"
+        },
+        {
+          "filename": ".buildkite/test_areas/model_executor.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Model Executor\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Model Executor\"\n+- label: \":nvidia: (H200 MIG 35GB) Model Executor\"\n   device: h200_35gb\n   key: model-executor\n   timeout_in_minutes: 60"
+        },
+        {
+          "filename": ".buildkite/test_areas/model_runner_v2.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -2,7 +2,7 @@ group: Model Runner V2\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Model Runner V2 Core\"\n+- label: \":nvidia: (H200 MIG 35GB) Model Runner V2 Core\"\n   device: h200_35gb\n   key: model-runner-v2-core-tests\n   timeout_in_minutes: 35\n@@ -24,7 +24,7 @@ steps:\n   # Temporary hack filter to exclude ngram spec decoding based tests.\n   - pytest -v -s entrypoints/llm/test_struct_output_generate.py -k \"xgrammar and not speculative_config6 and not speculative_config7 and not speculative_config8 and not speculative_config0\"\n \n-- label: \":nvidia: (H200) Model Runner V2 Examples\"\n+- label: \":nvidia: (H200 MIG 35GB) Model Runner V2 Examples\"\n   device: h200_35gb\n   key: model-runner-v2-examples\n   timeout_in_minutes: 35\n@@ -126,7 +126,7 @@ steps:\n     - pytest -v -s distributed/test_pp_cudagraph.py -k \"not ray\"\n     - pytest -v -s v1/distributed/test_pp_dp_v2.py\n \n-- label: \":nvidia: (H200) Model Runner V2 Spec Decode\"\n+- label: \":nvidia: (H200 MIG 35GB) Model Runner V2 Spec Decode\"\n   device: h200_35gb\n   key: model-runner-v2-spec-decode\n   timeout_in_minutes: 50"
+        },
+        {
+          "filename": ".buildkite/test_areas/models_basic.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -2,7 +2,7 @@ group: Models - Basic\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Basic Models (Initialization)\"\n+- label: \":nvidia: (H200 MIG 18GB) Basic Models (Initialization)\"\n   key: basic-models-tests-initialization\n   timeout_in_minutes: 25\n   device: h200_18gb\n@@ -23,7 +23,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Basic Models (Extra Initialization) Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Basic Models (Extra Initialization) Shard %N\"\n   device: h200_35gb\n   key: basic-models-tests-extra-initialization\n   timeout_in_minutes: 100\n@@ -38,7 +38,7 @@ steps:\n     - pytest -v -s models/test_initialization.py -k 'not test_can_initialize_small_subset' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB\n   parallelism: 4\n \n-- label: \":nvidia: (H200) Basic Models (Other)\"\n+- label: \":nvidia: (H200 MIG 35GB) Basic Models (Other)\"\n   device: h200_35gb\n   key: basic-models-tests-other\n   timeout_in_minutes: 35"
+        },
+        {
+          "filename": ".buildkite/test_areas/models_language.yaml",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 7,
+          "patch": "@@ -2,7 +2,7 @@ group: Models - Language\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Language Models (Standard)\"\n+- label: \":nvidia: (H200 MIG 18GB) Language Models (Standard)\"\n   key: language-models-tests-standard\n   timeout_in_minutes: 30\n   device: h200_18gb\n@@ -23,7 +23,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Language Models (Extra Standard) Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Language Models (Extra Standard) Shard %N\"\n   device: h200_35gb\n   key: language-models-tests-extra-standard\n   timeout_in_minutes: 40\n@@ -57,7 +57,7 @@ steps:\n       - tests/models/language/pooling/test_classification.py\n       - vllm/_aiter_ops.py\n       - vllm/platforms/rocm.py\n-- label: \":nvidia: (H200) Language Models (Hybrid) Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Language Models (Hybrid) Shard %N\"\n   device: h200_35gb\n   key: language-models-tests-hybrid\n   timeout_in_minutes: 65\n@@ -104,7 +104,7 @@ steps:\n     - CAUSAL_CONV1D_FORCE_BUILD=TRUE uv pip install --system --no-build-isolation 'git+https://github.com/Dao-AILab/causal-conv1d@v1.6.0'\n     - pytest -v -s models/language/generation -m hybrid_model -k 'granite-4.0-tiny-preview'\n \n-- label: \":nvidia: (H200) Language Models (Extended Generation)\"\n+- label: \":nvidia: (H200 MIG 35GB) Language Models (Extended Generation)\"\n   device: h200_35gb\n   key: language-models-test-extended-generation\n   timeout_in_minutes: 80\n@@ -133,7 +133,7 @@ steps:\n       - CAUSAL_CONV1D_FORCE_BUILD=TRUE uv pip install --system --no-build-isolation 'git+https://github.com/Dao-AILab/causal-conv1d@v1.6.0'\n       - pytest -v -s models/language/generation -m '(not core_model) and (not hybrid_model)'\n \n-- label: \":nvidia: (H200) Language Models (PPL)\"\n+- label: \":nvidia: (H200 MIG 18GB) Language Models (PPL)\"\n   key: language-models-test-ppl\n   timeout_in_minutes: 30\n   device: h200_18gb\n@@ -171,7 +171,7 @@ steps:\n       - vllm/platforms/rocm.py\n       - tests/models/language/generation_ppl_test\n \n-- label: \":nvidia: (H200) Language Models (Extended Pooling) Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Language Models (Extended Pooling) Shard %N\"\n   device: h200_35gb\n   key: language-models-test-extended-pooling\n   timeout_in_minutes: 120\n@@ -195,7 +195,7 @@ steps:\n       commands:\n       - pytest -v -s models/language/pooling -m 'not core_model' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB\n \n-- label: \":nvidia: (H200) Language Models (MTEB)\"\n+- label: \":nvidia: (H200 MIG 18GB) Language Models (MTEB)\"\n   key: language-models-test-mteb\n   timeout_in_minutes: 68\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/models_multimodal.yaml",
+          "status": "modified",
+          "additions": 11,
+          "deletions": 11,
+          "patch": "@@ -2,7 +2,7 @@ group: Models - Multimodal\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Multimodal Models (Standard) 1: qwen2\"\n+- label: \":nvidia: (H200 MIG 18GB) Multimodal Models (Standard) 1: qwen2\"\n   key: multi-modal-models-standard-1-qwen2\n   timeout_in_minutes: 68\n   device: h200_18gb\n@@ -22,7 +22,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Standard) 2: qwen3 + gemma\"\n+- label: \":nvidia: (H200 MIG 18GB) Multimodal Models (Standard) 2: qwen3 + gemma\"\n   key: multi-modal-models-standard-2-qwen3-gemma\n   timeout_in_minutes: 75\n   device: h200_18gb\n@@ -43,7 +43,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Standard) 3: llava + qwen2_vl\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (Standard) 3: llava + qwen2_vl\"\n   device: h200_35gb\n   key: multi-modal-models-standard-3-llava-qwen2-vl\n   timeout_in_minutes: 40\n@@ -62,7 +62,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Standard) 4: other + whisper\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (Standard) 4: other + whisper\"\n   device: h200_35gb\n   key: multi-modal-models-standard-4-other-whisper\n   timeout_in_minutes: 75\n@@ -99,7 +99,7 @@ steps:\n     - pytest -v -s models/multimodal/processing --ignore models/multimodal/processing/test_tensor_schema.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB\n   parallelism: 4\n \n-- label: \":nvidia: (H200) Multimodal Processor\"\n+- label: \":nvidia: (H200 MIG 18GB) Multimodal Processor\"\n   key: multi-modal-processor\n   timeout_in_minutes: 98\n   device: h200_18gb\n@@ -119,7 +119,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Accuracy Eval (Small Models)\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Accuracy Eval (Small Models)\"\n   device: h200_35gb\n   key: multi-modal-accuracy-eval-small-models\n   timeout_in_minutes: 30\n@@ -145,7 +145,7 @@ steps:\n       - vllm/platforms/rocm.py\n       - vllm/model_executor/model_loader/\n \n-- label: \":nvidia: (H200) Multimodal Models (Extended Generation 1)\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (Extended Generation 1)\"\n   device: h200_35gb\n   key: multi-modal-models-extended-generation-1\n   optional: true\n@@ -166,7 +166,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (PPL)\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (PPL)\"\n   device: h200_35gb\n   key: multi-modal-models-extended-ppl\n   optional: true\n@@ -184,7 +184,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Extended Generation 2) Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (Extended Generation 2) Shard %N\"\n   device: h200_35gb\n   key: multi-modal-models-extended-generation-2\n   parallelism: 4\n@@ -204,7 +204,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Extended Generation 3)\"\n+- label: \":nvidia: (H200 MIG 35GB) Multimodal Models (Extended Generation 3)\"\n   device: h200_35gb\n   key: multi-modal-models-extended-generation-3\n   optional: true\n@@ -223,7 +223,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Multimodal Models (Extended Pooling)\"\n+- label: \":nvidia: (H200 MIG 18GB) Multimodal Models (Extended Pooling)\"\n   key: multi-modal-models-extended-pooling\n   optional: true\n   device: h200_18gb"
+        },
+        {
+          "filename": ".buildkite/test_areas/plugins.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -62,7 +62,7 @@ steps:\n       - vllm/platforms/rocm.py\n \n \n-- label: \":nvidia: (H200) GGUF Plugin\"\n+- label: \":nvidia: (H200 MIG 18GB) GGUF Plugin\"\n   key: gguf-plugin\n   device: h200_18gb\n   timeout_in_minutes: 30\n@@ -75,7 +75,7 @@ steps:\n     - pip install \"vllm-gguf-plugin >= 0.0.2\"\n     - pytest -v -s plugins_tests/gguf\n \n-- label: \":nvidia: (H200) BitsAndBytes Plugin\"\n+- label: \":nvidia: (H200 MIG 18GB) BitsAndBytes Plugin\"\n   key: bitsandbytes-plugin\n   device: h200_18gb\n   timeout_in_minutes: 30"
+        },
+        {
+          "filename": ".buildkite/test_areas/pytorch.yaml",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 4,
+          "patch": "@@ -2,7 +2,7 @@ group: PyTorch\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) PyTorch Compilation\"\n+- label: \":nvidia: (H200 MIG 35GB) PyTorch Compilation\"\n   device: h200_35gb\n   key: pytorch-compilation-unit-tests\n   timeout_in_minutes: 60\n@@ -54,7 +54,7 @@ steps:\n       - csrc/\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) PyTorch Compilation H100 Cases\"\n+- label: \":nvidia: (H200 MIG 18GB) PyTorch Compilation H100 Cases\"\n   key: pytorch-compilation-unit-tests-h100\n   timeout_in_minutes: 30\n   device: h200_18gb\n@@ -121,7 +121,7 @@ steps:\n   commands:\n   - pytest -s -v compile/passes --ignore compile/passes/distributed\n \n-- label: \":nvidia: (H200) PyTorch Fullgraph\"\n+- label: \":nvidia: (H200 MIG 35GB) PyTorch Fullgraph\"\n   device: h200_35gb\n   key: pytorch-fullgraph-test\n   timeout_in_minutes: 90\n@@ -195,7 +195,7 @@ steps:\n   commands:\n   - pytest -s -v compile/fullgraph/test_full_cudagraph.py\n \n-- label: \":nvidia: (H200) PyTorch Nightly Dependency Override Check\"\n+- label: \":nvidia: (H200 MIG 18GB) PyTorch Nightly Dependency Override Check\"\n   key: pytorch-nightly-dependency-override-check\n   # if this test fails, it means the nightly torch version is not compatible with some\n   # of the dependencies. Please check the error message and add the package to whitelist"
+        },
+        {
+          "filename": ".buildkite/test_areas/quantization.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -2,7 +2,7 @@ group: Quantization\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Quantization Shard %N\"\n+- label: \":nvidia: (H200 MIG 35GB) Quantization Shard %N\"\n   device: h200_35gb\n   key: quantization\n   timeout_in_minutes: 40\n@@ -21,7 +21,7 @@ steps:\n   # parameter. It was not exercised by the previous L4 job.\n   - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py -k 'not test_compressed_tensors_w4a8_fp8' --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT\n \n-- label: \":nvidia: (H200) Quantized Fusions\"\n+- label: \":nvidia: (H200 MIG 35GB) Quantized Fusions\"\n   device: h200_35gb\n   key: quantized-fusions\n   timeout_in_minutes: 20\n@@ -52,7 +52,7 @@ steps:\n   commands:\n     - pytest -s -v tests/quantization/test_blackwell_moe.py\n \n-- label: \":nvidia: (H200) Quantized Models\"\n+- label: \":nvidia: (H200 MIG 35GB) Quantized Models\"\n   device: h200_35gb\n   key: quantized-models-test\n   timeout_in_minutes: 65"
+        },
+        {
+          "filename": ".buildkite/test_areas/ray_compat.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Ray Compatibility\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Ray Dependency Compatibility Check\"\n+- label: \":nvidia: (H200 MIG 18GB) Ray Dependency Compatibility Check\"\n   key: ray-dependency-compatibility-check\n   # Informational only — does not block the pipeline.\n   # If this fails, it means the PR introduces a dependency that"
+        },
+        {
+          "filename": ".buildkite/test_areas/rust_frontend.yaml",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 4,
+          "patch": "@@ -2,7 +2,7 @@ group: Rust Frontend E2E\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) Rust Frontend OpenAI Coverage\"\n+- label: \":nvidia: (H200 MIG 18GB) Rust Frontend OpenAI Coverage\"\n   timeout_in_minutes: 30\n   device: h200_18gb\n   working_dir: \"/vllm-workspace/tests\"\n@@ -60,7 +60,7 @@ steps:\n       - tests/v1/sample/test_logprobs_e2e.py\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Rust Frontend Serve/Admin Coverage\"\n+- label: \":nvidia: (H200 MIG 18GB) Rust Frontend Serve/Admin Coverage\"\n   timeout_in_minutes: 25\n   device: h200_18gb\n   working_dir: \"/vllm-workspace/tests\"\n@@ -109,7 +109,7 @@ steps:\n       - tests/entrypoints/serve/tokenize/test_tokenization.py\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Rust Frontend Core Correctness\"\n+- label: \":nvidia: (H200 MIG 18GB) Rust Frontend Core Correctness\"\n   timeout_in_minutes: 20\n   device: h200_18gb\n   working_dir: \"/vllm-workspace/tests\"\n@@ -123,7 +123,7 @@ steps:\n   - export VLLM_WORKER_MULTIPROC_METHOD=spawn\n   - pytest -s entrypoints/openai/correctness/test_lmeval.py::test_lm_eval_accuracy_v1_engine\n \n-- label: \":nvidia: (H200) Rust Frontend Tool Use\"\n+- label: \":nvidia: (H200 MIG 35GB) Rust Frontend Tool Use\"\n   device: h200_35gb\n   timeout_in_minutes: 25\n   working_dir: \"/vllm-workspace/tests\""
+        },
+        {
+          "filename": ".buildkite/test_areas/samplers.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -2,7 +2,7 @@ group: Samplers\n depends_on: \n   - image-build\n steps:\n-- label: \":nvidia: (H200) Samplers\"\n+- label: \":nvidia: (H200 MIG 35GB) Samplers\"\n   device: h200_35gb\n   key: samplers-test\n   timeout_in_minutes: 40"
+        },
+        {
+          "filename": ".buildkite/test_areas/spec_decode.yaml",
+          "status": "modified",
+          "additions": 9,
+          "deletions": 9,
+          "patch": "@@ -2,7 +2,7 @@ group: Spec Decode\n depends_on:\n   - image-build\n steps:\n-- label: \":nvidia: (H200) V1 Spec Decode\"\n+- label: \":nvidia: (H200 MIG 35GB) V1 Spec Decode\"\n   device: h200_35gb\n   key: v1-spec-decode\n   timeout_in_minutes: 40\n@@ -30,7 +30,7 @@ steps:\n       depends_on:\n       - image-build-amd\n \n-- label: \":nvidia: (H200) Spec Decode Eagle 1: DeepSeek + Qwen\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode Eagle 1: DeepSeek + Qwen\"\n   key: spec-decode-eagle-1-deepseek-qwen\n   timeout_in_minutes: 25\n   device: h200_35gb\n@@ -57,7 +57,7 @@ steps:\n       - tests/v1/e2e/spec_decode/\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Spec Decode Eagle 2: Llama 3 + Qwen VL + Other\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode Eagle 2: Llama 3 + Qwen VL + Other\"\n   key: spec-decode-eagle-2-llama3-qwen-vl-other\n   timeout_in_minutes: 25\n   device: h200_35gb\n@@ -96,7 +96,7 @@ steps:\n   commands:\n     - pytest -v -s v1/e2e/spec_decode/eagle/\n \n-- label: \":nvidia: (H200) Spec Decode Speculators + MTP\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode Speculators + MTP\"\n   key: spec-decode-speculators-mtp\n   timeout_in_minutes: 50\n   device: h200_35gb\n@@ -141,7 +141,7 @@ steps:\n     - pytest -v -s v1/e2e/spec_decode/speculators/\n     - pytest -v -s v1/e2e/spec_decode/mtp/\n \n-- label: \":nvidia: (H200) Spec Decode N-Gram + Suffix\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode N-Gram + Suffix\"\n   key: spec-decode-ngram-suffix\n   timeout_in_minutes: 20\n   device: h200_35gb\n@@ -170,7 +170,7 @@ steps:\n       - tests/v1/e2e/spec_decode/\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Spec Decode Draft Model\"\n+- label: \":nvidia: (H200 MIG 18GB) Spec Decode Draft Model\"\n   key: spec-decode-draft-model\n   timeout_in_minutes: 45\n   device: h200_18gb\n@@ -269,7 +269,7 @@ steps:\n       - tests/v1/e2e/spec_decode/test_mtp_parallel_load.py\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Spec Decode AL DFlash Nightly\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode AL DFlash Nightly\"\n   key: spec-decode-dflash-nightly\n   timeout_in_minutes: 90\n   device: h200_35gb\n@@ -305,7 +305,7 @@ steps:\n       - tests/v1/e2e/spec_decode/\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Spec Decode AL DSpark Nightly\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode AL DSpark Nightly\"\n   key: spec-decode-dspark-nightly\n   timeout_in_minutes: 60\n   device: h200_35gb\n@@ -345,7 +345,7 @@ steps:\n       - tests/v1/e2e/spec_decode/\n       - vllm/platforms/rocm.py\n \n-- label: \":nvidia: (H200) Spec Decode AL MTP + Other Acceptance Nightly\"\n+- label: \":nvidia: (H200 MIG 35GB) Spec Decode AL MTP + Other Acceptance Nightly\"\n   key: spec-decode-mtp-other-acceptance-nightly\n   timeout_in_minutes: 60\n   device: h200_35gb"
+        }
+      ]
+    },
+    {
+      "sha": "8c51b92654100aa1d698aeef862cad09c8cc5df8",
+      "author": {
+        "name": "Jiangyun Zhu",
+        "email": "riverclouds.zhu@qq.com"
+      },
+      "date": "2026-08-30T18:31:47+08:00",
+      "message": "[Bugfix] Avoid global config lookup in sparse indexer forward (#54400)\n\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "parents": [
+        "2c7d7dd64a2eaba0feedf42cab2f527486d7479c"
+      ],
+      "stats": {
+        "total_additions": 2,
+        "total_deletions": 3,
+        "files_changed": 5
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/layers/sparse_attn_indexer.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 3,
+          "patch": "@@ -769,6 +769,7 @@ def __init__(\n         # during model construction) and pass them into the custom op, rather\n         # than threading them through per-step metadata.\n         parallel_config = get_current_vllm_config().parallel_config\n+        self._parallel_config = parallel_config\n         self.dcp_world_size = parallel_config.decode_context_parallel_size\n         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0\n         self.use_pcp = parallel_config.prefill_context_parallel_size > 1\n@@ -787,9 +788,7 @@ def cp_kv_cache_interleave_size(self) -> int:\n         (it's set up in Worker.initialize_from_config, ahead of warmup/serving).\n         \"\"\"\n         if self._cp_kv_cache_interleave_size is None:\n-            value = (\n-                get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size\n-            )\n+            value = self._parallel_config.cp_kv_cache_interleave_size\n             if isinstance(get_forward_context().attn_metadata, dict):\n                 self._cp_kv_cache_interleave_size = value\n             return value"
+        }
+      ]
+    },
+    {
+      "sha": "2c7d7dd64a2eaba0feedf42cab2f527486d7479c",
+      "author": {
+        "name": "Simon Danielsson",
+        "email": "70206058+simondanielsson@users.noreply.github.com"
+      },
+      "date": "2026-08-30T16:24:20+08:00",
+      "message": "[Perf][ROCm] Dual-stream decode with hipgraphs (#52033)\n\nSigned-off-by: simondanielsson <simon.danielsson99@hotmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nCo-authored-by: Shanshan Shen <467638484@qq.com>",
+      "parents": [
+        "4f78a8fdd0b06421f0cedf1ef23220b76a527de7"
+      ],
+      "stats": {
+        "total_additions": 70,
+        "total_deletions": 57,
+        "files_changed": 127
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "status": "modified",
+          "additions": 29,
+          "deletions": 18,
+          "patch": "@@ -283,11 +283,24 @@ def __init__(\n         self._shared_experts: SharedExperts | None = None\n         if shared_experts is not None:\n             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts\n+            # When unquantized, shared expert inputs alias the hidden states,\n+            # which can lead to race condition in multi-stream mode. Quantized\n+            # routed experts copy the input into a fresh buffer first, breaking\n+            # the alias, so overlap is safe. Only observed on ROCm.\n+            routed_input_is_quantized = lambda: (\n+                self.routed_experts.quant_method.moe_quant_config is not None\n+                and self.routed_experts.quant_method.moe_quant_config.quant_dtype\n+                is not None\n+            )\n+            is_multistream_safe = lambda: (\n+                not current_platform.is_rocm() or routed_input_is_quantized()\n+            )\n             self._shared_experts = SharedExperts(\n                 shared_experts,\n                 moe_config=moe_config,\n                 enable_dbo=enable_dbo,\n                 mk_can_overlap_shared_experts=can_overlap,\n+                is_multistream_safe=is_multistream_safe,\n             )\n \n         # Needed for string -> MoERunner layer lookup in custom ops.\n@@ -582,12 +595,17 @@ def _apply_quant_method(\n         router_logits: torch.Tensor,\n         shared_experts_input: torch.Tensor | None,\n         input_ids: torch.Tensor | None = None,\n+        shared_experts_overlapping: bool = False,\n     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:\n         \"\"\"Run expert routing and the fused MoE kernel via the quant method.\n \n         Orchestrates shared expert execution (before/after), expert selection\n         via the router, and the actual fused MoE computation. Returns\n         (shared_expert_output, fused_expert_output).\n+\n+        `shared_experts_overlapping` should be True only if using multi-stream\n+        overlap. Then the shared expert was already launched in a separate\n+        stream, so the results only have to be awaited here.\n         \"\"\"\n         self._maybe_apply_shared_experts(\n             shared_experts_input, SharedExpertsOrder.NO_OVERLAP\n@@ -617,10 +635,9 @@ def _apply_quant_method(\n                 shared_experts_input=shared_experts_input,\n             )\n \n-        self._maybe_apply_shared_experts(\n-            shared_experts_input,\n-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,\n-        )\n+        if shared_experts_overlapping:\n+            assert self._shared_experts is not None\n+            self._shared_experts.wait()\n \n         return (\n             self._shared_experts.output if self._shared_experts is not None else None,\n@@ -642,18 +659,6 @@ def _sequence_parallel_context(self):\n             else nullcontext()\n         )\n \n-    def _maybe_sync_shared_experts_stream(\n-        self,\n-        shared_experts_input: torch.Tensor | None,\n-    ):\n-        # If router/gate provided, then apply it here.\n-        # (Note: This code runs only when \"overlapped mode\" is on to allow\n-        #        parallel execution of shared experts with the RoutedExperts via\n-        #        separate cuda stream)\n-        if self._shared_experts is not None:\n-            assert shared_experts_input is not None\n-            self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)\n-\n     def _maybe_add_zero_expert_output(\n         self,\n         result: torch.Tensor,\n@@ -878,8 +883,13 @@ def _forward_impl(\n         # TODO(bnell): this can be removed after MK migration is complete.\n         self.routed_experts._ensure_moe_quant_config_init()\n \n-        # Sync aux and main stream for shared expert multi-stream overlap.\n-        self._maybe_sync_shared_experts_stream(shared_experts_input)\n+        # If using multi-stream overlap for shared experts, we must launch it\n+        # before routed expert dispatch.\n+        shared_experts_overlapping = False\n+        if self._shared_experts is not None:\n+            shared_experts_overlapping = self._shared_experts.maybe_forward_async(\n+                shared_experts_input\n+            )\n \n         # If the Runner holds the gate, apply it after the stream sync,\n         # so it can run overlapped with the\n@@ -905,6 +915,7 @@ def _forward_impl(\n                 router_logits=router_logits,\n                 shared_experts_input=shared_experts_input,\n                 input_ids=input_ids,\n+                shared_experts_overlapping=shared_experts_overlapping,\n             )\n \n             return self._maybe_combine("
+        },
+        {
+          "filename": "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
+          "status": "modified",
+          "additions": 41,
+          "deletions": 39,
+          "patch": "@@ -43,6 +43,7 @@ def __init__(\n         moe_config: FusedMoEConfig,\n         enable_dbo: bool,\n         mk_can_overlap_shared_experts: Callable[[], bool],\n+        is_multistream_safe: Callable[[], bool],\n     ):\n         super().__init__()\n \n@@ -57,6 +58,10 @@ def __init__(\n \n         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts\n \n+        # Might not be safe to run multi-stream mode if routed and shared experts\n+        # alias the same inputs\n+        self._is_multistream_safe = is_multistream_safe\n+\n         # Allow disabling of the separate shared experts stream for\n         # debug purposes.\n         # TODO: Remove this after more extensive testings with TP/DP\n@@ -65,11 +70,12 @@ def __init__(\n             logger.debug_once(\"Disabling MoE shared_experts cuda stream\")\n             self._stream = None\n         else:\n-            # TODO(rob): enable shared expert overlap with non-cuda-alike.\n-            # aux_stream() returns None on non-cuda-alike platforms.\n             self._stream = aux_stream()\n             if self._stream is not None:\n                 logger.debug_once(\"Enabled separate cuda stream for MoE shared_experts\")\n+                # One pair per DBO ubatch id to sync aux and main stream.\n+                self._input_ready_event = [torch.cuda.Event(), torch.cuda.Event()]\n+                self._output_ready_event = [torch.cuda.Event(), torch.cuda.Event()]\n \n     # TODO(bnell): Hack for elastic_ep. Get rid of this\n     def _set_moe_config(self, new_moe_config: FusedMoEConfig):\n@@ -106,50 +112,51 @@ def _determine_shared_experts_order(\n         if self._mk_can_overlap_shared_experts():\n             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED\n \n+        # On ROCm, empirically only DP-only deployments benefit from the overlap.\n+        overlap_is_beneficial = not current_platform.is_rocm() or (\n+            self._moe_config.moe_parallel_config.dp_size > 1\n+            and self._moe_config.moe_parallel_config.tp_size == 1\n+        )\n+\n         should_run_shared_in_aux_stream = (\n-            current_platform.is_cuda()\n+            current_platform.is_cuda_alike()\n             and self._stream is not None\n             and hidden_states.shape[0]\n             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD\n+            and overlap_is_beneficial\n+            and self._is_multistream_safe()\n         )\n \n         if should_run_shared_in_aux_stream:\n             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED\n         else:\n             return SharedExpertsOrder.NO_OVERLAP\n \n-    def maybe_sync_shared_experts_stream(\n-        self,\n-        shared_experts_input: torch.Tensor,\n-    ):\n-        experts_order = self._determine_shared_experts_order(shared_experts_input)\n-\n-        if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:\n-            assert self._stream is not None\n-\n-            # Record that the clone will be used by shared_experts_stream\n-            # to avoid gc issue from deallocation of hidden_states_clone\n-            # For more details: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501\n-            # NOTE: We don't need shared_output.record_stream(current_stream())\n-            # because we synch the streams before using shared_output.\n-            shared_experts_input.record_stream(self._stream)\n-\n-            # Mark sync start point for the aux stream since we will\n-            # run in parallel with router/gate.\n-            self._stream.wait_stream(current_stream())\n-\n-    def _run_in_aux_stream(\n-        self,\n-        shared_experts_input: torch.Tensor,\n-    ) -> torch.Tensor:\n-        # TODO: assert that maybe_sync_shared_experts_stream has been called.\n-\n-        # Run shared experts in parallel on a separate stream.\n+    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:\n+        \"\"\"Enqueue shared experts on the aux stream without waiting for them.\n+\n+        Returns true if the shared experts were enqueued, false otherwise. Call\n+        `wait` to wait for the shared experts to finish if this returns true.\n+        \"\"\"\n+        if (\n+            self._determine_shared_experts_order(shared_experts_input)\n+            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED\n+        ):\n+            return False\n+        assert self._stream is not None\n+        idx = self._output_idx\n+        assert self._output[idx] is None\n+        self._input_ready_event[idx].record(current_stream())\n         with torch.cuda.stream(self._stream):\n-            output = self._layer(shared_experts_input)\n-        current_stream().wait_stream(self._stream)\n+            self._input_ready_event[idx].wait(self._stream)\n+            self._output[idx] = self._layer(shared_experts_input)\n+            self._output_ready_event[idx].record(self._stream)\n+        return True\n \n-        return output\n+    def wait(self) -> None:\n+        \"\"\"Block the main stream until `maybe_forward_async` output is ready.\"\"\"\n+        assert self._stream is not None\n+        self._output_ready_event[self._output_idx].wait(current_stream())\n \n     @property\n     def _output_idx(self) -> int:\n@@ -174,11 +181,6 @@ def forward(\n \n         assert self._output[self._output_idx] is None\n \n-        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:\n-            self._output[self._output_idx] = self._run_in_aux_stream(\n-                shared_experts_input\n-            )\n-        else:\n-            self._output[self._output_idx] = self._layer(shared_experts_input)\n+        self._output[self._output_idx] = self._layer(shared_experts_input)\n \n         assert self._output[self._output_idx] is not None"
+        }
+      ]
+    },
+    {
+      "sha": "4f78a8fdd0b06421f0cedf1ef23220b76a527de7",
+      "author": {
+        "name": "Devon Krisman",
+        "email": "844724+dkrisman@users.noreply.github.com"
+      },
+      "date": "2026-08-30T16:07:29+08:00",
+      "message": "[Model] Honor cap_pixels_per_frame in Qwen3-VL memory profiling (#54380)\n\nSigned-off-by: Devon Krisman <git@krisman.dev>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+      "parents": [
+        "b383e163961650c663ad2062544ecbee1b56afc8"
+      ],
+      "stats": {
+        "total_additions": 66,
+        "total_deletions": 1,
+        "files_changed": 67
+      },
+      "files": [
+        {
+          "filename": "tests/models/multimodal/processing/test_qwen3_vl.py",
+          "status": "modified",
+          "additions": 43,
+          "deletions": 0,
+          "patch": "@@ -184,3 +184,46 @@ def test_processor_multi_video_list_kwargs(\n     assert len(video_phs) == 2, (\n         f\"Expected exactly 2 video placeholders, got {len(video_phs)}\"\n     )\n+\n+\n+@pytest.mark.parametrize(\"model_id\", [MODEL_ID])\n+def test_dummy_video_spreads_budget_when_frame_cap_enabled(model_id: str) -> None:\n+    \"\"\"Regression test for memory profiling with ``cap_pixels_per_frame``.\n+\n+    With the HF per-frame pixel cap enabled (transformers#48071) and a\n+    raised video budget, a 2-frame profiling dummy would be processed at\n+    only 2 * cap pixels, underestimating the largest possible video (a\n+    fully sampled one still fills the whole ``longest_edge`` budget). The\n+    dummy builder must spread the budget over enough frames that the cap\n+    is not binding.\n+    \"\"\"\n+    # 16 capped frames' worth of budget on top of the default per-frame\n+    # ceiling (max_video_tokens=768 at patch 16, merge 2 -> 786,432\n+    # pixels per frame).\n+    per_frame_cap = 768 * (16 * 2) ** 2\n+    budget = per_frame_cap * 16\n+    size = {\"longest_edge\": budget, \"shortest_edge\": 4096}\n+\n+    capped_ctx = build_model_context(\n+        model_id,\n+        mm_processor_kwargs={\"size\": size, \"cap_pixels_per_frame\": True},\n+        limit_mm_per_prompt={\"image\": 0, \"video\": 1},\n+    )\n+    capped = MULTIMODAL_REGISTRY.create_processor(capped_ctx.model_config)\n+    capped_dummy = capped.dummy_inputs.get_dummy_mm_data(1024, {\"video\": 1}, {})\n+    capped_frames = capped_dummy[\"video\"][0][0].shape[0]\n+    assert capped_frames == 16, (\n+        f\"Expected the dummy to spread the budget over 16 frames, got {capped_frames}\"\n+    )\n+\n+    uncapped_ctx = build_model_context(\n+        model_id,\n+        mm_processor_kwargs={\"size\": size},\n+        limit_mm_per_prompt={\"image\": 0, \"video\": 1},\n+    )\n+    uncapped = MULTIMODAL_REGISTRY.create_processor(uncapped_ctx.model_config)\n+    uncapped_dummy = uncapped.dummy_inputs.get_dummy_mm_data(1024, {\"video\": 1}, {})\n+    uncapped_frames = uncapped_dummy[\"video\"][0][0].shape[0]\n+    assert uncapped_frames == 2, (\n+        f\"Expected the uncapped dummy to keep 2 frames, got {uncapped_frames}\"\n+    )"
+        },
+        {
+          "filename": "vllm/model_executor/models/qwen3_vl.py",
+          "status": "modified",
+          "additions": 23,
+          "deletions": 1,
+          "patch": "@@ -112,7 +112,7 @@\n from vllm.triton_utils import HAS_TRITON, tl, triton\n from vllm.utils.cache import LRUCache\n from vllm.utils.collection_utils import is_list_of\n-from vllm.utils.math_utils import round_up\n+from vllm.utils.math_utils import cdiv, round_up\n from vllm.utils.torch_utils import PIN_MEMORY\n from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers\n \n@@ -1146,6 +1146,28 @@ def get_dummy_mm_data(\n         # video_max_pixels contains the temporal compression factor,\n         # so we divide by 2 to get the maximum number of image pixels.\n         video_max_pixels = video_size[\"longest_edge\"]\n+\n+        # With the HF processor's per-frame pixel cap enabled\n+        # (cap_pixels_per_frame, huggingface/transformers#48071), a 2-frame\n+        # dummy is processed at only 2 * cap pixels, so memory profiling\n+        # underestimates the largest possible item: a fully sampled video\n+        # still reaches the whole longest_edge budget. Spread the budget\n+        # over enough frames that the cap is not binding for the dummy.\n+        # This takes precedence over a shrinking num_frames override, which\n+        # would otherwise reintroduce the under-profiling.\n+        if mm_kwargs.get(\"cap_pixels_per_frame\"):\n+            max_video_tokens = mm_kwargs.get(\n+                \"max_video_tokens\",\n+                getattr(video_processor, \"max_video_tokens\", 768),\n+            )\n+            patch_size = mm_kwargs.get(\"patch_size\", video_processor.patch_size)\n+            merge_size = mm_kwargs.get(\"merge_size\", video_processor.merge_size)\n+            per_frame_cap = max_video_tokens * (patch_size * merge_size) ** 2\n+            target_num_frames = max(\n+                target_num_frames,\n+                min(video_processor.max_frames, cdiv(video_max_pixels, per_frame_cap)),\n+            )\n+\n         target_video_width, target_video_height = (\n             self.info.get_image_size_with_most_features(\n                 max_pixels=video_max_pixels // temporal_patch_size"
+        }
+      ]
+    },
+    {
+      "sha": "b383e163961650c663ad2062544ecbee1b56afc8",
+      "author": {
+        "name": "Canlin Guo",
+        "email": "canlinguosdu@gmail.com"
+      },
+      "date": "2026-08-30T15:43:20+08:00",
+      "message": "[Bugfix] Reset cached Mamba align metadata on profiling teardown (#54044)\n\nSigned-off-by: Canlin Guo <canlinguosdu@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "8fa4c6cdb3d622c87e4e6952a502caf70dc32cda"
+      ],
+      "stats": {
+        "total_additions": 44,
+        "total_deletions": 0,
+        "files_changed": 44
+      },
+      "files": [
+        {
+          "filename": "tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py",
+          "status": "modified",
+          "additions": 36,
+          "deletions": 0,
+          "patch": "@@ -402,3 +402,39 @@ def _capture_model() -> int:\n \n     assert memory[\"captured\"] - memory[\"before\"] >= 3 * allocation_bytes\n     assert memory[\"after\"] == memory[\"before\"]\n+\n+\n+def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):\n+    \"\"\"Profiling-cached Mamba align metadata must be invalidated at teardown.\n+\n+    ``MambaHybridModelState`` lazily caches ``_mamba_group_ids`` and\n+    ``_mamba_spec`` from whichever KVCacheConfig it first sees. When the\n+    profiling config's group layout differs from the real (e.g. PP-projected)\n+    config, reusing the stale metadata mismatches the real block tables\n+    (\"expected 3 block tables, got 4\" at\n+    ``MambaSpecDecodeGPUContext.initialize_from_forward_context``).\n+    \"\"\"\n+    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)\n+    runner.compilation_config = SimpleNamespace(static_forward_context={})\n+    runner.model_state = SimpleNamespace(\n+        supports_mm_inputs=False,\n+        _mamba_ctx=object(),\n+        _mamba_group_ids=[0, 1],\n+        _mamba_spec=object(),\n+    )\n+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)\n+    runner.kv_caches = []\n+    runner.attn_groups = []\n+    runner.kv_cache_config = SimpleNamespace()\n+    runner.cudagraph_manager = object()\n+    runner.lora_config = None\n+    runner.maybe_remove_all_loras = lambda _: None\n+\n+    monkeypatch.setattr(cgu.torch.accelerator, \"synchronize\", lambda: None)\n+    monkeypatch.setattr(cgu.torch.accelerator, \"empty_cache\", lambda: None)\n+\n+    cgu._teardown_profiling_state(runner)\n+\n+    assert runner.model_state._mamba_ctx is None\n+    assert runner.model_state._mamba_group_ids == []\n+    assert runner.model_state._mamba_spec is None"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/cudagraph_utils.py",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 0,
+          "patch": "@@ -864,6 +864,14 @@ def _teardown_profiling_state(runner: \"GPUModelRunner\") -> None:\n     torch.accelerator.synchronize()\n     if hasattr(runner.model_state, \"_mamba_ctx\"):\n         runner.model_state._mamba_ctx = None\n+    # Invalidate the align-mode Mamba group metadata cached from the\n+    # profiling KVCacheConfig: the real (e.g. PP-projected) config may\n+    # place Mamba layers into a different group layout, so it must be\n+    # re-derived from the real config.\n+    if hasattr(runner.model_state, \"_mamba_group_ids\"):\n+        runner.model_state._mamba_group_ids = []\n+    if hasattr(runner.model_state, \"_mamba_spec\"):\n+        runner.model_state._mamba_spec = None\n     if hasattr(runner, \"kv_caches\"):\n         runner.kv_caches.clear()\n     if hasattr(runner, \"attn_groups\"):"
+        }
+      ]
+    },
+    {
+      "sha": "8fa4c6cdb3d622c87e4e6952a502caf70dc32cda",
+      "author": {
+        "name": "Kevin H. Luu",
+        "email": "khluu000@gmail.com"
+      },
+      "date": "2026-08-30T15:08:25+08:00",
+      "message": "[CI] Add explicit step keys to 18 hardware test steps (#54330)\n\nSigned-off-by: khluu <khluu000@gmail.com>\nCo-authored-by: Kimi Code <noreply@moonshot.cn>",
+      "parents": [
+        "1dc464d42681d22f38caf1fdc1eb632dc4421c45"
+      ],
+      "stats": {
+        "total_additions": 18,
+        "total_deletions": 0,
+        "files_changed": 18
+      },
+      "files": [
+        {
+          "filename": ".buildkite/hardware_tests/ascend_npu.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -2,6 +2,7 @@ group: Hardware\n depends_on: ~\n steps:\n   - label: \"Ascend NPU Test\"\n+    key: ascend-npu-test\n     soft_fail: true\n     timeout_in_minutes: 20\n     no_plugin: true"
+        },
+        {
+          "filename": ".buildkite/hardware_tests/cpu.yaml",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 0,
+          "patch": "@@ -2,6 +2,7 @@ group: CPU\n depends_on: []\n steps:\n - label: CPU-Kernel Tests\n+  key: cpu-kernel-tests\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -59,6 +60,7 @@ steps:\n #       bash .buildkite/scripts/hardware_ci/run-cpu-compatibility-test.sh\"\n \n - label: CPU-Language Generation and Pooling Model Tests\n+  key: cpu-language-generation-and-pooling-model-tests\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -76,6 +78,7 @@ steps:\n       pytest -x -v -s tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py\"\n \n - label: CPU-Quantization Model Tests\n+  key: cpu-quantization-model-tests\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -97,6 +100,7 @@ steps:\n       pytest -x -v -s tests/quantization/test_cpu_w8a8.py\"\n       \n - label: CPU-Distributed Tests (PP+TP)\n+  key: cpu-distributed-tests-pp-tp\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -116,6 +120,7 @@ steps:\n       bash .buildkite/scripts/hardware_ci/run-cpu-distributed-smoke-test.sh tp_pp\"\n \n - label: CPU-Distributed Tests (DP+TP)\n+  key: cpu-distributed-tests-dp-tp\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -126,6 +131,7 @@ steps:\n       bash .buildkite/scripts/hardware_ci/run-cpu-distributed-smoke-test.sh dp_tp\"\n \n - label: CPU-Multi-Modal Model Tests %N\n+  key: cpu-multi-modal-model-tests-n\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -140,6 +146,7 @@ steps:\n   parallelism: 4\n \n - label: CPU-Qwen2.5-VL Multimodal Tests\n+  key: cpu-qwen2-5-vl-multimodal-tests\n   depends_on: []\n   device: intel_cpu\n   no_plugin: true\n@@ -153,6 +160,7 @@ steps:\n       VLLM_CI_ENV=0 pytest -x -v -s tests/models/multimodal/generation/test_qwen2_5_vl.py\"\n \n - label: \"Arm CPU Test\"\n+  key: arm-cpu-test\n   depends_on: []\n   soft_fail: false\n   device: arm_cpu"
+        },
+        {
+          "filename": ".buildkite/hardware_tests/gh200.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -1,6 +1,7 @@\n group: Hardware\n steps:\n   - label: \"GH200 Test\"\n+    key: gh200-test\n     soft_fail: true\n     device: gh200\n     no_plugin: true"
+        },
+        {
+          "filename": ".buildkite/hardware_tests/intel.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -2,6 +2,7 @@ group: Hardware\n depends_on: ~\n steps:\n   - label: \"Intel HPU Test\"\n+    key: intel-hpu-test\n     soft_fail: true\n     device: intel_hpu\n     no_plugin: true"
+        },
+        {
+          "filename": ".buildkite/hardware_tests/intel_xpu_ci/test-intel.yaml",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 0,
+          "patch": "@@ -16,6 +16,7 @@ steps:\n         - exit_status: -10  # Agent was lost\n           limit: 2\n   - label: \"XPU example Test\"\n+    key: xpu-example-test\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 50\n@@ -37,6 +38,7 @@ steps:\n         bash .buildkite/scripts/hardware_ci/run-intel-test.sh\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh example'\n   - label: \"XPU V1 test\"\n+    key: xpu-v1-test\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 70\n@@ -59,6 +61,7 @@ steps:\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh v1'\n     parallelism: 2\n   - label: \"XPU W8A8 FP8 Linear Examples\"\n+    key: xpu-w8a8-fp8-linear-examples\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 60\n@@ -81,6 +84,7 @@ steps:\n         bash .buildkite/scripts/hardware_ci/run-intel-test.sh\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh w8a8-fp8-linear'\n   - label: \"XPU server test\"\n+    key: xpu-server-test\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 45\n@@ -102,6 +106,7 @@ steps:\n         bash .buildkite/scripts/hardware_ci/run-intel-test.sh\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh server'\n   - label: \"XPU quantization test\"\n+    key: xpu-quantization-test\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 60\n@@ -123,6 +128,7 @@ steps:\n         bash .buildkite/scripts/hardware_ci/run-intel-test.sh\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh quantization'\n   - label: \"XPU compressed tensors FP8 test\"\n+    key: xpu-compressed-tensors-fp8-test\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 60\n@@ -145,6 +151,7 @@ steps:\n         bash .buildkite/scripts/hardware_ci/run-intel-test.sh\n         'bash .buildkite/scripts/hardware_ci/run-intel-ci-test.sh compressed-tensors-fp8'\n   - label: \"XPU Graph\"\n+    key: xpu-graph\n     depends_on:\n       - image-build-xpu\n     timeout_in_minutes: 60"
+        }
+      ]
+    },
+    {
       "sha": "1dc464d42681d22f38caf1fdc1eb632dc4421c45",
       "author": {
         "name": "Juan Pérez de Algaba",
