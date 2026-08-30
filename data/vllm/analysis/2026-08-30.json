@@ -1,0 +1,120 @@
+{
+  "date": "2026-08-30",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-30T20:00:00+08:00",
+  "daily_summary": "当日 13 条变更以 API 层安全与正确性修复为主线。安全侧三连：cache_salt 此前无长度上限，攻击者可用超长 salt 在单线程 EngineCore 调度器上以 pickle+sha256 序列化阻塞全部并发请求（DoS，GHSA-wpww-v874-ph2p）；stop_token_ids 是唯一未对词表验证的用户可见 token-id 参数，越界 id 在带边界检查的后端上令整个引擎崩溃、无检查后端则静默污染同批邻居请求的 logits 行；批量 chat completions 的 echo 会把用户 prompt 前置到助手回答。投机解码两项：draft 与 target 共享同一 Philox offset 的 Gumbel 噪声流导致 probabilistic 采样分布偏差（加 salt 解耦）；ROCm AITER MLA 投机解码经元数据级别上报与小头 verify 路径去同步达到 FULL cudagraphs。分布式侧 NIXL P/D 分离新增 MLA 模型 DCP 支持（KV 按块跨 rank 分片）；另有 Qwen2.5-VL/Qwen3-VL 类级 lru_cache RoPE 缓存随模型释放、Rust frontend gRPC 音视频输入、GPT-OSS MoE 路由元数据复用与 family-120 router GEMM 门控修复。",
+  "sig_summaries": {
+    "sig-core": "四条变更。cache_salt 在六个 API protocol 模型（completions/chat/responses/pooling/Anthropic/scale-out）上加 `max_length=1024`（pooling 补 `min_length=1`）——超长 salt 的 `pickle.dumps`+`sha256` 在单线程 EngineCore 调度器上序列化会阻塞所有并发请求，Pydantic 校验以 422 提前拒绝（#54353，GHSA-wpww-v874-ph2p）；`stop_token_ids` 镜像 `_validate_logit_bias` 模式对词表验证——OOB id 经 `index_put_` 用作 device 上 logits 索引，CANN 9.1 的 IndexCheck 令全部 TP rank 崩溃、无检查后端静默写入邻请求 logits 行，无效请求改为 400 拒绝（#54196）；批量 chat completions 的 echo 补上 `role == assistant` 守护，用户 prompt 不再被前置到回答、`continue_final_message` 前缀仍保留（#52529）；WSL 下 amd-smi/rocm-smi 不可达时 ROCm 平台回退检测——非 CPU-only build + PyTorch HIP 支持 + accelerator 可见三条件齐备才激活（#38434）。",
+    "sig-spec-decode": "两条变更。draft 与 target 的 Gumbel 噪声取自同一 Philox offset（同 seed/pos）——拒绝后重采样与产生该 draft token 的噪声字节相同，argmax 条件下的截断使高排名输家 token 被系统性低权重、输出分布偏离 target；为 draft 的 Philox 流 offset 加 salt `(1 << 30)` 解耦，并修复采样位置从被 `max_model_len` clamp 的 buffer 派生、上下文极限附近两个连续 draft 步可能重用同一噪声向量的潜在缺陷（#54282，仅影响 `draft_sample_method='probabilistic'`，默认 greedy 不受影响）。ROCm AITER MLA 投机解码经两项修复达到 FULL cudagraphs：元数据按 KV cache 组的 `non_causal_multi_token_decode` 上报 `UNIFORM_BATCH`（DSpark draft 组不再把整个引擎拖出 FULL），小头 verify 路径的逐层 KV 范围扩展（含 4 次 device->host 同步与按读回值分配）移入每步一次的 `_build_decode` 持久缓冲（#51171，Kimi-K3 + DSpark TP8 MI355X 实测）。",
+    "sig-omni": "两条变更。Qwen2.5-VL 的 `get_rope_by_thw` 是实例方法却被类级 `functools.lru_cache` 装饰（`self` 入 key 强引用每个 vision tower）、Qwen3-VL 的 `rot_pos_ids` 用类级静态 `lru_cache` 把位置张量 pin 到解释器生命周期——均改为保持 1024 上限与命中行为的 per-instance `LRUCache`，缓存随模型实例释放，进程内引擎 shutdown 后显存可回收（#54346，与 #54162/#54246 互补）；Rust frontend gRPC 推理接受音视频 HTTP(S) URL、data URI 与 raw bytes 输入，保留 UUID/MIME 元数据、视频结构前缀范围与 Qwen3-ASR 音频位置经 prefill/decode（#53760）。",
+    "sig-model-performance": "两条变更。family-120 Blackwell（消费级 sm_120 / SoC sm_121，GB10/DGX Spark）的 bf16→fp32 router GEMM 融合路径被 `allow_specialized_router_gemm`（Hopper+SM100）误门控，回退到独立 copy kernel 并 bf16 舍入 router logits——而该路径只是 `torch.mm` 的 out_dtype epilogue（纯 cuBLAS/hipBLASLt，架构无关），改为独立谓词门控（#54048）；GPT-OSS MoE 在 triton_kernels v3.6+ 路径上 `topk()` 返回的 `SparseMatrix` 已含 bitmatrix 与路由元数据（sorted dispatch/combine indices、per-expert histograms），no-expert-map 分支却丢弃后重打包 bitmatrix 并二次构造 `SparseMatrix`——每 MoE 层每 forward step 重复计算，现直接从 topk 结果构建 `RoutingData`/`GatherIndx`/`ScatterIndx`（#45457，同时消除相对 v3.5.1 bundled 版本的回归）。",
+    "sig-ci": "两条变更。多节点 assignment 测试的 `_wait_until_pg_removed` 轮询 `get_current_placement_group()`（driver 上恒为 None）立即返回，下一次 `initialize_ray_cluster` 因 placement group 资源未释放而失败——删除该 helper（生产从不调用），改为匹配生产 teardown 并等待 `available_resources_per_node` 显示足够空闲 GPU（#53621）；`test_mem.py` 三个 sleep 模式断言用 device-wide free memory（跨进程的 `cudaMemGetInfo`/`hipMemGetInfo`），8 MiB/1 MiB 级的信号量会被 co-tenant 几十 MiB 的分配淹没而伪失败——改用 allocator 记账断言（#54312）。",
+    "sig-large-scale-serving": "一条变更。NIXL P/D 分离此前假设 MLA 的 KV cache 在 TP 间完全复制（远端 rank 只读一次），而 DCP（decode context parallelism）按块跨 rank 分片 KV 打破该假设；以每侧 dcp_size 为 1（完全复制，既有行为）或 tp_size（完全分片、每 rank 不相交 1/dcp_size 切片）为简化假设——partial sharding 从不出现，路由保持三个平坦 case（双复制/单侧分片/双侧分片），跨侧 DCP 尺寸整除以纯取模路由，KV connector 挂载时以块粒度分片（#50611，+818/-104，含 config/kv_transfer/worker 测试）。"
+  },
+  "commits": [
+    {
+      "sha": "1dc464d42681d22f38caf1fdc1eb632dc4421c45",
+      "comment": "**背景**：`cache_salt` 此前只有 `min_length=1`（pooling 端点甚至没有约束）而无上限，攻击者可发送任意长的 salt 字符串，在单线程的 EngineCore 调度器上经 `pickle.dumps` + `sha256` 序列化，阻塞所有并发请求造成资源耗尽 DoS（GHSA-wpww-v874-ph2p）。**方法**：为六个 API protocol 模型（completions、chat completions、responses、pooling、Anthropic、scale-out token-in-token-out）的 `cache_salt` Pydantic `Field` 加 `max_length=1024`（+7/-0，6 文件），并为 pooling 端点补上缺失的 `min_length=1`。**效果**：Pydantic 校验以 HTTP 422 在到达调度器前拒绝超长 salt；1024 字符对合法 salt（文档预期 256-bit base64 约 43 字符）足够宽裕。",
+      "sig": "sig-core",
+      "sig_reason": "API protocol 层 cache_salt 长度约束的 DoS 防护，属核心 API 输入验证范畴。",
+      "tags": ["bugfix", "low-risk", "security", "dos", "cache-salt", "pydantic", "input-validation", "api-protocol"],
+      "pr_number": 54353
+    },
+    {
+      "sha": "1ebff996a118cdc6e831c521c839d29ffe47d30f",
+      "comment": "**背景**：WSL 环境下 `amd-smi` 与 `rocm-smi` 均不可达，ROCm 平台检测失败导致无法正确识别平台。**方法**：在 `vllm/platforms/__init__.py` 增加回退检测——仅当 vLLM 非 CPU-only build、PyTorch 报告 HIP 支持且 `torch.accelerator.is_available()` 确认可见加速器时才激活 ROCm 平台；amdsmi 路径仍是主检测器（+15/-1）。**效果**：WSL 中的 ROCm 部署可正确完成平台识别（以 `VLLM_ATTENTION_BACKEND=TRITON_ATTN` 在单设备上验证 Qwen3.5-9B-AWQ-4bit 离线推理）。",
+      "sig": "sig-core",
+      "sig_reason": "WSL 环境下 ROCm 平台回退检测，属核心平台识别范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "wsl", "platform-detection", "fallback"],
+      "pr_number": 38434
+    },
+    {
+      "sha": "7a67941c1d0506d0690fbb4e91b573c660d24981",
+      "comment": "**背景**：Rust frontend 的 gRPC 推理路径此前只接受图像输入，音视频需要先行离线预处理，与 Python frontend 的多模态能力不对齐。**方法**：gRPC 推理接受音视频 HTTP(S) URL、data URI 与 raw bytes 三种形态，保留 UUID 与 MIME 元数据；视频结构前缀范围（structural-prefix ranges）与 Qwen3-ASR 音频位置在 prefill/decode 间正确保持；配套 `tests/model_executor/test_qwen3_asr_mrope.py` 与模型侧适配（+122/-48）。**效果**：两张 A100 80GB 上验证——视频（示例 MP4，12-token 文本 prompt 产出 2292 prompt tokens）与音频（`winning_call.ogg`，13-token prompt 产出 346 tokens）的聚合与 prefill/decode 请求均 HTTP 200 且无 gRPC `UNIMPLEMENTED`/媒体准备错误；344 项 server 测试、311 项 chat 测试通过。",
+      "sig": "sig-omni",
+      "sig_reason": "Rust frontend gRPC 音视频多模态输入支持，属多模态输入处理范畴。",
+      "tags": ["feature", "medium-risk", "rust-frontend", "grpc", "audio", "video", "multimodal", "qwen3-asr", "media-inputs"],
+      "pr_number": 53760
+    },
+    {
+      "sha": "b016ed8ea3dd8cfec9173e8d5a87ef12adc03096",
+      "comment": "**背景**：Qwen2.5-VL/Qwen3-VL 在进程内 serve 多模态请求后 shutdown，GPU 显存确定性驻留。`Qwen2_5_VisionTransformer.get_rope_by_thw` 是实例方法却被类级 `functools.lru_cache` 装饰——`self` 是每个 cache key 的一部分，cache wrapper 强引用每个处理过请求的 vision tower；`Qwen3_VisionTransformer.rot_pos_ids` 的类级静态 `lru_cache` 同样把缓存的位置张量保活到解释器生命周期。**方法**：两个类级缓存均替换为有界 per-instance `LRUCache`，保持既有 1024 条上限与命中行为，缓存生命周期绑定所属模型实例（+20/-7）。**效果**：vision 模块与缓存张量随模型释放；与 #54162（通用顶层模型持有者）、#54246（KV cache 绑定）互补，覆盖 Qwen 特有的类级缓存泄漏。",
+      "sig": "sig-omni",
+      "sig_reason": "Qwen VL 系列类级 RoPE 缓存导致的显存驻留修复，属多模态模型生命周期范畴。",
+      "tags": ["bugfix", "low-risk", "qwen2.5-vl", "qwen3-vl", "rope-cache", "lru-cache", "memory-leak", "in-process-engine"],
+      "pr_number": 54346
+    },
+    {
+      "sha": "dbf662c9e810ef4c3f466c7c4b2b3282ba889622",
+      "comment": "**背景**：ROCm 上投机解码达不到 FULL cudagraphs，两个独立原因（Kimi-K3 + DSpark draft，TP8 MI355X 实测）。其一，DSpark draft 组经 decode 路径服务整个 `1 + num_speculative_tokens` 块，但 `TritonMLAMetadataBuilder` 从类常量上报 `UNIFORM_SINGLE_TOKEN_DECODE`，引擎对 attention 组取最小值，一个组就把整个引擎拖出 FULL——而 `forward_mqa` 用 `repeat_interleave`（Python int 上）展平块且无 device->host 同步，实际满足 `UNIFORM_BATCH`。其二，`AiterMLAImpl.forward_mqa` 的小头（每 rank < 16 query heads）verify 路径在每个 MLA 层把各请求的 paged-KV 范围展开为每 verify token 一行，含 4 次 device->host 同步与按读回值定尺寸的分配，每次都中止 HIP graph capture。**方法**：`triton_mla.py` 按 KV cache 组的 `non_causal_multi_token_decode` 标记上报 `UNIFORM_BATCH`；展开移到每步一次的 `_build_decode`、写入持久缓冲使 `mla_gluon` 重放时地址固定，剩余一次同步留在捕获区域外的 builder（如 `flex_attention.py` 的 `.item()`）；并在 `gpu_worker.py` 补设 `cache_config.kv_cache_size_tokens`（此前只在 engine core 与前端设置、worker 只前向传播 `num_gpu_blocks`，builder 在多进程路径上见到 None）（+181/-127）。**效果**：ROCm AITER MLA 投机解码达到 FULL cudagraphs。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "ROCm AITER MLA 投机解码达到 FULL cudagraphs 的元数据上报与捕获区域内去同步修复，属投机解码执行路径范畴。",
+      "tags": ["perf", "medium-risk", "rocm", "aiter", "mla", "spec-decode", "cudagraph", "dspark", "kimi-k3", "metadata-builder"],
+      "pr_number": 51171
+    },
+    {
+      "sha": "b5707bf994cb968adfc7a29fbb80b0582f53f38d",
+      "comment": "**背景**：family-120 Blackwell（消费级 sm_120 / SoC sm_121——GB10 / DGX Spark）上 bf16→fp32 的 router GEMM 回退到独立 `bf16→fp32` copy kernel 并对 router logits 做 bf16 舍入，而融合路径本可用（#49921）。该融合路径只是 `torch.mm` 的 out_dtype epilogue（纯 cuBLAS/hipBLASLt，无 NVVM 或 CuteDSL codegen），架构无关，却被 `allow_specialized_router_gemm`（仅 Hopper + SM100）门控；family-120 正确地拿不到 SM100 专用 kernel（tcgen05 bf16x3、CuteDSL），却连它能跑的 cuBLAS 层也一并失去。**方法**：cuBLAS 层改用自己的谓词 `is_cuda() and {Hopper, SM100, family-120}` 门控，专用 kernel 门控不动、仍限定那些家族（Ampere 等无变化，+10/-11）。**效果**：GB10（sm_121）上该层启用融合 GEMM，DeepSeek-V4-Flash（router 权重 bf16 `[256, 4096]`）的 logits 不再被 bf16 舍入；扩展 device-free 的 kernel 分发测试覆盖 family-120 各分支。",
+      "sig": "sig-model-performance",
+      "sig_reason": "family-120 上 MoE router GEMM 融合路径的门控修复，属 MoE kernel 性能范畴。",
+      "tags": ["bugfix", "low-risk", "moe", "router-gemm", "cublas", "out-dtype", "family-120", "gb10", "dgx-spark", "blackwell"],
+      "pr_number": 54048
+    },
+    {
+      "sha": "680e2177e473ed8dfaa9773f7ead185b369cab46",
+      "comment": "**背景**：`test_multi_node_assignment.py` 在 L4 Distributed 2-Node CI 上 flaky：测试经 `_wait_until_pg_removed` 等待，但生产代码从不调用它，且该 helper 轮询的 `get_current_placement_group()` 在 driver 上恒为 None、立即返回；随后的 `initialize_ray_cluster` 因前一轮 placement group 的 GPU 尚未归还而报 `Current node has no GPU available.` 失败。**方法**：删除未被生产使用的 helper；测试改为匹配生产 teardown（只调 `remove_placement_group`），并等待 `available_resources_per_node` 在 driver 侧显示足够空闲 GPU 再进入下一轮（+17/-20）。**效果**：`VLLM_MULTI_NODE=1` 下 1 passed in 74.30s，CI 不再伪失败。",
+      "sig": "sig-ci",
+      "sig_reason": "多节点 Ray placement group teardown 后测试的 flaky 修复，属 CI 稳定性范畴。",
+      "tags": ["test", "low-risk", "ci", "ray", "placement-group", "deflake", "multi-node", "resource-release"],
+      "pr_number": 53621
+    },
+    {
+      "sha": "6cddad414ee46796f21aaf7b8643a6e7a00c09b5",
+      "comment": "**背景**：`test_mem.py` 的 `test_basic_cumem`/`test_discard_tags`/`test_cumem_with_cudagraph` 用 device-wide free memory 的严格增长断言 `sleep()`/`discard()` 释放了显存——但 `torch.accelerator.get_memory_info()` 是跨进程查询（直通 `cudaMemGetInfo`/`hipMemGetInfo`），两次采样间的差值掺杂 GPU 上其他进程的分配；被断言的信号又极小（8 MiB 用户数据、1 MiB discard），192 GiB 卡上 co-tenant 在采样窗口内分配几十 MiB 即触发裸 `AssertionError`。AMD CI 于 2026-08-26 在无关 PR #52707 上观察到该伪失败。**方法**：断言改用 allocator 自身的记账（bookeeping）而非设备全局查询来核对释放量（+28/-9）。**效果**：断言不再受同设备其他进程活动影响，测试去 flaky。",
+      "sig": "sig-ci",
+      "sig_reason": "sleep 模式显存释放断言从设备全局查询改为 allocator 记账的去 flaky 修复，属测试稳定性范畴。",
+      "tags": ["test", "low-risk", "deflake", "sleep-mode", "allocator", "memory-assert", "amd-ci"],
+      "pr_number": 54312
+    },
+    {
+      "sha": "fe755c88995ad468882517b6c4bdd60138d46a3a",
+      "comment": "**背景**：target verification 期间，用于重采样被拒绝 draft token 的 Gumbel 噪声与产生该 draft token 的噪声取自同一 Philox offset（同 seed、同 pos），字节完全相同。在 proposal 赢得 argmax 的条件下，其余 token 的 Gumbel 被截断到该 max 之下，对 draft 排名最高却输掉的 token 截断最紧（高 q 的输家 token 噪声通常偏小，否则本应获胜），残差恰好低权重这些 token，输出分布不再是 target 的（仅影响 `draft_sample_method='probabilistic'`；默认 greedy 下 `draft_logits` 为 None、从不调用 `gumbel_sample`）。**方法**：draft 的 Philox 流 offset 加 salt `(1 << 30)` 解耦两流——verification 本就是对缓存 draft 分布的概率比检验而非 Gumbel 耦合，无任何依赖两流一致的逻辑；同时重构 speculator 计算采样流索引用 position 的方式，各调用点显式声明自身约定，顺带修复采样位置此前从被 `max_model_len` clamp 的 buffer 派生、上下文极限附近两个连续 draft 步可能重用同一噪声向量的潜在缺陷（现 unclamped 跟踪）（+232/-30）。**效果**：`test_gumbel_drafted_rejection_sample_is_unbiased` 等投机解码测试通过，probabilistic draft 采样恢复无偏。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "draft 与 target Gumbel 噪声流解耦修复 probabilistic 采样分布偏差，属投机解码采样正确性范畴。",
+      "tags": ["bugfix", "high-risk", "spec-decode", "gumbel-noise", "philox", "rejection-sampling", "mrv2", "probabilistic", "sampling-correctness"],
+      "pr_number": 54282
+    },
+    {
+      "sha": "7fbfca2670bbd23061fb6aec66db78e7004a38bd",
+      "comment": "**背景**：批量 chat completion 路径的 `echo=true` 把 `conversation[-1]['content']` 前置到模型回答而不检查该消息的 role；默认 `add_generation_prompt=true` 时最后一条是用户 prompt，产出 `USER PROMPTASSISTANT ANSWER` 而非 `ASSISTANT ANSWER`。非批量路径（`serving.py`）已有守护子句，两文件 `role` 的计算完全一致。**方法**：批量路径补上同一子句 `and conversation[-1].get('role') == role`（+106/-1，含测试）。**效果**：尾部 user turn 不再被回显，真正的 assistant 前缀（`continue_final_message=true`）仍正常回显，两条路径恢复一致；新增两条免 GPU 的回归测试（经 `__new__` 构造、直接 await 生产 echo 组装代码）。",
+      "sig": "sig-core",
+      "sig_reason": "批量 chat completions echo 的 assistant role 守护修复，属核心 API frontend 范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "chat-completions", "batch", "echo", "parity", "openai-api"],
+      "pr_number": 52529
+    },
+    {
+      "sha": "5b0e5b69ac1a3884a6479c9537789c95263cc804",
+      "comment": "**背景**：`stop_token_ids` 是唯一未对词表验证的用户可见 token-id 参数：越界 id 被接受后用作 device 上 logits 的索引（min_tokens/EOS masking 的 `logits.index_put_((rows, all_stop_token_ids), -inf)`）。实测两种危害——带边界检查的后端（CANN 9.1 插入 `IndexCheck` kernel）上单个含 `stop_token_ids: [151645]` 的请求即以 vector-core 异常崩溃整个引擎（全部 TP rank 死、device context abort，#54195 及 vllm-ascend#15200）；无检查的后端（CANN 9.0.1 及任何依赖 UB 的后端）上 OOB `index_put_` 静默写入同 batch 邻居请求的 logits 行。触发链需越界 id + `min_tokens > 0`（PD 代理示例脚本把 prefill 重写为 `max_tokens=1, min_tokens=1`，激活了设备索引路径）+ 边界检查后端。**方法**：新增 `SamplingParams._validate_stop_token_ids`，镜像既有 `_validate_logit_bias`/`_validate_allowed_token_ids` 模式，无效请求以 400 拒绝（+46/-15）。**效果**：越界 id 不再到达引擎；新增 `test_chat_stop_token_ids_validation.py` 覆盖接受/拒绝分支。",
+      "sig": "sig-core",
+      "sig_reason": "stop_token_ids 对词表的输入验证修复，属核心 API 输入验证范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "sampling-params", "stop-token-ids", "input-validation", "oob", "crash", "logits-processor"],
+      "pr_number": 54196
+    },
+    {
+      "sha": "129087ddab2b197b067e54e130d2cf5fcb094bd5",
+      "comment": "**背景**：triton_kernels v3.6+ 路径上 `topk()` 返回的 `SparseMatrix` 在构造时已算出 bitmatrix 及其路由元数据（sorted dispatch/combine indices、per-expert histograms）——正是 `_patch_make_bitmatrix_metadata` 所支撑的机制；但 `triton_kernel_moe_forward` 的 no-expert-map 分支丢弃该结果，用自定义 kernel 从 topk ids 重打包 bitmatrix，再构造第二个 `SparseMatrix` 把相同元数据重算一遍——每 MoE 层、每 forward step（#28986，重实现 #35619）。**方法**：直接从 topk 结果构建 `RoutingData`/`GatherIndx`/`ScatterIndx`（`routing_data_from_sparse_topk`）；expert-map 路径保留重打包（重映射会改变 id），v3.5.1 legacy 路径不受影响（其融合 `routing()` 本无重复，这同时消除了相对 bundled 版本的回归，关联 triton-lang/triton#9969 的 v3.6 迁移）（+102/-15）。**效果**：新增 parity 测试在 `n_tokens ∈ {1, 33, 512}` × `(n_experts, topk) ∈ {(32,4), (128,4)}` 上断言复用构造与 `make_routing_data` 逐张量一致；路由构造段微基准去除重复计算。",
+      "sig": "sig-model-performance",
+      "sig_reason": "GPT-OSS MoE 路由元数据的复用去重优化，属 MoE kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "moe", "gpt-oss", "triton-kernels", "routing", "sparse-matrix", "metadata-reuse"],
+      "pr_number": 45457
+    },
+    {
+      "sha": "7f4793eaa335a3667927a0191868d01f36b170af",
+      "comment": "**背景**：NIXL P/D 分离假设 MLA 的 KV cache 在 TP 间完全复制，远端 rank 只需读一次；而 DCP（decode context parallelism）按块把 KV 分片到各 rank，打破了该假设——producer（dcp_size=4）的 4 个分片各属一个 rank，decoder（dcp_size=2）每 rank 持两倍大的分片、各读两个远端 rank（`remote_rank % local_dcp_size == local_dcp_rank`）。**方法**：以关键简化假设为前提——每侧 dcp_size 要么 1（完全复制，既有行为不变）要么 tp_size（完全分片、每 rank 持不相交的 1/dcp_size 切片），从不 partial；由此 DCP 分片与旧的多 TP 副本选取逻辑无需在同一侧组合，路由保持三个平坦 case（双复制/单侧分片/双侧分片）而非通用重叠求解器。两个从属假设：跨侧 DCP 尺寸整除（真实部署用 2 的幂/高合成度），KV connector 挂载时以块粒度分片（`cp_kv_...`）（+818/-104，23 文件，含 config/kv_transfer/worker 与测试）。**效果**：NIXL P/D 分离支持 MLA 模型 DCP 部署。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL P/D 分离对 MLA 模型 DCP 的支持，属大规模服务 KV 传输范畴。",
+      "tags": ["feature", "medium-risk", "nixl", "pd-disagg", "dcp", "mla", "kv-transfer", "kv-sharding", "context-parallelism"],
+      "pr_number": 50611
+    }
+  ]
+}
