@@ -1,0 +1,80 @@
+{
+  "date": "2026-08-31",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-31T20:00:00+08:00",
+  "daily_summary": "当日 8 条变更以正确性修复为主。FlashInfer sparse MLA 修复 BLHNC 块外层 KV 布局下的双层寻址错误——稀疏索引转换把物理块 ID 乘以 block_size 致 decode 读到其他层的 page、融合 DeepSeek-V3.2/GLM cache writer 从物理步幅反推逻辑块大小致写入落在错误的块或层，均改从实际 FlashInfer KV cache 视图派生物理行步幅。分布式通信修复 GroupCoordinator.isend_tensor_dict 的两个缺陷：元数据经同步 gloo send 交付、对端延迟提交匹配 recv 时 rendezvous 阻塞两 rank（vllm-ascend 虚拟流水线 fold-point 发送死锁），以及 fire-and-forget 调用者丢弃句柄后 pickled 元数据缓冲与设备张量无保留造成的 mid-send use-after-free。投机解码收回 #50488 越过平台默认上限的 capture 尺寸（H200 上默认捕获扩至 2176/6400 token 致夜间 CI OOM）；量化侧 NVFP4 weight-only checkpoint 在 config 解析时提升为 W4A16 走 Marlin，避免未初始化 input_scale 被折进反量化 alpha 令全部专家归零、输出乱码。另有 FlashInfer 0.6.18 升级、多模态 fallback 完整 prompt 进程级 LRU 的驻留修复、torch-abi 审计队列误移回滚与安全文件 CODEOWNERS 补充。",
+  "sig_summaries": {
+    "sig-model-performance": "一条变更。`FLASHINFER_MLA_SPARSE` 使用 BLHNC 等块外层 KV cache 布局时，其他层的 page 插入同一层连续块之间，两条路径却假设物理块步幅恰等于逻辑块大小——FlashInfer sparse index 转换把物理块 ID 乘 `block_size` 致 decode 读到另一层的 page；融合 DeepSeek-V3.2/GLM cache writer 从物理块步幅反推逻辑块大小致写入落在错误的块或层。改为从实际 FlashInfer KV cache 视图派生物理行步幅并贯穿常规与 DCP sparse-index 转换、显式向融合 writer 传入逻辑 MLA 块大小，DCP 物理重映射测试扩展到非稠密块步幅（#54465）。",
+    "sig-large-scale-serving": "一条变更。`GroupCoordinator.isend_tensor_dict` 名义非阻塞、元数据却经同步 `send_object`（gloo send）交付——超 eager 阈值的 gloo 发送是 rendezvous 的，对端在后续迭代才提交匹配 recv 时（vllm-ascend 虚拟流水线 fold-point 发送）两 rank 死锁；且 fire-and-forget 调用者丢弃返回句柄后，pickled 元数据缓冲无保留（gloo 后台线程拷贝时 use-after-free）、非 CUDA 设备张量不 record_stream 可被后续计算覆盖。新增保持 gloo FIFO 顺序的 `isend_object` 非阻塞路径与持有序列化张量直至 wait 的 `_RetainedHandle`，`_pending_isends` FIFO 惰性回收且只门于可靠的设备句柄 `is_completed()`；`send_tensor_dict` 同步语义不变（#49274，+282/-13）。",
+    "sig-spec-decode": "一条变更。#50488 在平台既有默认上限（H200 512 token、数据中心 Blackwell 1024 token）之上追加 uniform-decode capture 尺寸，H200 夜间 CI 默认捕获扩至 2176/6400 token——suffix 配置 FULL graph capture OOM、DFlash 可用 KV cache 被压到 0.94 GiB（需 5.12 GiB）。生成的 uniform-decode 尺寸收回默认上限内：装得下的精确 off-stride 尺寸仍得 FULL decode graph、更宽 batch 回退 eager 而非扩张默认图内存包络阻止引擎启动，显式 capture 尺寸仍可 opt in，回归测试钉住 DFlash 2176-token 与 suffix 6400-token 两个失败宽度（#54418）。",
+    "sig-quantization": "一条变更。ModelOpt NVFP4 checkpoint 可自标 `quant_algo` NVFP4 却只量化权重（每个 config group 的 `input_activations` 为 null），无 activation scale 可加载却被 W4A4 融合 MoE 路径把未初始化 `input_scale` 折进反量化 alpha——缓冲值依赖 allocator，为 0.0 时全部权重 scale 归零、每个专家死亡、模型输出重复 token 乱码且无报错（GB10 sm121 复现、RTX PRO 6000 sm120 恰好拿到 1.0 页成 no-op，#54189）。config 解析时检测 weight-only 情形并提升为 `W4A16_NVFP4` 走 Marlin（反量化权重到 bf16、从不读 input scale），真 W4A4 checkpoint 保持既有路径（#54427）。",
+    "sig-omni": "一条变更。#53560（缓存公共 token 序列）的回归——多模态 placeholder 跨 BPE 边界时，共享文本 fallback 对完整用户 prompt 的解码再编码此前绕过缓存，现进入 2048 条目的进程级 `cached_encode` LRU，互异长 prompt 以 Python token list 驻留至驱逐（普通 MiniCPM-V 图像 chat 请求即触发，多用户长 prompt 服务可驻留数百 MiB 或更多）。fallback prompt 改为直接 `tokenizer.encode(..., add_special_tokens=False)` 绕过缓存、保留可复用 placeholder/replacement 序列的缓存——恢复既有缓存边界且 token 匹配、placeholder 位置与模型输出不变（#54439）。",
+    "sig-ci": "三条变更。FlashInfer 升级至 0.6.18（docker/versions.json、requirements/cuda.txt、Dockerfile 与 gpt_oss eval 适配，经完整 CI nightly 验证，#54313）；回滚 #54326 对 `Torch Stable ABI Audit` 的队列误移——审计需 CUDA wheel 镜像，small-cpu 队列的 `-cpu` 镜像含 allowlist 之外的 `_C_AVX2.abi3.so`/`_C_AVX512.abi3.so`，恢复 `gpu_1_queue` 默认路由后步骤回绿（#54468）；安全指南与策略文件的 CODEOWNERS 加入 jperezdealgaba（#54358）。"
+  },
+  "commits": [
+    {
+      "sha": "570735520942b6428ae98f1eb442c6d88adae55e",
+      "comment": "**背景**：`FLASHINFER_MLA_SPARSE` 使用 BLHNC 这类块外层（block-outermost）KV cache 布局时，其他层的 page 会插入同一层连续块之间，而两条路径都错误假设一层的物理块步幅恰等于其逻辑块大小——FlashInfer sparse index 转换把物理块 ID 乘以 `block_size`，decode 因此读到另一层的 page；融合 DeepSeek-V3.2/GLM cache writer 从物理块步幅反推逻辑块大小，写入落在错误的块或层。**方法**：从实际 FlashInfer KV cache 视图派生物理行步幅并贯穿常规与 DCP sparse-index 转换；显式向融合 cache writer 传入逻辑 MLA 块大小；DCP 物理重映射覆盖扩展到非稠密块步幅（+25/-4）。**效果**：BLHNC 布局下稀疏 MLA 的读路径与写路径寻址正确，是后续工作的独立前置。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer sparse MLA 的 BLHNC 布局寻址修复，属 MLA kernel 正确性范畴。",
+      "tags": ["bugfix", "low-risk", "flashinfer", "sparse-mla", "blhnc", "kv-cache-layout", "deepseek-v3.2", "glm", "dcp"],
+      "pr_number": 54465
+    },
+    {
+      "sha": "c92b29a1d40644da710209f862b1be0ebd5c2e74",
+      "comment": "**背景**：`GroupCoordinator.isend_tensor_dict` 存在两个阻塞/所有权缺陷。其一，名义非阻塞的接口以同步 `send_object`（gloo send）交付元数据——超过 eager 阈值的 gloo 发送是 rendezvous 的，阻塞至对端提交匹配 recv；流水线调度若在后续迭代才提交匹配 recv（如 vllm-ascend 的虚拟流水线 fold-point 发送），两 rank 在元数据发送中死锁，与 `isend_` 的承诺相反。其二，fire-and-forget 调用者无保留：pickled 元数据缓冲（size_tensor/object_tensor）是局部临时量，调用者丢弃返回句柄后无人保活，gloo 后台线程拷贝时 use-after-free；设备张量源仅在 `tensor.is_cuda` 时 record_stream，非 CUDA 设备上 in-flight isend 缓冲可被后续计算释放或覆盖。**方法**：新增 `isend_object(obj, dst)` 以 isend 提交 size+pickled object（保持 gloo FIFO 顺序），返回持有序列化 CPU 张量直至 wait() 排空的 `_RetainedHandle`；`isend_tensor_dict` 以 `isend_object` 替代阻塞 `send_object` 播种句柄列表（`send_tensor_dict` 仍等待全部句柄，同步语义不变）；每次调用把 (handles, sent_tensors) 追加进 `_pending_isends` FIFO、下次调用惰性回收——回收只以设备张量句柄的 `is_completed()` 为门（那里可靠）再 wait gloo 句柄（+282/-13）。**效果**：PP + chunked prefill 下元数据发送不再阻塞，预期流水线重叠性能改善（trace 对比见 PR）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "isend_tensor_dict 元数据非阻塞化与发送缓冲保留，属分布式通信范畴。",
+      "tags": ["bugfix", "medium-risk", "distributed", "gloo", "isend", "metadata", "pipeline-parallelism", "deadlock", "use-after-free"],
+      "pr_number": 49274
+    },
+    {
+      "sha": "7ab29234890b29b005e46b53037309e597425095",
+      "comment": "**背景**：FlashInfer 依赖版本例行升级。**方法**：升级 FlashInfer 至 0.6.18，同步更新 `docker/versions.json`、`requirements/cuda.txt`、Dockerfile、gpt_oss eval 测试与 model_executor 层一处适配（+7/-5）。**效果**：经完整 CI nightly 测试验证通过。",
+      "sig": "sig-ci",
+      "sig_reason": "FlashInfer 依赖版本升级与 CI 全量验证，属依赖管理范畴。",
+      "tags": ["ci", "low-risk", "flashinfer", "dependency-upgrade", "version-bump"],
+      "pr_number": 54313
+    },
+    {
+      "sha": "7a100bb617471801ee1d5525bfbb8fb238a345ea",
+      "comment": "**背景**：#54326 把 `Torch Stable ABI Audit` 移到 `small_cpu_queue_premerge` 后每构建必败——该步骤计算上是 0-GPU，但队列决定 docker 插件运行的镜像：审计需要 CUDA wheel 环境，而 small-cpu 队列的 `-cpu` 镜像中 CPU wheel 附带审计 allowlist 之外的 `_C_AVX2.abi3.so`/`_C_AVX512.abi3.so`（build 86214/86224/86228/86246/86250 连续失败 vs 移动前 86222 通过）。**方法**：回滚该步骤的队列移动，恢复 `depends_on: image-build` 与默认路由（`gpu_1_queue`，CUDA 镜像）（+1/-2）；crcr-report 有意留在 cpu-small（reviewer 决定，soft_fail + allow_dependency_failure）。**效果**：torch-abi 审计在下一个构建恢复绿色；#54326 其余 L4 标记（2/4-GPU 步骤 → EKS）不受影响且工作正常。",
+      "sig": "sig-ci",
+      "sig_reason": "torch-abi 审计步骤队列误移的回滚，属 CI 基础设施范畴。",
+      "tags": ["ci", "low-risk", "buildkite", "torch-abi", "queue-routing", "revert", "cpu-image"],
+      "pr_number": 54468
+    },
+    {
+      "sha": "b2dc864bb668da328aee8a8b0b72a0ad13c82252",
+      "comment": "**背景**：#50488 在平台既有默认上限（H200 512 token、数据中心 Blackwell 1024 token）之上追加 uniform-decode capture 尺寸，H200 nightly CI 上默认捕获扩至 2176 与 6400 token——Spec Decode N-Gram + Suffix 的 FULL graph capture OOM；AL DFlash 夜间图内存把可用 KV cache 压到 0.94 GiB（需 5.12 GiB）。**方法**：生成的 uniform-decode 尺寸保持在平台既有默认上限内——仍装得下的精确 off-stride 尺寸获得 FULL decode graph，更宽的 batch 回退 eager 而非扩张默认图内存包络阻止引擎启动；用户仍可显式 capture 尺寸 opt in。保留 #50488 的动态 tier 推导与安全 off-stride 覆盖（draft #54352 的整体 revert 因此可关闭），回归测试钉住 DFlash 的 2176-token 与 suffix 的 6400-token 两个精确失败宽度（+73/-67）。**效果**：两处 H200 门禁恢复通过。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "投机解码默认 CUDA graph 捕获尺寸的内存安全上限修复，属投机解码配置范畴。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "cudagraph", "capture-size", "memory-oom", "config-default", "h200"],
+      "pr_number": 54418
+    },
+    {
+      "sha": "9d0fe9bac89d0bda98f977770f5ae88b386e981a",
+      "comment": "**背景**：ModelOpt NVFP4 checkpoint 可自标 `quant_algo` NVFP4 而只量化权重（每个 config group 的 `input_activations` 为 null）——没有 activation scale 可加载，W4A4 融合 MoE 路径却把未初始化的 `input_scale` 折进反量化 alpha（`w13_weight_scale_2.mul_(w13_input_scale)` 等）；缓冲值未定义且依赖 allocator，为 0.0 时全部权重 scale 归零、每个专家死亡、模型输出重复 token 乱码且无任何报错——是否触发取决于 allocator（GB10 sm121 上复现，RTX PRO 6000 sm120 上 caching allocator 恰好返回 1.0 页使 fold 成为 no-op，#54189）。**方法**：config 解析时检测 weight-only 情形——自标 NVFP4 但所有 config group 的 `input_activations` 为 null 时提升为 `W4A16_NVFP4`，MoE 层路由走 Marlin（反量化权重到 bf16、从不读 input scale，无未初始化值可折）；真正的 W4A4 checkpoint 保持既有路径（+16/-0）。**效果**：新增 CPU 即可运行的 config 解析测试断言提升与不回归两分支；sm120 上以 `PYTORCH_NO_CUDA_MEMORY_CACHING=1` 复现并验证修复。",
+      "sig": "sig-quantization",
+      "sig_reason": "NVFP4 weight-only checkpoint 的 W4A16 路由修复，属量化配置解析范畴。",
+      "tags": ["bugfix", "low-risk", "quantization", "nvfp4", "modelopt", "weight-only", "w4a16", "marlin", "moe", "uninitialized-scale"],
+      "pr_number": 54427
+    },
+    {
+      "sha": "e79961c946e5b12da44ba0556567b418cd50fe20",
+      "comment": "**背景**：安全指南与策略文件的 codeowners 需要补充负责人。**方法**：`.github/CODEOWNERS` 中安全相关文件的所有权加入 jperezdealgaba（+3/-3）。**效果**：安全文件变更获得对应审查。",
+      "sig": "sig-ci",
+      "sig_reason": "安全文件 CODEOWNERS 所有权补充，属仓库治理范畴。",
+      "tags": ["ci", "low-risk", "codeowners", "security", "governance"],
+      "pr_number": 54358
+    },
+    {
+      "sha": "f6895a5fcb4710481bb44726af4fa57f4172330c",
+      "comment": "**背景**：#53560（缓存公共 token 序列）引入的内存驻留回归——多模态 placeholder 跨 BPE 边界时，共享文本 fallback 解码再编码完整用户 prompt；该编码此前绕过缓存，现进入 2048 条目的进程级 `cached_encode` LRU，互异长 prompt 以 Python token list 驻留至驱逐。普通 MiniCPM-V 图像 chat 请求即可触发（无需畸形输入或特殊标志），长 prompt 影响小但长时间多用户服务以多样长 prompt 可驻留数百 MiB 或更多；其他 placeholder 跨 BPE 边界的多模态模型同样受影响。**方法**：保留可复用 placeholder/replacement 序列的缓存，重建后的 fallback prompt 直接以 `tokenizer.encode(..., add_special_tokens=False)` 编码——恢复既有缓存边界，token 匹配、placeholder 位置与模型输出不变（+3/-6）。**效果**：多模态处理套件 92 passed、MiniCPM-V BPE 边界测试 1 passed；256 个约 32K-token 互异 prompt 的内存实验确认驻留消除。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态 fallback prompt 编码缓存驻留修复，属多模态处理范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "fallback-prompt", "lru-cache", "memory-retention", "bpe", "minicpm-v"],
+      "pr_number": 54439
+    }
+  ]
+}

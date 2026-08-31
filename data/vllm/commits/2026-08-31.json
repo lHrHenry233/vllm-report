@@ -1,0 +1,292 @@
+{
+  "date": "2026-08-31",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "570735520942b6428ae98f1eb442c6d88adae55e",
+      "author": {
+        "name": "Lucas Wilkinson",
+        "email": "LucasWilkinson@users.noreply.github.com"
+      },
+      "date": "2026-08-31T09:13:42+08:00",
+      "message": "[Bugfix][MLA] Fix BLHNC addressing for FlashInfer sparse MLA (#54465)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\n---\n tests/v1/attention/test_indexer_dcp_localize.py         | 12 ++++++++++--\n vllm/models/deepseek_v32/common/kernels.py              |  6 +++++-\n vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py |  7 +++++++\n vllm/v1/attention/backends/mla/sparse_utils.py          |  4 +++-\n 4 files changed, 25 insertions(+), 4 deletions(-)",
+      "parents": [
+        "c92b29a1d40644da710209f862b1be0ebd5c2e74"
+      ],
+      "stats": {
+        "total_additions": 25,
+        "total_deletions": 4,
+        "files_changed": 4
+      },
+      "files": [
+        {
+          "filename": "tests/v1/attention/test_indexer_dcp_localize.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 2,
+          "patch": "@@ -642,7 +642,10 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():\n \n \n @pytest.mark.skipif(not current_platform.is_cuda(), reason=\"This test requires CUDA\")\n-def test_dcp_filter_compacts_valid_slots_for_sparse_kernel():\n+@pytest.mark.parametrize(\"block_stride_rows\", [None, 12])\n+def test_dcp_filter_compacts_valid_slots_for_sparse_kernel(\n+    block_stride_rows: int | None,\n+):\n     block_size = 4\n     num_topk = 128\n     dcp_size = 2\n@@ -658,6 +661,7 @@ def test_dcp_filter_compacts_valid_slots_for_sparse_kernel():\n         dcp_size=dcp_size,\n         dcp_rank=0,\n         BLOCK_SIZE=block_size,\n+        BLOCK_STRIDE_ROWS=block_stride_rows,\n         NUM_TOPK_TOKENS=num_topk,\n         return_valid_counts=True,\n     )\n@@ -668,7 +672,11 @@ def test_dcp_filter_compacts_valid_slots_for_sparse_kernel():\n     assert (out[0, valid:] == -1).all()\n     # In-kernel compaction packs valid slots to the front; prefix order is\n     # unspecified, so compare as a set.\n-    assert set(out[0, :valid].cpu().tolist()) == {40, 41, 42, 43}\n+    block_stride_rows = block_stride_rows or block_size\n+    expected_base = 10 * block_stride_rows\n+    assert set(out[0, :valid].cpu().tolist()) == set(\n+        range(expected_base, expected_base + block_size)\n+    )\n \n \n @pytest.mark.skipif(not current_platform.is_cuda(), reason=\"This test requires CUDA\")"
+        },
+        {
+          "filename": "vllm/models/deepseek_v32/common/kernels.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 1,
+          "patch": "@@ -140,6 +140,7 @@ def _fused_norm_rope_kernel(\n     mla_cache_ptr,\n     mla_cache_block_stride,\n     mla_cache_entry_stride,\n+    MLA_CACHE_BLOCK_SIZE: tl.constexpr,\n     MLA_CACHE_FP8: tl.constexpr,\n     mla_cache_scale_ptr,\n     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).\n@@ -242,7 +243,7 @@ def _fused_norm_rope_kernel(\n                 return\n \n             slot_idx = tl.load(slot_mapping_ptr + tok_idx)\n-            mla_block_size = mla_cache_block_stride // mla_cache_entry_stride\n+            mla_block_size = MLA_CACHE_BLOCK_SIZE\n             mla_block_idx = slot_idx // mla_block_size\n             mla_block_off = slot_idx % mla_block_size\n \n@@ -479,6 +480,7 @@ def fused_norm_rope(\n     mla_ds_scale_view = torch.empty(0, dtype=torch.float32, device=device)\n     mla_ds_rope_view = torch.empty(0, dtype=torch.bfloat16, device=device)\n     if mla_kv_cache is not None:\n+        mla_block_size = mla_kv_cache.shape[1]\n         if mla_cache_ds_mla:\n             # 656-byte custom layout addressed in bytes; mla_cache_ptr is the\n             # 1-byte fp8 view, so block/entry strides are byte offsets and the\n@@ -503,6 +505,7 @@ def fused_norm_rope(\n         mla_kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)\n         mla_block_stride = 0\n         mla_entry_stride = 0\n+        mla_block_size = 1\n         mla_k_scale = _dummy((1,), torch.float32, device)\n \n     if q_c_out is None:\n@@ -570,6 +573,7 @@ def fused_norm_rope(\n         mla_kv_cache,\n         mla_block_stride,\n         mla_entry_stride,\n+        mla_block_size,\n         mla_cache_fp8,\n         mla_k_scale,\n         mla_ds_scale_view,"
+        },
+        {
+          "filename": "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 0,
+          "patch": "@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (\n     MultipleOf,\n )\n from vllm.v1.attention.backends.mla.sparse_utils import (\n+    flat_kv_row_view,\n     triton_convert_req_index_to_global_index,\n     triton_filter_and_convert_dcp_index,\n )\n@@ -377,6 +378,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):\n         assert self.topk_indices_buffer is not None\n         topk_indices = self.topk_indices_buffer[:num_actual_toks]\n \n+        _, block_stride_rows = flat_kv_row_view(\n+            kv_c_and_k_pe_cache, attn_metadata.block_size\n+        )\n+\n         if self.dcp_world_size > 1:\n             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(\n                 attn_metadata.req_id_per_token[:num_actual_toks],\n@@ -386,6 +391,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):\n                 dcp_rank=self.dcp_rank,\n                 cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),\n                 BLOCK_SIZE=attn_metadata.block_size,\n+                BLOCK_STRIDE_ROWS=block_stride_rows,\n                 NUM_TOPK_TOKENS=topk_indices.shape[1],\n                 return_valid_counts=True,\n             )\n@@ -395,6 +401,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):\n                 attn_metadata.block_table,\n                 topk_indices,\n                 BLOCK_SIZE=attn_metadata.block_size,\n+                BLOCK_STRIDE_ROWS=block_stride_rows,\n                 NUM_TOPK_TOKENS=topk_indices.shape[1],\n                 return_valid_counts=True,\n             )"
+        },
+        {
+          "filename": "vllm/v1/attention/backends/mla/sparse_utils.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 1,
+          "patch": "@@ -307,6 +307,7 @@ def triton_filter_and_convert_dcp_index(\n     dcp_rank: int,\n     cp_kv_cache_interleave_size: int = 1,\n     BLOCK_SIZE: int = 64,\n+    BLOCK_STRIDE_ROWS: int | None = None,\n     NUM_TOPK_TOKENS: int = 2048,\n     BLOCK_N: int = 128,\n     return_valid_counts: bool = False,\n@@ -343,6 +344,7 @@ def triton_filter_and_convert_dcp_index(\n             block_table,\n             token_indices,\n             BLOCK_SIZE=BLOCK_SIZE,\n+            BLOCK_STRIDE_ROWS=BLOCK_STRIDE_ROWS,\n             NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,\n             BLOCK_N=BLOCK_N,\n             return_valid_counts=return_valid_counts,\n@@ -390,7 +392,7 @@ def triton_filter_and_convert_dcp_index(\n         None,\n         max_num_blocks_per_req,\n         BLOCK_SIZE,\n-        BLOCK_SIZE,  # dense caches on the DCP path\n+        BLOCK_STRIDE_ROWS if BLOCK_STRIDE_ROWS is not None else BLOCK_SIZE,\n         block_n,\n         False,  # HAS_PREFILL\n         count_valid,\n"
+        }
+      ]
+    },
+    {
+      "sha": "c92b29a1d40644da710209f862b1be0ebd5c2e74",
+      "author": {
+        "name": "AI-Infra Rookie",
+        "email": "zhouxinyi6@huawei.com"
+      },
+      "date": "2026-08-31T07:51:25+08:00",
+      "message": "[Bugfix] Make metadata send non-blocking in GroupCoordinator.isend_tensor_dict (#49274)\n\nSigned-off-by: z00897177 <zhouxinyi6@huawei.com>\n---\n tests/distributed/test_comm_ops.py | 136 +++++++++++++++++++++++++++++++++++\n vllm/distributed/parallel_state.py | 143 ++++++++++++++++++++++++++++++++++++-\n vllm/v1/worker/gpu_worker.py       |  16 ++---\n 3 files changed, 282 insertions(+), 13 deletions(-)",
+      "parents": [
+        "7ab29234890b29b005e46b53037309e597425095"
+      ],
+      "stats": {
+        "total_additions": 282,
+        "total_deletions": 13,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/distributed/test_comm_ops.py",
+          "status": "modified",
+          "additions": 136,
+          "deletions": 0,
+          "patch": "@@ -5,6 +5,7 @@\n Run `pytest tests/distributed/test_comm_ops.py`.\n \"\"\"\n \n+from collections import deque\n from collections.abc import Callable\n from typing import Any\n from unittest.mock import Mock\n@@ -208,9 +209,14 @@ def send_recv_tensor_dict_test_worker(\n class _DummyWork:\n     def __init__(self) -> None:\n         self.wait_calls = 0\n+        self.completed = False\n \n     def wait(self) -> None:\n         self.wait_calls += 1\n+        self.completed = True\n+\n+    def is_completed(self) -> bool:\n+        return self.completed\n \n \n class _DummyAllGatherGroup:\n@@ -235,6 +241,7 @@ def _make_group_for_unit_test(\n     g.use_cpu_custom_send_recv = False\n     g.device_group = None\n     g.cpu_group = None\n+    g._pending_isends = deque()\n     return g\n \n \n@@ -402,6 +409,135 @@ def test_flashinfer_all_reduce_precedes_nccl(monkeypatch: pytest.MonkeyPatch) ->\n     nccl_selector.assert_not_called()\n \n \n+def test_isend_object_posts_size_then_object_and_releases_on_wait(\n+    monkeypatch: pytest.MonkeyPatch,\n+) -> None:\n+    posted: list[tuple[torch.Tensor, _DummyWork]] = []\n+\n+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:\n+        w = _DummyWork()\n+        posted.append((t, w))\n+        return w\n+\n+    monkeypatch.setattr(torch.distributed, \"isend\", fake_isend)\n+\n+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)\n+    handle = g.isend_object({\"k\": [1, 2, 3]}, dst=1)\n+\n+    # two sends, in size-then-object order (preserves gloo FIFO).\n+    assert len(posted) == 2\n+    assert posted[0][0].dtype == torch.long\n+    assert posted[0][0].shape == torch.Size([1])\n+    assert posted[0][0].item() == posted[1][0].numel()\n+    assert posted[1][0].dtype == torch.uint8\n+\n+    # retain holds both source tensors until wait.\n+    assert handle._retained == (posted[0][0], posted[1][0])\n+\n+    handle.wait()\n+\n+    # both underlying works drained, retain dropped.\n+    assert all(w.wait_calls == 1 for _, w in posted)\n+    assert handle._retained == ()\n+\n+    # wait is idempotent: gloo Work.wait() is single-shot for p2p sends (a\n+    # second wait blocks forever), and both the lazy FIFO reap in\n+    # ``_reap_completed_isends`` and any explicit isend caller may wait the\n+    # same metadata handle.\n+    handle.wait()\n+    assert all(w.wait_calls == 1 for _, w in posted)\n+    assert handle._retained == ()\n+\n+\n+def test_isend_tensor_dict_includes_metadata_handle(\n+    monkeypatch: pytest.MonkeyPatch,\n+) -> None:\n+    posted: list[torch.Tensor] = []\n+\n+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:\n+        posted.append(t)\n+        return _DummyWork()\n+\n+    monkeypatch.setattr(torch.distributed, \"isend\", fake_isend)\n+\n+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)\n+    td = {\"a\": torch.arange(4, dtype=torch.float32, device=\"cpu\")}\n+    handles = g.isend_tensor_dict(td, dst=1)\n+\n+    # size + object (metadata) + one tensor send.\n+    assert len(posted) == 3\n+    assert posted[0].dtype == torch.long\n+    assert posted[1].dtype == torch.uint8\n+    assert posted[2].dtype == torch.float32\n+\n+    # composite metadata handle + one tensor handle.\n+    assert len(handles) == 2\n+\n+    for handle in handles:\n+        handle.wait()\n+    assert handles[0]._retained == ()\n+\n+\n+def test_isend_tensor_dict_self_retains_for_fire_and_forget(\n+    monkeypatch: pytest.MonkeyPatch,\n+) -> None:\n+    works: list[_DummyWork] = []\n+\n+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:\n+        w = _DummyWork()\n+        works.append(w)\n+        return w\n+\n+    monkeypatch.setattr(torch.distributed, \"isend\", fake_isend)\n+\n+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)\n+    td = {\"a\": torch.arange(4, dtype=torch.float32, device=\"cpu\")}\n+\n+    # fire-and-forget: the returned handles are dropped by the caller, so the\n+    # group must self-retain the handles and the source tensor.\n+    g.isend_tensor_dict(td, dst=1)\n+    assert len(g._pending_isends) == 1\n+    handles0, tensors0 = g._pending_isends[0]\n+    assert len(handles0) == 2  # metadata composite + one tensor send\n+    assert tensors0 == [td[\"a\"]]\n+\n+    # the first send is still in flight, so the next call's reap keeps it.\n+    g.isend_tensor_dict(td, dst=1)\n+    assert len(g._pending_isends) == 2\n+\n+    # metadata-only send (no tensors) is dropped best-effort on the next\n+    # reap, since it has no reliable completion signal.\n+    g.isend_tensor_dict({\"meta\": \"no-tensors\"}, dst=1)\n+    assert len(g._pending_isends) == 3\n+\n+    # complete every posted work; the next call reaps all three old entries\n+    # (the metadata-only one unconditionally) and keeps only its own.\n+    for w in works:\n+        w.completed = True\n+    g.isend_tensor_dict(td, dst=1)\n+    assert len(g._pending_isends) == 1\n+    # reaped entries had their metadata handles waited as a backstop.\n+    assert handles0[0]._retained == ()\n+\n+\n+def test_send_tensor_dict_sync_path_does_not_self_retain(\n+    monkeypatch: pytest.MonkeyPatch,\n+) -> None:\n+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:\n+        return _DummyWork()\n+\n+    monkeypatch.setattr(torch.distributed, \"isend\", fake_isend)\n+    monkeypatch.setattr(torch.distributed, \"is_initialized\", lambda: True)\n+    monkeypatch.setattr(GroupCoordinator, \"send_object\", lambda self, obj, dst: None)\n+\n+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)\n+    td = {\"a\": torch.arange(4, dtype=torch.float32, device=\"cpu\")}\n+    g.send_tensor_dict(td, dst=1)\n+\n+    # the sync path waited every handle, so no retention entry may leak.\n+    assert len(g._pending_isends) == 0\n+\n+\n def test_async_intermediate_tensors_lazy_wait() -> None:\n     work = _DummyWork()\n     post_calls = {\"n\": 0}"
+        },
+        {
+          "filename": "vllm/distributed/parallel_state.py",
+          "status": "modified",
+          "additions": 140,
+          "deletions": 3,
+          "patch": "@@ -27,7 +27,7 @@ import contextlib\n import gc\n import pickle\n import weakref\n-from collections import namedtuple\n+from collections import deque, namedtuple\n from collections.abc import Callable\n from contextlib import contextmanager, nullcontext\n from dataclasses import dataclass\n@@ -78,6 +78,37 @@ class Handle(Protocol):\n     def wait(self) -> None: ...\n \n \n+class _RetainedHandle:\n+    \"\"\"Handle that retains source tensors until all posted work completes.\n+\n+    Used by ``isend_object`` to keep the serialized CPU tensors alive while\n+    gloo copies them in the background; ``wait`` drops the refs once drained.\n+\n+    ``wait`` must be idempotent: gloo ``Work.wait()`` is single-shot for\n+    point-to-point operations — calling it a second time on an already\n+    completed send blocks forever (verified empirically). Both the worker's\n+    top-of-step drain of ``_pp_send_work`` and ``_reap_completed_isends``\n+    may wait the same entry's metadata handle, so the second caller must\n+    not re-wait the underlying works.\n+    \"\"\"\n+\n+    def __init__(self, works: list[Any], retained: tuple[torch.Tensor, ...]) -> None:\n+        self._works = works\n+        self._retained = retained\n+        self._waited = False\n+\n+    def is_completed(self) -> bool:\n+        return all(w.is_completed() for w in self._works)\n+\n+    def wait(self) -> None:\n+        if self._waited:\n+            return\n+        for w in self._works:\n+            w.wait()\n+        self._waited = True\n+        self._retained = ()\n+\n+\n def _split_tensor_dict(\n     tensor_dict: dict[str, torch.Tensor | Any],\n ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:\n@@ -532,6 +563,15 @@ class GroupCoordinator:\n             and getattr(self.device_communicator, \"supports_tensor_dict\", False)\n         )\n \n+        # FIFO of in-flight ``isend_tensor_dict`` calls: one entry per call,\n+        # (handles, sent source tensors). Self-retention keeps the send\n+        # buffers alive for fire-and-forget callers that drop the returned\n+        # handles; entries are reaped lazily on the next ``isend_tensor_dict``\n+        # (see ``_reap_completed_isends``). Lazily created instead of plain\n+        # attribute init because some subclasses replicate ``__init__``\n+        # without calling ``super().__init__``.\n+        self._pending_isends: deque[tuple[list[Handle], list[torch.Tensor]]] = deque()\n+\n     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:\n         \"\"\"Create a new device-side ProcessGroup with the same per-rank membership\n         as this coordinator's `device_group`, but backed by a distinct communicator.\n@@ -882,6 +922,33 @@ class GroupCoordinator:\n \n         return obj\n \n+    def isend_object(self, obj: Any, dst: int) -> Handle:\n+        \"\"\"Non-blocking ``send_object``: isend size + pickled object on the\n+        CPU group. Returns a handle that retains the serialized source\n+        tensors until ``wait`` drains both sends.\n+        \"\"\"\n+        assert dst < self.world_size, f\"Invalid dst rank ({dst})\"\n+        assert dst != self.rank_in_group, (\n+            \"Invalid destination rank. Destination rank is the same \"\n+            \"as the current rank.\"\n+        )\n+\n+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)\n+        size_tensor = torch.tensor(\n+            [object_tensor.numel()], dtype=torch.long, device=\"cpu\"\n+        )\n+\n+        retained = (size_tensor, object_tensor)\n+        works: list[Any] = []\n+        for tensor in retained:\n+            work = torch.distributed.isend(\n+                tensor, dst=self.ranks[dst], group=self.cpu_group\n+            )\n+            if work is not None:\n+                works.append(work)\n+\n+        return _RetainedHandle(works, retained)\n+\n     def broadcast_tensor_dict(\n         self,\n         tensor_dict: dict[str, torch.Tensor | Any] | None = None,\n@@ -1014,8 +1081,51 @@ class GroupCoordinator:\n         )\n         for handle in handles:\n             handle.wait()\n+        # The sync path waited every handle, so the self-retention entry\n+        # appended by ``isend_tensor_dict`` is already drained; drop it\n+        # instead of leaking the tensor refs until the next async send.\n+        pending = getattr(self, \"_pending_isends\", None)\n+        if pending and pending[-1][0] is handles:\n+            pending.pop()\n         return None\n \n+    def _reap_completed_isends(self) -> None:\n+        \"\"\"Lazily drop self-retained ``isend_tensor_dict`` entries that have\n+        completed, oldest first (FIFO).\n+\n+        gloo ``Work.is_completed()`` is unreliable (it can report completion\n+        before the background copy of the source buffer finishes), so the\n+        metadata handle (``handles[0]``, a gloo-backed ``_RetainedHandle``) is\n+        never used as the completion gate. Instead we gate on the tensor-send\n+        handles (``handles[1:]``), which run on the device backend where\n+        ``is_completed()`` is reliable. Once all tensor sends are done the\n+        peer must already have posted the matching tensor recvs — and since\n+        the receiver ingests metadata before tensors, the gloo metadata send\n+        is then guaranteed complete, so ``wait()`` on it is ~instant and only\n+        serves to drop the retained refs.\n+\n+        Metadata-only entries (``handles[1:]`` empty, e.g. an empty\n+        ``IntermediateTensors``) have no reliable completion signal; drop them\n+        best-effort without blocking on the gloo metadata wait.\n+        \"\"\"\n+        pending = getattr(self, \"_pending_isends\", None)\n+        if pending is None:\n+            # Subclasses that replicate __init__ without calling\n+            # super().__init__ may not have the attribute yet.\n+            self._pending_isends = pending = deque()\n+        while pending:\n+            handles, _ = pending[0]\n+            tensor_handles = handles[1:]\n+            if not tensor_handles:\n+                pending.popleft()\n+                continue\n+            if not all(h.is_completed() for h in tensor_handles):\n+                # The oldest send is still in flight; FIFO ordering means the\n+                # rest are no further along, so stop here.\n+                break\n+            handles[0].wait()\n+            pending.popleft()\n+\n     def isend_tensor_dict(\n         self,\n         tensor_dict: dict[str, torch.Tensor | Any],\n@@ -1023,6 +1133,16 @@ class GroupCoordinator:\n         all_gather_group: \"GroupCoordinator | None\" = None,\n         all_gather_tensors: dict[str, bool] | None = None,\n     ) -> list[Handle]:\n+        \"\"\"Send the input tensor dictionary asynchronously.\n+\n+        The returned handles are additionally self-retained in\n+        ``self._pending_isends`` (together with the sent source tensors) and\n+        reaped lazily on subsequent calls, so fire-and-forget callers that\n+        drop the handles cannot free or overwrite the send buffers while the\n+        sends are still in flight. Callers that do keep the handles may\n+        ``wait()`` them as before; the retention entry is dropped on reap\n+        either way.\n+        \"\"\"\n         if self.world_size <= 1:\n             return []\n \n@@ -1048,12 +1168,16 @@ class GroupCoordinator:\n         metadata_group = self.cpu_group\n \n         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)\n-        self.send_object(metadata_list, dst=dst)\n \n         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]\n         assert len(tensor_keys) == len(tensor_list)\n \n-        handles: list[Handle] = []\n+        # Reap completed sends before posting new ones, bounding the\n+        # self-retention FIFO.\n+        self._reap_completed_isends()\n+        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]\n+\n+        sent_tensors: list[torch.Tensor] = []\n         for key, tensor in zip(tensor_keys, tensor_list):\n             if tensor.numel() == 0:\n                 continue\n@@ -1070,6 +1194,19 @@ class GroupCoordinator:\n             if tensor.is_cuda:\n                 tensor.record_stream(torch.cuda.current_stream(tensor.device))\n             handles.append(handle)\n+            sent_tensors.append(tensor)\n+\n+        # Self-retain for fire-and-forget callers: keep the handles and\n+        # the source tensors alive until the sends complete (reaped\n+        # lazily by ``_reap_completed_isends``). Without this, dropping\n+        # the returned handles would GC the ``_RetainedHandle``'s\n+        # serialized metadata buffers mid-send, and non-CUDA devices\n+        # have no ``record_stream`` equivalent protecting the tensor\n+        # sources.\n+        pending = getattr(self, \"_pending_isends\", None)\n+        if pending is None:\n+            self._pending_isends = pending = deque()\n+        pending.append((handles, sent_tensors))\n \n         return handles\n "
+        },
+        {
+          "filename": "vllm/v1/worker/gpu_worker.py",
+          "status": "modified",
+          "additions": 6,
+          "deletions": 10,
+          "patch": "@@ -216,8 +216,6 @@ class Worker(WorkerBase):\n         self.profiler_config = vllm_config.profiler_config\n \n         self.use_v2_model_runner = vllm_config.use_v2_model_runner\n-        # pending non-blocking PP send work from the previous iteration\n-        self._pp_send_work: list[Handle] = []\n \n         # Resolved lazily on first sleep/wake; persists worker-process state.\n         self._sleep_mode_backend: SleepModeBackend | None = None\n@@ -1108,12 +1106,6 @@ class Worker(WorkerBase):\n     def execute_model(\n         self, scheduler_output: \"SchedulerOutput\"\n     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n-        # ensure any previous non-blocking PP sends are complete\n-        if self._pp_send_work:\n-            for handle in self._pp_send_work:\n-                handle.wait()\n-            self._pp_send_work = []\n-\n         intermediate_tensors = None\n         forward_pass = scheduler_output.total_num_scheduled_tokens > 0\n         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens\n@@ -1186,8 +1178,12 @@ class Worker(WorkerBase):\n             and not get_pp_group().is_last_rank\n         )\n \n-        # launch non-blocking send of intermediate tensors\n-        self._pp_send_work = get_pp_group().isend_tensor_dict(\n+        # launch non-blocking send of intermediate tensors; the\n+        # GroupCoordinator self-retains the source tensors and the\n+        # metadata handle in ``_pending_isends`` and reaps them lazily on\n+        # the next ``isend_tensor_dict(is_async=True)`` call, so this\n+        # step returns without waiting for the receiver to drain.\n+        get_pp_group().isend_tensor_dict(\n             output.tensors,\n             all_gather_group=get_tp_group(),\n             all_gather_tensors=all_gather_tensors,\n"
+        }
+      ]
+    },
+    {
+      "sha": "7ab29234890b29b005e46b53037309e597425095",
+      "author": {
+        "name": "Wei Zhao",
+        "email": "51183510+wzhao18@users.noreply.github.com"
+      },
+      "date": "2026-08-31T07:01:05+08:00",
+      "message": "[Flashinfer] Upgrade Flashinfer version to 0.6.18 (#54313)\n\nSigned-off-by: wzhao18 <wzhao18.sz@gmail.com>\nSigned-off-by: Wei Zhao <51183510+wzhao18@users.noreply.github.com>\nCo-authored-by: Jee Jee Li <pandaleefree@gmail.com>\nCo-authored-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: Jiangyun Zhu <riverclouds.zhu@qq.com>\n---\n docker/Dockerfile                                                     | 2 +-\n docker/versions.json                                                  | 2 +-\n requirements/cuda.txt                                                 | 4 ++--\n .../gpt_oss/configs/gpt-oss-20b-flashinfer-mxfp4-bf16-cutlass.yaml    | 2 +-\n vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py          | 2 ++\n 5 files changed, 7 insertions(+), 5 deletions(-)",
+      "parents": [
+        "7a100bb617471801ee1d5525bfbb8fb238a345ea"
+      ],
+      "stats": {
+        "total_additions": 7,
+        "total_deletions": 5,
+        "files_changed": 5
+      },
+      "files": [
+        {
+          "filename": "docker/Dockerfile",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -943,7 +943,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \\\n # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)\n # https://docs.flashinfer.ai/installation.html\n # From versions.json: .flashinfer.version\n-ARG FLASHINFER_VERSION=0.6.17\n+ARG FLASHINFER_VERSION=0.6.18\n RUN --mount=type=cache,target=/opt/uv/cache \\\n     if [ \"${INSTALL_RUBIN_PRERELEASE}\" != \"true\" ]; then \\\n         uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \\"
+        },
+        {
+          "filename": "docker/versions.json",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -71,7 +71,7 @@\n       \"default\": \"true\"\n     },\n     \"FLASHINFER_VERSION\": {\n-      \"default\": \"0.6.17\"\n+      \"default\": \"0.6.18\"\n     },\n     \"GDRCOPY_CUDA_VERSION\": {\n       \"default\": \"12.8\""
+        },
+        {
+          "filename": "requirements/cuda.txt",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -14,8 +14,8 @@ PyNvVideoCodec==2.0.4\n # flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from\n # install_requires so the published wheel does not carry an unresolvable pin\n --extra-index-url https://flashinfer.ai/whl/\n-flashinfer-python==0.6.17\n-flashinfer-cubin==0.6.17\n+flashinfer-python==0.6.18\n+flashinfer-cubin==0.6.18\n apache-tvm-ffi==0.1.11\n tilelang==0.1.12\n nvidia-cudnn-frontend>=1.19.1"
+        },
+        {
+          "filename": "tests/evals/gpt_oss/configs/gpt-oss-20b-flashinfer-mxfp4-bf16-cutlass.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -3,4 +3,4 @@\n model_name: \"openai/gpt-oss-20b\"\n metric_threshold: 0.568\n reasoning_effort: \"low\"\n-server_args: \"--tensor-parallel-size 2 --moe-backend flashinfer_cutlass\"\n+server_args: \"--tensor-parallel-size 2 --moe-backend flashinfer_cutlass --gpu-memory-utilization 0.85\""
+        },
+        {
+          "filename": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -197,6 +197,8 @@ def fi_chunk_gated_delta_rule(\n     fi_state = initial_state.to(torch.float32)\n     fi_g = g.to(torch.float32)\n     fi_beta = beta.to(torch.float32)\n+    if cu_seqlens is not None:\n+        cu_seqlens = cu_seqlens.to(torch.int64)\n     result = chunk_gated_delta_rule_fi(\n         q=q,\n         k=k,\n"
+        }
+      ]
+    },
+    {
+      "sha": "7a100bb617471801ee1d5525bfbb8fb238a345ea",
+      "author": {
+        "name": "Kevin H. Luu",
+        "email": "khluu000@gmail.com"
+      },
+      "date": "2026-08-31T05:59:36+08:00",
+      "message": "[CI] Restore gpu_1_queue routing for torch-abi audit (#54468)\n\nSigned-off-by: khluu <khluu000@gmail.com>\n---\n .buildkite/test_areas/torch_abi.yaml | 3 +--\n 1 file changed, 1 insertion(+), 2 deletions(-)",
+      "parents": [
+        "b2dc864bb668da328aee8a8b0b72a0ad13c82252"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 2,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/torch_abi.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 2,
+          "patch": "@@ -1,11 +1,10 @@\n group: Torch ABI\n depends_on:\n-  - image-build-cpu\n+  - image-build\n steps:\n - label: \":nvidia: (L4) Torch Stable ABI Audit\"\n   key: torch-stable-abi-audit\n   timeout_in_minutes: 5\n-  device: cpu-small\n   source_file_dependencies:\n   - .buildkite/check-torch-abi.py\n   - csrc/\n"
+        }
+      ]
+    },
+    {
+      "sha": "b2dc864bb668da328aee8a8b0b72a0ad13c82252",
+      "author": {
+        "name": "Kevin H. Luu",
+        "email": "khluu000@gmail.com"
+      },
+      "date": "2026-08-31T02:02:31+08:00",
+      "message": "[Bugfix][Spec Decode] Keep default CUDA graph sizes memory-safe (#54418)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>\n---\n tests/compile/test_config.py | 120 +++++++++++++++++++++++--------------------\n vllm/config/compilation.py   |   5 +-\n vllm/config/vllm.py          |  15 +++---\n 3 files changed, 73 insertions(+), 67 deletions(-)",
+      "parents": [
+        "9d0fe9bac89d0bda98f977770f5ae88b386e981a"
+      ],
+      "stats": {
+        "total_additions": 73,
+        "total_deletions": 67,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/compile/test_config.py",
+          "status": "modified",
+          "additions": 64,
+          "deletions": 56,
+          "patch": "@@ -542,34 +542,36 @@ def _mock_config_for_cudagraph_sizes(\n \n \n @pytest.mark.parametrize(\n-    (\"max_num_seqs\", \"num_speculative_tokens\"),\n+    (\"max_num_seqs\", \"num_speculative_tokens\", \"widest_is_captured\"),\n     [\n         # No speculation: the 2x headroom under the platform ceiling, unchanged.\n-        (8, 0),\n-        (32, 0),\n+        (8, 0, True),\n+        (32, 0, True),\n         # Speculating, but the widest decode batch still fits under the ceiling.\n-        (64, 7),\n-        (256, 1),\n-        # Widest decode batch above the ceiling, which must not cut below it.\n-        (32, 16),\n-        (64, 16),\n+        (64, 7, True),\n+        (256, 1, True),\n+        # Wider decode batches must not raise the memory-safety ceiling.\n+        (32, 16, False),\n+        (64, 16, False),\n+        # Exact H200 regressions: DFlash (2176) and suffix decoding (6400).\n+        (128, 16, False),\n+        (256, 24, False),\n         # Widest decode batch off the capture stride, above the ceiling.\n-        (33, 16),\n+        (33, 16, False),\n         # ... and off the stride while below it, where the ceiling stands but\n         # the generated sizes would otherwise stop at 400.\n-        (24, 16),\n+        (24, 16, True),\n     ],\n )\n-def test_default_cudagraph_capture_size_covers_widest_uniform_decode(\n-    max_num_seqs, num_speculative_tokens\n+def test_default_cudagraph_capture_size_respects_platform_ceiling(\n+    max_num_seqs, num_speculative_tokens, widest_is_captured\n ):\n-    \"\"\"The widest uniform decode batch has to be inside the captured range.\n+    \"\"\"Uniform decode coverage must not raise the platform default ceiling.\n \n     A decode step presents up to `max_num_seqs * (1 + num_speculative_tokens)`\n-    tokens. If that size is not captured the decode path silently falls back to\n-    eager while the resolved mode still reports full decode graphs, so neither\n-    the platform's token-denominated ceiling nor the capture stride may stop\n-    short of it.\n+    tokens. Off-stride sizes within the platform ceiling are captured exactly.\n+    Larger batches fall back to eager execution instead of expanding the\n+    default capture range and risking OOM during engine initialization.\n     \"\"\"\n     compilation_config = CompilationConfig(\n         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE\n@@ -592,20 +594,21 @@ def test_default_cudagraph_capture_size_covers_widest_uniform_decode(\n         default_max_graph_size,\n     )\n     widest_uniform_decode = max_num_seqs * decode_query_len\n-    expected_max_size = max(token_grid_max, widest_uniform_decode)\n-    assert compilation_config.max_cudagraph_capture_size == expected_max_size\n+    assert compilation_config.max_cudagraph_capture_size == token_grid_max\n     assert (\n         compilation_config.max_cudagraph_capture_size\n         == compilation_config.cudagraph_capture_sizes[-1]\n     )\n-    assert widest_uniform_decode in compilation_config.cudagraph_capture_sizes\n+    assert (\n+        widest_uniform_decode in compilation_config.cudagraph_capture_sizes\n+    ) is widest_is_captured\n \n \n-def test_default_cudagraph_capture_sizes_keep_token_grid_bounded():\n-    \"\"\"Keep the token grid bounded; only request counts may exceed the default.\n+def test_default_cudagraph_capture_sizes_keep_all_sizes_bounded():\n+    \"\"\"Keep both token and uniform-decode grids under the platform default.\n \n-    This guards the measured 581 versus 100 capture-size regression at\n-    max_num_seqs=512 with 16 draft tokens.\n+    This guards both the measured 581 versus 100 capture-count regression and\n+    the graph-memory regression from capturing shapes up to 8704 tokens.\n     \"\"\"\n     max_num_seqs = 512\n     decode_query_len = 17\n@@ -640,12 +643,19 @@ def test_default_cudagraph_capture_sizes_keep_token_grid_bounded():\n     request_counts += list(range(256, max_request_count + 1, 16))\n     request_counts.append(max_request_count)\n     expected_sizes = sorted(\n-        set(token_grid + [count * decode_query_len for count in request_counts])\n+        set(\n+            token_grid\n+            + [\n+                count * decode_query_len\n+                for count in request_counts\n+                if count * decode_query_len <= default_max_graph_size\n+            ]\n+        )\n     )\n \n     assert compilation_config.cudagraph_capture_sizes == expected_sizes\n     assert all(\n-        size <= default_max_graph_size or size % decode_query_len == 0\n+        size <= default_max_graph_size\n         for size in compilation_config.cudagraph_capture_sizes\n     )\n \n@@ -675,12 +685,13 @@ def test_cudagraph_capture_sizes_respect_sequence_parallelism():\n         VllmConfig._set_cudagraph_sizes(config)\n \n     assert all(size % 2 == 0 for size in compilation_config.cudagraph_capture_sizes)\n-    assert 544 in compilation_config.cudagraph_capture_sizes\n+    assert 544 not in compilation_config.cudagraph_capture_sizes\n+    assert compilation_config.max_cudagraph_capture_size == 512\n \n \n @pytest.mark.skipif(not current_platform.is_cuda(), reason=\"Only test CUDA\")\n-def test_real_vllm_config_captures_widest_ngram_decode_batch():\n-    \"\"\"Real config post-init preserves the widest static ngram decode batch.\"\"\"\n+def test_real_vllm_config_caps_widest_ngram_decode_batch():\n+    \"\"\"Real config post-init preserves the default capture ceiling.\"\"\"\n     model_config = ModelConfig(model=\"facebook/opt-125m\")\n     speculative_config = SpeculativeConfig(\n         prompt_lookup_min=1,\n@@ -708,11 +719,11 @@ def test_real_vllm_config_captures_widest_ngram_decode_batch():\n             compilation_config=compilation_config,\n         )\n \n-    assert 544 in config.compilation_config.cudagraph_capture_sizes\n+    assert 544 not in config.compilation_config.cudagraph_capture_sizes\n     assert (\n         config.compilation_config.max_cudagraph_capture_size\n         == config.compilation_config.cudagraph_capture_sizes[-1]\n-        == 544\n+        == 512\n     )\n \n \n@@ -750,13 +761,12 @@ def test_default_cudagraph_capture_size_unchanged_without_speculation(max_num_se\n     )\n \n \n-def test_default_cudagraph_capture_size_covers_a_single_speculative_token():\n-    \"\"\"One speculative token is already enough to lose the widest batch.\n+def test_single_speculative_token_does_not_raise_default_capture_size():\n+    \"\"\"One speculative token must not raise the default capture ceiling.\n \n     MTP at depth 1 gives a query length of 2, so 300 requests is a 600-token\n-    decode batch against the platform's token ceiling. Gating the unit conversion on a\n-    deeper speculative width would leave this common configuration dispatching\n-    its largest decode steps eager.\n+    decode batch against the platform's token ceiling. The widest batch falls\n+    back to eager execution rather than expanding the capture range.\n     \"\"\"\n     compilation_config = CompilationConfig(\n         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE\n@@ -774,21 +784,19 @@ def test_default_cudagraph_capture_size_covers_a_single_speculative_token():\n         1024 if current_platform.is_device_capability_family(100) else 512\n     )\n     token_grid_max = min(300 * 2 * 2, default_max_graph_size)\n-    widest_uniform_decode = 300 * 2\n-    expected_max_size = max(token_grid_max, widest_uniform_decode)\n-    assert compilation_config.max_cudagraph_capture_size == expected_max_size\n+    assert compilation_config.max_cudagraph_capture_size == token_grid_max\n     assert (\n         compilation_config.max_cudagraph_capture_size\n         == compilation_config.cudagraph_capture_sizes[-1]\n     )\n-    assert 600 in compilation_config.cudagraph_capture_sizes\n+    assert 600 not in compilation_config.cudagraph_capture_sizes\n \n \n-def test_default_cudagraph_capture_size_caps_requests_not_tokens():\n-    \"\"\"The ceiling admits at most the platform default number of requests.\n+def test_default_cudagraph_capture_size_caps_tokens():\n+    \"\"\"The ceiling remains a platform-bounded token count.\n \n-    `max_num_seqs` far above the platform default must not push the capture\n-    range up without bound just because each request is now several tokens wide.\n+    `max_num_seqs` and speculative width must not push the default capture range\n+    above the platform's memory-safety guard.\n     \"\"\"\n     compilation_config = CompilationConfig(\n         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE\n@@ -805,16 +813,15 @@ def test_default_cudagraph_capture_size_caps_requests_not_tokens():\n     default_max_graph_size = (\n         1024 if current_platform.is_device_capability_family(100) else 512\n     )\n-    decode_query_len = 17\n-    token_grid_max = min(1024 * decode_query_len * 2, default_max_graph_size)\n-    widest_covered_decode = min(1024, default_max_graph_size) * decode_query_len\n-    expected_max_size = max(token_grid_max, widest_covered_decode)\n-    assert compilation_config.max_cudagraph_capture_size == expected_max_size\n+    assert compilation_config.max_cudagraph_capture_size == default_max_graph_size\n     assert (\n         compilation_config.max_cudagraph_capture_size\n         == compilation_config.cudagraph_capture_sizes[-1]\n     )\n-    assert expected_max_size == default_max_graph_size * 17\n+    assert all(\n+        size <= default_max_graph_size\n+        for size in compilation_config.cudagraph_capture_sizes\n+    )\n \n \n def _widest_covered_request_count(capture_sizes, query_len, max_num_seqs):\n@@ -844,20 +851,21 @@ def test_default_cudagraph_capture_sizes_cover_every_dynamic_decode_width():\n         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE\n     )\n     config = _mock_config_for_cudagraph_sizes(\n-        max_num_seqs=256,\n+        max_num_seqs=128,\n         num_speculative_tokens=16,\n         max_num_batched_tokens=32768,\n         compilation_config=compilation_config,\n-        # 16 draft tokens up to a batch of 16, then 2 out to 256.\n-        num_speculative_tokens_per_batch_size=[(1, 16, 16), (17, 256, 2)],\n+        # 16 draft tokens up to a batch of 16, then 2 out to 128. Both\n+        # tier maxima fit under the 512-token default capture ceiling.\n+        num_speculative_tokens_per_batch_size=[(1, 16, 16), (17, 128, 2)],\n     )\n \n     VllmConfig._set_cudagraph_sizes(config)\n \n     sizes = compilation_config.cudagraph_capture_sizes\n-    # The wide tier only ever runs to a batch of 16, the narrow one to 256.\n-    assert _widest_covered_request_count(sizes, 17, 256) >= 16\n-    assert _widest_covered_request_count(sizes, 3, 256) == 256\n+    # The wide tier only ever runs to a batch of 16, the narrow one to 128.\n+    assert _widest_covered_request_count(sizes, 17, 128) >= 16\n+    assert _widest_covered_request_count(sizes, 3, 128) == 128\n \n \n def test_dynamic_decode_capture_clamps_configured_width():"
+        },
+        {
+          "filename": "vllm/config/compilation.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 3,
+          "patch": "@@ -703,9 +703,8 @@ class CompilationConfig:\n     If not specified, max_cudagraph_capture_size is capped at 512 by default,\n     or 1024 on data center Blackwell GPUs. This avoids OOM in tight memory\n     scenarios with small max_num_seqs, and limits capture of large graphs that\n-    increase startup time and memory usage. When the uniform decode query length\n-    exceeds one, uniform decode sizes are appended and can raise the final value\n-    above this default.\n+    increase startup time and memory usage. Uniform decode sizes are appended\n+    only within this default ceiling.\n     \"\"\"\n \n     dynamic_shapes_config: DynamicShapesConfig = field("
+        },
+        {
+          "filename": "vllm/config/vllm.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 8,
+          "patch": "@@ -1953,10 +1953,9 @@ class VllmConfig:\n \n         `max_num_batched_tokens` is also appended to the list if it fits\n         within `max_cudagraph_capture_size`, so the max batch size is captured\n-        even when off-stride. Likewise, when the uniform decode query length\n-        exceeds one, the widest uniform decode batch (`max_num_seqs *\n-        decode_query_len`) is appended when it fits, since it need not land on\n-        an 8- or 16-token stride.\n+        even when off-stride. Uniform decode sizes are appended when they fit\n+        within the platform's default capture ceiling, since they need not land\n+        on an 8- or 16-token stride.\n \n         In the end, `vllm_config.compilation_config.cudagraph_capture_sizes`\n         will be the final sizes to capture cudagraph (in ascending order).\n@@ -2085,6 +2084,7 @@ class VllmConfig:\n                             n * query_len\n                             for query_len, tier_max_reqs in decode_tiers\n                             for n in request_counts(tier_max_reqs)\n+                            if n * query_len <= max_cudagraph_capture_size\n                         }\n                     )\n             max_num_tokens = self.scheduler_config.max_num_batched_tokens\n@@ -2134,10 +2134,9 @@ class VllmConfig:\n                     and max_num_tokens not in cudagraph_capture_sizes\n                 ):\n                     cudagraph_capture_sizes.append(max_num_tokens)\n-                # These extend past the token-strided ceiling, which counts one\n-                # token per request. valid_max_size below raises the final\n-                # max_cudagraph_capture_size to the widest of them. They remain\n-                # filtered by max_num_tokens.\n+                # Preserve the platform's default capture ceiling. Larger\n+                # uniform decode batches fall back to eager execution unless\n+                # users explicitly configure wider capture sizes.\n                 cudagraph_capture_sizes += [\n                     size for size in uniform_decode_sizes if size <= max_num_tokens\n                 ]\n"
+        }
+      ]
+    },
+    {
+      "sha": "9d0fe9bac89d0bda98f977770f5ae88b386e981a",
+      "author": {
+        "name": "Aditya Jha",
+        "email": "118803119+ima-helikoptaaa@users.noreply.github.com"
+      },
+      "date": "2026-08-31T01:02:15+08:00",
+      "message": "[Bugfix][Quantization][MoE] Route weight only NVFP4 checkpoints through W4A16 (#54427)\n\nSigned-off-by: Aditya Jha <4adityajha@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>\n---\n vllm/model_executor/layers/quantization/modelopt.py | 16 ++++++++++++++++\n 1 file changed, 16 insertions(+)",
+      "parents": [
+        "e79961c946e5b12da44ba0556567b418cd50fe20"
+      ],
+      "stats": {
+        "total_additions": 16,
+        "total_deletions": 0,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/layers/quantization/modelopt.py",
+          "status": "modified",
+          "additions": 16,
+          "deletions": 0,
+          "patch": "@@ -1081,6 +1081,22 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):\n     ) -> \"ModelOptNvFp4Config\":\n         is_checkpoint_nvfp4_serialized = \"NVFP4\" in quant_method\n \n+        # A checkpoint can declare quant_algo \"NVFP4\" yet quantize weights\n+        # only (input_activations is null in every config group). The W4A4\n+        # MoE path then folds an uninitialized input_scale that was never\n+        # loaded and can zero every expert, so route it through W4A16.\n+        if quant_method == \"NVFP4\":\n+            config_groups = original_config.get(\"config_groups\")\n+            if (\n+                isinstance(config_groups, dict)\n+                and config_groups\n+                and all(\n+                    isinstance(group, dict) and group.get(\"input_activations\") is None\n+                    for group in config_groups.values()\n+                )\n+            ):\n+                quant_method = \"W4A16_NVFP4\"\n+\n         if group_size is None:\n             group_size = 16  # Default value\n \n"
+        }
+      ]
+    },
+    {
+      "sha": "e79961c946e5b12da44ba0556567b418cd50fe20",
+      "author": {
+        "name": "Juan Pérez de Algaba",
+        "email": "124347725+jperezdealgaba@users.noreply.github.com"
+      },
+      "date": "2026-08-31T00:24:21+08:00",
+      "message": "[codeowners] Add jperezdealgaba to security file ownership (#54358)\n\nAdds Juan Pérez de Algaba (`@jperezdealgaba`) alongside Russell Bryant as a CODEOWNER for the vLLM security guide, security policy, and vulnerability-management documentation.\n---\n .github/CODEOWNERS | 6 +++---\n 1 file changed, 3 insertions(+), 3 deletions(-)",
+      "parents": [
+        "f6895a5fcb4710481bb44726af4fa57f4172330c"
+      ],
+      "stats": {
+        "total_additions": 3,
+        "total_deletions": 3,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": ".github/CODEOWNERS",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -218,6 +218,6 @@ mkdocs.yaml @hmellor\n /vllm/model_executor/layers/pooler @noooop\n \n # Security guide and policies\n-/docs/usage/security.md @russellb\n-/SECURITY.md @russellb\n-/docs/contributing/vulnerability_management.md @russellb\n+/docs/usage/security.md @russellb @jperezdealgaba\n+/SECURITY.md @russellb @jperezdealgaba\n+/docs/contributing/vulnerability_management.md @russellb @jperezdealgaba\n"
+        }
+      ]
+    },
+    {
+      "sha": "f6895a5fcb4710481bb44726af4fa57f4172330c",
+      "author": {
+        "name": "waizuichougou",
+        "email": "105572299+waizuichougou@users.noreply.github.com"
+      },
+      "date": "2026-08-31T00:19:38+08:00",
+      "message": "[Bugfix][Multimodal] Avoid caching full prompts in fallback (#54439)\n\nSigned-off-by: waizuichougou <2082431897@qq.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>\n---\n vllm/multimodal/processing/processor.py | 9 +++------\n 1 file changed, 3 insertions(+), 6 deletions(-)",
+      "parents": [
+        "56058fd572f6a7fec6899385f4a4ed7f4b964477"
+      ],
+      "stats": {
+        "total_additions": 3,
+        "total_deletions": 6,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/multimodal/processing/processor.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 6,
+          "patch": "@@ -1559,14 +1559,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):\n             # let BPE merge tokens across a segment boundary, silently\n             # changing how a non-special-token placeholder is tokenized.\n             new_token_ids = flatten_2d_lists(\n-                [\n-                    cached_encode(tokenizer, text, add_special_tokens=False)\n-                    for text in out_texts\n-                ]\n+                [tokenizer.encode(text, add_special_tokens=False) for text in out_texts]\n             )\n         else:\n-            new_token_ids = cached_encode(\n-                tokenizer, \"\".join(out_texts), add_special_tokens=False\n+            new_token_ids = tokenizer.encode(\n+                \"\".join(out_texts), add_special_tokens=False\n             )\n \n         return new_token_ids, result\n"
+        }
+      ]
+    }
+  ]
+}
