@@ -2,14 +2,15 @@
   "date": "2026-08-31",
   "repo": "vllm-project/vllm",
   "generated_at": "2026-08-31T20:00:00+08:00",
-  "daily_summary": "当日 8 条变更以正确性修复为主。FlashInfer sparse MLA 修复 BLHNC 块外层 KV 布局下的双层寻址错误——稀疏索引转换把物理块 ID 乘以 block_size 致 decode 读到其他层的 page、融合 DeepSeek-V3.2/GLM cache writer 从物理步幅反推逻辑块大小致写入落在错误的块或层，均改从实际 FlashInfer KV cache 视图派生物理行步幅。分布式通信修复 GroupCoordinator.isend_tensor_dict 的两个缺陷：元数据经同步 gloo send 交付、对端延迟提交匹配 recv 时 rendezvous 阻塞两 rank（vllm-ascend 虚拟流水线 fold-point 发送死锁），以及 fire-and-forget 调用者丢弃句柄后 pickled 元数据缓冲与设备张量无保留造成的 mid-send use-after-free。投机解码收回 #50488 越过平台默认上限的 capture 尺寸（H200 上默认捕获扩至 2176/6400 token 致夜间 CI OOM）；量化侧 NVFP4 weight-only checkpoint 在 config 解析时提升为 W4A16 走 Marlin，避免未初始化 input_scale 被折进反量化 alpha 令全部专家归零、输出乱码。另有 FlashInfer 0.6.18 升级、多模态 fallback 完整 prompt 进程级 LRU 的驻留修复、torch-abi 审计队列误移回滚与安全文件 CODEOWNERS 补充。",
+  "daily_summary": "当日 42 条变更以 KV offload 连续修复与新模型落地为主线。KV offload 七连修：混合注意力模型（gpt-oss-20b/120b 与 Gemma 类交错 SWA）逐组认证通过 canonical portability gate，获得跨 TP 的 offload 存储复用；`/dev/shm` 共享区在全部 worker 映射后 barrier+unlink，SIGKILL/OOM 不再泄漏文件、固定 engine_id 可干净重启；CPU→GPU load 对计算流 stream wait，修复异步调度下加载块被挂起清零静默抹除（mamba 模型整个 cache-hit 前缀 attend 全零）；P2P 全热 producer 改 REQUEST_LEVEL 级联避免 30s 超时重算、被中止 load 保留至终态完成以释放 primary-tier 预留、KV 事件前传 ownership 并按 medium/ownership 跟踪 residency。核心侧引入引擎级准入控制——`--max-num-queued-reqs`/`--max-num-queued-tokens` 在 `AsyncLLM.add_request` 最早拒绝超限请求（HTTP 503）；新模型 Qwen3.8-Flash-Next（GDN+MTP，+19K 行）与 Dots3 NOTE 运行时优化（MR V2 默认、MTP CUDA graph、embedding+RMSNorm 融合）落地；前端连修三族截断缺陷——`prompt_token_offsets`/`prompt_is_token_ids` 与 prompt 同截断、pooling 先截断后 padding（此前 left 截断只留 pad token）；content_parts 路径补转发 cache_salt、异步多模态媒体跨模态并发解析、renderer shutdown 时机修正、protocol.py 移出 openai 目录。正确性修复包括 ROCm AITER unified-attention graph replay 元数据、SM120 上 DSv4 投机解码 C128A topk 索引不连续的启动崩溃、DCP 下 DSv3.2/GLM-5.2 融合 attention 的 query RMSNorm 跳过与部分输出不合并、MiniCPM-o 在 Transformers v5 下复用 MiniCPM-V image processor、模态嵌套 mm_processor_kwargs 被预算读取忽略、FlashInfer sparse MLA BLHNC 寻址、isend_tensor_dict 元数据阻塞/use-after-free、投机解码默认 CUDA graph 尺寸 OOM、NVFP4 weight-only 路由与多模态 fallback prompt 缓存驻留。量化侧 AutoRound 新增块级 FP8 与 XPU MXFP8 MoE 支持、XPU 非量化权重可选 N-contiguous relayout；CPU 平台 AMX 支持 FP16/BF16 GDN state（前缀缓存吞吐 +35%）、Voxtral 可用并合修若干缺陷；融合 embedding kernel 落地、DSv3 专用 router GEMM kernel 退役（-1029 行）。CI 侧 FlashInfer 0.6.18 升级、torch-abi 审计队列回滚、XPU Qwen2-VL flaky 收敛、Qwen3-VL DeepStack 编译契约与 Kimi K3 fixture 测试、安全文件 CODEOWNERS 补充。",
   "sig_summaries": {
-    "sig-model-performance": "一条变更。`FLASHINFER_MLA_SPARSE` 使用 BLHNC 等块外层 KV cache 布局时，其他层的 page 插入同一层连续块之间，两条路径却假设物理块步幅恰等于逻辑块大小——FlashInfer sparse index 转换把物理块 ID 乘 `block_size` 致 decode 读到另一层的 page；融合 DeepSeek-V3.2/GLM cache writer 从物理块步幅反推逻辑块大小致写入落在错误的块或层。改为从实际 FlashInfer KV cache 视图派生物理行步幅并贯穿常规与 DCP sparse-index 转换、显式向融合 writer 传入逻辑 MLA 块大小，DCP 物理重映射测试扩展到非稠密块步幅（#54465）。",
-    "sig-large-scale-serving": "一条变更。`GroupCoordinator.isend_tensor_dict` 名义非阻塞、元数据却经同步 `send_object`（gloo send）交付——超 eager 阈值的 gloo 发送是 rendezvous 的，对端在后续迭代才提交匹配 recv 时（vllm-ascend 虚拟流水线 fold-point 发送）两 rank 死锁；且 fire-and-forget 调用者丢弃返回句柄后，pickled 元数据缓冲无保留（gloo 后台线程拷贝时 use-after-free）、非 CUDA 设备张量不 record_stream 可被后续计算覆盖。新增保持 gloo FIFO 顺序的 `isend_object` 非阻塞路径与持有序列化张量直至 wait 的 `_RetainedHandle`，`_pending_isends` FIFO 惰性回收且只门于可靠的设备句柄 `is_completed()`；`send_tensor_dict` 同步语义不变（#49274，+282/-13）。",
+    "sig-core": "十三条变更。引擎新增准入控制：`--max-num-queued-reqs`（在途请求上限，n>1 请求占 n 槽）与 `--max-num-queued-tokens`（prefill token 积压上限，约为目标 TTFT×prefill 吞吐，直接映射 PD 分离 prefill 池容量）在 `AsyncLLM.add_request` 同步检查、超限 HTTP 503，默认禁用（#49445）。前端三族截断缺陷连修：`prompt_token_offsets` 与 `prompt_is_token_ids` 均为与 prompt token 逐元素配对的平行数组，`apply_post_tokenization` 截断 prompt 却不碰它们（#54407、#54509）；pooling 的验证器顺序 padding→truncation 使 left 截断只保留刚追加的 pad token、嵌入全是 padding 且 200 OK，改为先截断后 padding 对齐 Transformers（#54364）。`/inference/v1/generate` 的 content_parts 路径补转发 `cache_salt`，避免复用不同模型版本的 prefix-cache 块（#54315）；`parse_chat_messages_async` 的异步媒体改为单个 `asyncio.gather` 跨模态并发解析（#54537）；renderer shutdown 时机修正——在线两次、离线零次（#52124）；`protocol.py` 移出 openai 目录（#54492）。正确性：SM120 上 DSv4 投机解码验证 batch 越过 FlashInfer 64-token standalone kernel 截断后 `eidx` 不连续断言崩溃，decode 视图改取持久缓冲全宽行切片（#53574）；DCP 下 DSv3.2/GLM-5.2 融合 attention 修复 query RMSNorm 被 owner-local 槽检查跳过与纯 DCP 不合并部分 output/LSE（#50005）。新模型与性能：Qwen3.8-Flash-Next 支持（GDN kernel+MTP+PLE offload，+19K 行，#53896）；Dots3 NOTE 默认 Model Runner V2、MTP CUDA graph 捕获、embedding+RMSNorm 融合（#53517）；CPU Voxtral attention 后端加入支持列表（#53921）。",
+    "sig-large-scale-serving": "八条变更，KV offload 为主。canonical portability gate 改为逐组认证混合注意力模型（gpt-oss-20b/120b、Gemma 类交错 SWA），TP1 写入的 KV 被 TP2 冷进程复用且输出 byte-identical（#51689）；`/dev/shm/vllm_offload_{engine_id}.mmap` 在全部 worker mmap 后 gloo barrier+unlink——SIGKILL/OOM/崩溃不再泄漏 `cpu_bytes_to_use` 大小的文件、固定 engine_id 重启不再被残留文件卡死 creator 选举（#52596）；CPU→GPU load 对计算流 stream wait，修复含 mamba 层模型在异步调度下加载块被更早 step 已发出的清零静默抹除、请求对整个 cache-hit 前缀 attend 全零（#50696，无修复 4/5 失败、有修复 5/5 通过）；P2P 全热 producer 以 REQUEST_LEVEL 级联已驻留块，远端 decoder 不再挂到 30s 超时重算（#52912）；P2P 被中止 load 保留至 AbortAck/超时的终态完成以释放 primary-tier 预留（#52571）；KV 事件携带可选 ownership 区分二级层与框架事件（#52067）、offloaded-block residency 按 medium/ownership 跟踪避免移除一处丢弃他处仍需的元数据（#52068）；`GroupCoordinator.isend_tensor_dict` 元数据非阻塞化与发送缓冲保留（#49274）。",
+    "sig-model-performance": "六条变更。ROCm AITER unified-attention 获得专用 metadata builder——通用 ROCm 构建器在 graph capture 时置零 `query_start_loc` 保护 legacy prefix-prefill kernel，而该后端 replay 时要消费它，共享路径破坏 query 边界（#53821）；FlashInfer sparse MLA 的 BLHNC 块外层布局双层寻址错误修复（#54465）；新增融合 embedding CUDA kernel（vocab parallel embedding，+580 行，#53677）；CPU AMX 支持 FP16/BF16 持久 GDN state，hybrid prefix caching 对齐块 1152→640/2176→1152 token、Qwen3.6-35B-A3B-FP8 八前缀长度几何平均吞吐 +35.18%/+37.51%（#52191）；CPU 缺陷合修——fused MoE buffer 溢出、Qwen3.6 router logits GEMM、纯 SWA 模型 block_size（#54042）；DSv3 专用 FP32 router GEMM kernel 退役，净删 1029 行（#54040）。",
     "sig-spec-decode": "一条变更。#50488 在平台既有默认上限（H200 512 token、数据中心 Blackwell 1024 token）之上追加 uniform-decode capture 尺寸，H200 夜间 CI 默认捕获扩至 2176/6400 token——suffix 配置 FULL graph capture OOM、DFlash 可用 KV cache 被压到 0.94 GiB（需 5.12 GiB）。生成的 uniform-decode 尺寸收回默认上限内：装得下的精确 off-stride 尺寸仍得 FULL decode graph、更宽 batch 回退 eager 而非扩张默认图内存包络阻止引擎启动，显式 capture 尺寸仍可 opt in，回归测试钉住 DFlash 2176-token 与 suffix 6400-token 两个失败宽度（#54418）。",
-    "sig-quantization": "一条变更。ModelOpt NVFP4 checkpoint 可自标 `quant_algo` NVFP4 却只量化权重（每个 config group 的 `input_activations` 为 null），无 activation scale 可加载却被 W4A4 融合 MoE 路径把未初始化 `input_scale` 折进反量化 alpha——缓冲值依赖 allocator，为 0.0 时全部权重 scale 归零、每个专家死亡、模型输出重复 token 乱码且无报错（GB10 sm121 复现、RTX PRO 6000 sm120 恰好拿到 1.0 页成 no-op，#54189）。config 解析时检测 weight-only 情形并提升为 `W4A16_NVFP4` 走 Marlin（反量化权重到 bf16、从不读 input scale），真 W4A4 checkpoint 保持既有路径（#54427）。",
-    "sig-omni": "一条变更。#53560（缓存公共 token 序列）的回归——多模态 placeholder 跨 BPE 边界时，共享文本 fallback 对完整用户 prompt 的解码再编码此前绕过缓存，现进入 2048 条目的进程级 `cached_encode` LRU，互异长 prompt 以 Python token list 驻留至驱逐（普通 MiniCPM-V 图像 chat 请求即触发，多用户长 prompt 服务可驻留数百 MiB 或更多）。fallback prompt 改为直接 `tokenizer.encode(..., add_special_tokens=False)` 绕过缓存、保留可复用 placeholder/replacement 序列的缓存——恢复既有缓存边界且 token 匹配、placeholder 位置与模型输出不变（#54439）。",
-    "sig-ci": "三条变更。FlashInfer 升级至 0.6.18（docker/versions.json、requirements/cuda.txt、Dockerfile 与 gpt_oss eval 适配，经完整 CI nightly 验证，#54313）；回滚 #54326 对 `Torch Stable ABI Audit` 的队列误移——审计需 CUDA wheel 镜像，small-cpu 队列的 `-cpu` 镜像含 allowlist 之外的 `_C_AVX2.abi3.so`/`_C_AVX512.abi3.so`，恢复 `gpu_1_queue` 默认路由后步骤回绿（#54468）；安全指南与策略文件的 CODEOWNERS 加入 jperezdealgaba（#54358）。"
+    "sig-quantization": "四条变更。AutoRound（INC）格式新增块级 FP8 支持——config 校验、layer helper 与 scheme 解析委托 FP8 linear method，w8g128x128 checkpoint 可加载（#47434）；AutoRound MXFP8 MoE 模型新增 XPU 支持，Qwen3-30B-A3B-MXFP8 在 XPU TP4 上 GSM8K 5-shot 0.9075/0.9166（#51248）；XPU 非量化 linear 权重新增 `VLLM_XPU_FORCE_N_CONTIG_WEIGHT` 强制 N-contiguous relayout，K>N 形状在 B60/B70 双 SKU 均有提速（down_proj prefill 至 2.0x），oneDNN 非确定性构造下默认保守（#53536）；ModelOpt NVFP4 weight-only checkpoint config 解析时提升为 `W4A16_NVFP4` 走 Marlin，避免未初始化 `input_scale` 折进反量化 alpha 令全部专家归零（#54427）。",
+    "sig-omni": "四条变更。模态嵌套 `mm_processor_kwargs`（`videos_kwargs` 等）此前被 vLLM 自身 token-budget 与 dummy-input 读取忽略——Qwen3-VL/Qwen3.8 长视频 recipe 下 encoder-cache profiling 欠预留，扁平 `size` 又泄漏进图像预算；改为按模态 overlay 嵌套 dict（#53808）；MiniCPM-o 在 Transformers 5.15 串行测试中复用 MiniCPM-V 2.5 不兼容 image processor（#44282 覆写绕过 #48413 修过的基类路径），抽共享 `_get_checkpoint_image_processor` helper 修复（#54501）；Python 前端补齐 video embeds 输入支持，解锁视频输入的 EPD 使用（#54242）；多模态 fallback prompt 不再进入进程级 `cached_encode` LRU，消除互异长 prompt 的内存驻留（#54439）。",
+    "sig-ci": "六条变更。FlashInfer 升级至 0.6.18（#54313）；回滚 #54326 对 `Torch Stable ABI Audit` 的队列误移——small-cpu 队列的 `-cpu` 镜像含 allowlist 之外的 `_C_AVX2.abi3.so`/`_C_AVX512.abi3.so`，恢复 `gpu_1_queue` 默认路由（#54468）；XPU 上 Qwen2-VL 多图 BF16 生成测试的后期数值发散 flaky 以 `max_tokens=64` 收敛（#54172）；新增 Qwen3-VL DeepStack 编译输入契约回归测试——空零背衬 payload 后注入非零 payload、断言下一次编译调用使用之（#53529）；Kimi K3 Eagle3 测试 fixture 一行修复（#54482）；安全指南与策略文件的 CODEOWNERS 加入 jperezdealgaba（#54358）。"
   },
   "commits": [
     {
@@ -75,6 +76,278 @@
       "sig_reason": "多模态 fallback prompt 编码缓存驻留修复，属多模态处理范畴。",
       "tags": ["bugfix", "low-risk", "multimodal", "fallback-prompt", "lru-cache", "memory-retention", "bpe", "minicpm-v"],
       "pr_number": 54439
+    },
+    {
+      "sha": "82936c409d17321d5a791796296790508605aaed",
+      "comment": "**背景**：XPU 上 Qwen2-VL 多图生成正确性测试不稳定——BF16 + ViT FlashAttention 后端下 HF 与 vLLM 可在长生成前缀保持一致后在自回归解码后期数值发散，`check_logprobs_close` 间歇失败。**方法**：沿用 CPU 平台既有 workaround，把该测试 `max_tokens` 限制到 64（+16/-8）。**效果**：保留对 HF 参考的整体正确性验证目的、剥离长程数值稳定性变量，1 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU 多模态生成测试的 flaky 收敛，属测试基础设施范畴。",
+      "tags": ["test", "low-risk", "xpu", "qwen2-vl", "multimodal", "flaky-test", "numerical-divergence"],
+      "pr_number": 54172
+    },
+    {
+      "sha": "bd575a0d0bdf482557648e5278bbba98b6a939b9",
+      "comment": "**背景**：AutoRound（INC）格式此前不支持块级（group-wise）FP8 checkpoint，如 `Llama-3.1-8B-fp-w8g128x128` 无法在 vLLM 中加载推理。**方法**：AutoRound config 解析新增 block-wise FP8 支持——接受合法 block 配置并拒绝非法 activation 配置的校验、FP8 block helper 的 layer config 处理、scheme 解析在识别块级 FP8 时委托既有 FP8 linear method（+503/-62，10 文件）。**效果**：w8g128x128 checkpoint 离线推理输出正常；新增 config 校验、layer helper、scheme 选择等 5 个单测全部通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "AutoRound 块级 FP8 量化格式支持，属量化格式解析范畴。",
+      "tags": ["feature", "low-risk", "quantization", "autoround", "inc", "fp8", "block-wise", "group-quant"],
+      "pr_number": 47434
+    },
+    {
+      "sha": "dafbef15a1c879c64ebb99427917e4ca8d5bca1e",
+      "comment": "**背景**：vLLM 请求队列无界——等待队列已饱和时引擎仍接受请求，等于默默接受可能无界的 TTFT 代价；目前完全依赖外部负载均衡器维护状态并按 QoS 预筛，引擎内没有任何早期拒绝并指示上游重试到较空闲实例的机制。**方法**：在 `AsyncLLM.add_request` 中、tokenization 与 IPC 之前同步检查两个默认禁用的准入标志——`--max-num-queued-reqs` 限制在途请求数（waiting+running，n>1 的请求占 n 槽）、`--max-num-queued-tokens` 限制 prefill 阶段 prompt token 总量（约为目标 TTFT × prefill 吞吐，PD 分离场景直接映射 prefill 池容量，支持人类可读单位）；超限以 HTTP 503 拒绝，无需与调度器往返（OutputProcessor 已跟踪 per-request 状态，+644/-35）。**效果**：请求在 IPC 链条最早期被拒、省去注定丢弃的工作，流式与非流式均支持。",
+      "sig": "sig-core",
+      "sig_reason": "引擎级请求准入控制与队列上限管理，属核心引擎范畴。",
+      "tags": ["feature", "low-risk", "admission-control", "queue-management", "max-num-queued-reqs", "max-num-queued-tokens", "http-503", "ttft"],
+      "pr_number": 49445
+    },
+    {
+      "sha": "76ff0cdff2defded8d912d550299c902ff33cdca",
+      "comment": "**背景**：`ROCM_AITER_UNIFIED_ATTN` 与通用 ROCm 路径共享 graph capture 元数据构建——通用构建器在 capture 时把 `common_attn_metadata.query_start_loc` 置零以保护 legacy prefix-prefill kernel，而 AITER unified attention 在 replay 时要消费该张量，query 边界被破坏。**方法**：仅为 AITER unified-attention 后端引入专用 metadata builder：保留廉价的 capture 时 `seq_lens=1` 行为、replay 时保留 `query_start_loc`；通用 `RocmAttentionMetadataBuilder` 行为不变，新 builder 只被 `RocmAiterUnifiedAttentionBackend` 选中（+59/-3）。**效果**：该后端 graph replay 正确性修复；回归测试分别验证后端选择与 capture 元数据行为，并断言通用 ROCm 后端仍选原构建器。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm AITER unified-attention 的 graph replay 元数据修复，属注意力后端范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "aiter", "unified-attention", "cudagraph-replay", "query-start-loc", "metadata-builder"],
+      "pr_number": 53821
+    },
+    {
+      "sha": "c5d840ff6a50f544fca8524e8caffda9f63b7728",
+      "comment": "**背景**：canonical portability gate 此前要求模型有单一 full-attention 组才认证通过——混合注意力模型（full + sliding-window 组）中 gpt-oss-20b/120b 与 Gemma 类交错 SWA 模型被排除在 TP 无关 offload 之外；而每层字节都是 head-shard 片段、与窗口无关，存储命名空间完全可以跨拓扑折叠。**方法**：gate 改为逐组检查 spec、并把每组的 KV-head 数对照该 rank 的分片而非只看模型级整除；认证本身不变——仍在注册时对照活跃 tensor stride 逐层进行，`_validate_canonical_refs` 对静态标志声称却不可交付的可移植性仍 fail-closed（+91/-91）。**效果**：2x H100 E2E（gpt-oss-20b，fs 二级层，canonical_layout 开启）：TP1 写入后 TP2 冷进程直接复用同一命名空间 3840/3901 cached tokens、输出与全新 TP2 计算 byte-identical；解锁滑动窗口混合模型的跨 TP offload，不影响模型输出。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload canonical 可移植性门对混合注意力模型的扩展，属 KV offload 范畴。",
+      "tags": ["feature", "medium-risk", "kv-offload", "portability-gate", "hybrid-attention", "sliding-window", "gpt-oss", "cross-tp-reuse"],
+      "pr_number": 51689
+    },
+    {
+      "sha": "4c58a0c398b056b135b98bd93c644945be7e3109",
+      "comment": "**背景**：`SharedOffloadRegion` 以 `/dev/shm/vllm_offload_{engine_id}.mmap` 支撑 CPU offload 层，路径只在 `cleanup()` 中移除——SIGKILL/OOM/崩溃从不运行 cleanup，每次硬退出泄漏一个 `cpu_bytes_to_use` 大小的文件，固定 `engine_id` 的残留文件还使下次启动时任何 rank 都赢不了 creator 选举（#51579）。**方法**：全部 worker `mmap()` 完成后在 worker 组上 barrier（gloo cpu group；`_INNER_DP_WORLD` 已初始化则用之，否则 `_WORLD`），随后 creator unlink 路径——既有映射保持有效，最后一个 worker 无论以何种方式退出内核都会回收内存；barrier 在 `MADV_POPULATE_WRITE` 之前运行，失败时 creator 先 unlink 再重抛。以 barrier 取代 #51317 的 `.openers` 计数文件——barrier 只需节点本地 opener 的超集，计数式的欠计/过计失败模式不可表达、无需配置管道（+247/-34）。**效果**：37/37 单测通过（含 unlink-after-barrier、barrier 失败清理、跨进程 barrier + SIGKILL + 重启）；2-GPU E2E（TP=2/DP=2、固定 engine_id）确认启动中创建后即 unlink、两 worker 映射同一已删除 inode、SIGKILL 后 `/dev/shm` 为空、同 engine_id 重启干净。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 共享内存区域的生命周期与崩溃泄漏修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "dev-shm", "shared-memory", "fd-leak", "barrier", "crash-recovery", "engine-id"],
+      "pr_number": 52596
+    },
+    {
+      "sha": "e0d27040ddcc5ac31cf01c5b04a7d764ccba656d",
+      "comment": "**背景**：P2P KV-offload 的请求结束路径上，`ClientRole.finish()` 在 `AbortAck` 或既有 abort 超时产出失败结果之前丢弃活跃 load——连带丢弃关联 `job_id`，既有失败完成路径无法解析挂起的 primary-tier 写入（#49829）。**方法**：保留被中止 load 的状态与 job 身份直至既有终态完成路径运行，让 `LoadResult(success=False)` → `complete_write(success=False)` 传播失败并释放挂起的 primary-tier 预留（+97/-11）。**效果**：确定性测试覆盖 finish 后活跃 load 保留、AbortAck 清理、abort 超时清理、重复 finish、迟到 TransferDone 与单次终态结果；P2P session 及相邻 tiering 测试 149 passed，调度器超时与通用 HIT_PENDING 行为不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "P2P KV offload 中止路径的状态保留修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "p2p", "abort", "load-state", "primary-tier", "resource-release"],
+      "pr_number": 52571
+    },
+    {
+      "sha": "e2c8eeac40d01051d6d60b8f42ebbe5842a1c672",
+      "comment": "**背景**：vocab parallel embedding 的查找与归约等操作存在融合空间（PR 以 before/after kernel profile 截图展示差距）。**方法**：新增融合 embedding CUDA kernel（`csrc/libtorch_stable/vocab_parallel_embedding_kernels.cu`），接入 torch bindings 与 CMake，附 kernel 基准与测试（+580/-10，8 文件）。**效果**：性能对比确认 kernel 时间缩短；现有 embedding 路径可经新融合实现获得加速。",
+      "sig": "sig-model-performance",
+      "sig_reason": "融合 embedding CUDA kernel 新增，属 kernel 优化范畴。",
+      "tags": ["performance", "low-risk", "kernel", "embedding", "vocab-parallel-embedding", "cuda", "fusion"],
+      "pr_number": 53677
+    },
+    {
+      "sha": "bed3280f50dce36ff9472eee937d1aada7e31d75",
+      "comment": "**背景**：对会把新分配 KV 块清零的模型（任何含 mamba 层的模型，`needs_kv_cache_zeroing`），offloading connector 的 CPU→GPU load 可被静默抹除——`transfer_async` 只对 GPU→CPU 在计算流上等待，load 在自己的流上运行、与计算流无序；copy 先落时，对目标块的挂起清零会把它抹掉，请求对整个 cache-hit 前缀 attend 全零——无崩溃、无报错、只有降级的输出。调度器侧 `_skip_zero_block_ids` 只编辑当前调度步的清零列表，无法收回更早 step 已发出的清零；同步调度隐式安全（引擎阻塞在每步输出上），异步调度移除等待后两流间的顺序只靠时序、无任何强制。**方法**：一行修复——CPU→GPU load 同样对计算流做 stream wait（+4/-2）；skip set 仍是绕过 CUDA 流的写入方（NIXL/RDMA）唯一可能的护栏。**效果**：H100 实测该修复是真实护栏——同一测试无修复 4/5 次失败（32 个加载块全部为零）、有修复 5/5 通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload CPU→GPU 加载与计算流的顺序修复，属 KV offload 正确性范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "stream-ordering", "kv-zeroing", "mamba", "async-scheduling", "silent-corruption"],
+      "pr_number": 50696
+    },
+    {
+      "sha": "810bc3250c945829c64a745b4f695ddfd8f9a598",
+      "comment": "**背景**：`parse_chat_messages_async` 在 `AsyncMultiModalItemTracker` 中按模态分组记录异步媒体工作，`resolve_items` 等一个完整模态组完成才开始下一组——含 image/audio/video 的请求中独立的 fetch/decode 工作逐模态组串行执行（image → audio → video），而异步媒体 connector 本已把阻塞 I/O 与解码移出事件循环，逐模态循环为混合模态请求增加了可避免的墙钟延迟。**方法**：单个 `asyncio.gather` 收集全部被跟踪的异步媒体项，再把返回列表切回原模态组喂给既有结果物化代码——flatten/slice 保留模态映射与组内顺序，`return_exceptions=True` 保留（+78/-13）。**效果**：混合模态请求的各模态媒体解析并发执行；范围有意限于已跟踪项的调度，不改 MediaConnector 缓存行为。",
+      "sig": "sig-core",
+      "sig_reason": "前端聊天解析的跨模态媒体并发优化，属 API 前端范畴。",
+      "tags": ["performance", "low-risk", "frontend", "chat-utils", "multimodal", "async-media", "asyncio-gather"],
+      "pr_number": 54537
+    },
+    {
+      "sha": "9debcd5990bf275db5ac8ed7bea653a1fa8a23a0",
+      "comment": "**背景**：#43617 修复过编译 warmup 以 `deepstack_input_embeds=None` 调用 decoder、使编译图特化到无 DeepStack 路径、后续多模态请求忽略真实 DeepStack 特征的正确性缺陷（改为无 payload 时保留参数并以零背衬张量占位），该稳定输入契约缺回归测试。**方法**：新增 `tests/compile/test_deepstack_input_contract.py`（+71/-0）：先以空零背衬 payload 运行编译 decoder、再注入已知非零 payload、断言下一次编译调用使用它——旧的 `num_tokens==0` 早退被带回时测试失败。**效果**：钉住契约；qwen3_vl mrope 96 passed；实测 compiled 与 eager 输出一致，恢复旧 guard 会改变两者输出（含 #53516 报告的 stop_sign 人数），底层质量问题另行调查。",
+      "sig": "sig-ci",
+      "sig_reason": "Qwen3-VL DeepStack 编译输入契约的回归测试，属测试覆盖范畴。",
+      "tags": ["test", "low-risk", "qwen3-vl", "deepstack", "torch-compile", "regression-test", "input-contract"],
+      "pr_number": 53529
+    },
+    {
+      "sha": "9acbc5360aa50d148fcfcbd597703514aa9a3e22",
+      "comment": "**背景**：KV offload 的块驻留（residency）元数据未按存储介质与所有权区分，移除一处 residency 会丢弃另一处仍需要的元数据。**方法**：按 medium 与 ownership 跟踪 offloaded-block residencies，把事件元数据保留至最终驻留移除（+54/-19）。**效果**：`test_events.py` 单测覆盖；与 #52067（事件 ownership 前传）配套。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 事件元数据按介质与所有权的驻留跟踪，属 KV offload 范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "kv-events", "residency", "metadata"],
+      "pr_number": 52068
+    },
+    {
+      "sha": "eeb549a74dbf9cd41ff6b4c99ea2f4c6a82a7538",
+      "comment": "**背景**：延续 #41907/#52131/#53500/#53659 的前端整理——2023 年 vLLM 在线服务只有 OpenAI 兼容服务器，`engine/protocol.py` 一直留在 openai 目录内；如今在线服务已远超 OpenAI 兼容范畴，该位置不再合理。**方法**：把 `engine/protocol.py` 移出 openai 文件夹并全仓更新 import（194 文件，+550/-585）。**效果**：前端代码组织与服务形态对齐，纯移动重构、无行为变化。",
+      "sig": "sig-core",
+      "sig_reason": "前端 protocol 模块位置整理，属 API 前端代码组织范畴。",
+      "tags": ["refactor", "low-risk", "frontend", "protocol", "code-organization", "openai-server"],
+      "pr_number": 54492
+    },
+    {
+      "sha": "d8de4ae322b54e518b2de771fe28673c6e9664d9",
+      "comment": "**背景**：prefix cache 已热的 PD producer 不计算任何新块，BLOCK_LEVEL 策略下 tiering manager 无东西可向 P2P 二级层级联——远端 decoder 的 fetch 需求挂起至 30s load 超时后重算整个 prompt（#52808）。**方法**：对携带 `remote_decoder` kv_request_id 的请求声明 `OffloadPolicy.REQUEST_LEVEL`——tiering manager 级联已驻留 primary tier 的块（自 primary 读取、无需 GPU 访问），primary-tier load 供给的前缀命中块也保留在 store 路径；其余请求（含 consumer leg）保持 BLOCK_LEVEL。store job 的创建还让对端首条 FetchMsg 绑定 session，`on_request_finished` 可快速失败未匹配需求而非等满超时（+282/-9）。**效果**：五个新测试两级钉住行为——manager 级四种请求形态的 policy 断言（remote_decoder+kv_request_id 得 REQUEST_LEVEL、plain/consumer leg/畸形 remote_decoder 保持 BLOCK_LEVEL），tiering 级覆盖全热请求仍向 request-level tier 交付完整块集、`keys_to_store==[]` 且 block-level tier 不动。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "P2P KV offload 全热 producer 的 REQUEST_LEVEL 级联修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "p2p", "offload-policy", "request-level", "prefill-disagg", "warm-prefix"],
+      "pr_number": 52912
+    },
+    {
+      "sha": "699e180df48d78b5275d528124641c67b4b1664c",
+      "comment": "**背景**：DeepSeek-V4 Flash 在 SM120（RTX 6000 Pro、DGX Spark）+ FlashInfer sparse-MLA 后端下服务器启动的 CUDA graph capture 即崩溃：`Check failed: (eidx.IsContiguous()) is false`。#52823（自适应 topk 宽度）后 `build_c128a_topk_metadata` 返回持久 `c128a_global_decode_buffer` 的宽度收窄切片——保留行步幅、不连续；FlashInfer 把 `num_tokens<=64` 的调用派给 standalone decode kernel（无 eidx 连续性检查）、更大的派给 paged orchestrator 的 `CHECK_INPUT_AND_TYPE`。纯 target-only decode 停在截断之下从不触发；投机解码的验证 batch 携带 `num_decodes*(1+K)` 行越过截断，故在启动 capture 中暴露（DGX Spark/sm_121a 独立复现）。**方法**：`build_c128a_topk_metadata` 新增 `full_width_decode` 标志（仅 SM120 的 metadata builder 设置）——decode 视图取持久缓冲的全宽行切片：连续、graph 稳定地址（每步 `.contiguous()` 拷贝会每步新分配并破坏 capture），kernel 跨步写入与自适应 `max_compressed_tokens` 界限不变；decode 侧按 per-token topk lens 界定读取，活动宽度之外的陈旧列不被读。SM100（FlashMLA/TRTLLM）保持活动宽度切片，prefill 视图全后端收窄（Triton 消费者跨行计非负项）（+31/-7）。**效果**：SM120 上投机解码启动 capture 不再崩溃。",
+      "sig": "sig-core",
+      "sig_reason": "SM120 上 DSv4 C128A decode topk 索引连续性修复，属核心模型路径范畴。",
+      "tags": ["bugfix", "low-risk", "sm120", "deepseek-v4", "c128a", "topk-indices", "sparse-mla", "flashinfer", "cudagraph-capture", "spec-decode"],
+      "pr_number": 53574
+    },
+    {
+      "sha": "28bf75c9a951b9871d2646df1c7828ee5a66e953",
+      "comment": "**背景**：#54407 修复 `prompt_token_offsets` 同类缺陷后，`EmbedsPrompt.prompt_is_token_ids` 是最后一个未处理的平行数组——与 `prompt_token_ids` 逐元素配对的逐位置掩码（True=该位置读真实 token id、False=读一行 `prompt_embeds`），契约要求两者同长；`TokenizeParams.apply_post_tokenization` 截断 `prompt_token_ids` 与 `prompt_embeds` 却从不碰掩码，设置 `truncate_prompt_tokens` 后 prompt 缩短而掩码不变，两者描述不同位置。该混合模式路径可从 OpenAI API 直达（`--enable-prompt-embeds` 服务器上带 `truncate_prompt_tokens` 的 chat 请求）。**方法**：把既有 `_truncation_slice` 应用到掩码并扩展其 docstring 命名该情形（+54/-2）。**效果**：截断后掩码与 token 序列重新对齐；含渲染器单测。",
+      "sig": "sig-core",
+      "sig_reason": "prompt embeds 混合输入截断掩码对齐修复，属前端渲染范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "prompt-embeds", "truncation", "tokenization", "parallel-array"],
+      "pr_number": 54509
+    },
+    {
+      "sha": "399247cc8877f60f02f3aa859c61c3330a59bfbb",
+      "comment": "**背景**：Buildkite 失败暴露 Transformers 5.15 下串行测试中 MiniCPM-o 2.6 复用了 MiniCPM-V 2.5 不兼容的 image processor——#44282 的 MiniCPM-o 覆写绕过了基类 processor 路径，#48413 只在基类路径修了同类复用缺陷，#51668 的 Transformers 5.15 升级使被漏掉的覆写显形。**方法**：把既有的 checkpoint 专属 image processor 加载抽为共享 `_get_checkpoint_image_processor` helper，MiniCPM-V 与 MiniCPM-o 均改用之，同时保留 MiniCPM-o 的 tokenizer、audio feature extractor 与 pooling 配置（+41/-23）。**效果**：新增串行 MiniCPM-V 2.5 → MiniCPM-o 2.6 回归测试，触达失败的 `get_sliced_grid` 路径并验证两个远端 processor 类彼此独立。",
+      "sig": "sig-omni",
+      "sig_reason": "MiniCPM-o 多模态 image processor 复用修复，属多模态处理器范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "minicpm-o", "minicpm-v", "image-processor", "transformers-v5", "processor-reuse"],
+      "pr_number": 54501
+    },
+    {
+      "sha": "5bfd76372d66507d014895376458fd507e124e66",
+      "comment": "**背景**：renderer 生命周期不对称——在线 serving 中被 shutdown 两次，离线推理中从不 shutdown（PR 日志对比：main 分支离线退出时无 HfRenderer 关闭日志）。**方法**：修正 `vllm/renderers/base.py` 的 shutdown 时机（+12/-13）。**效果**：离线（embed 示例）与在线（`vllm serve`）退出路径均恰好一次 shutdown，日志显示 HfRenderer 在 teardown 中被正确关闭。",
+      "sig": "sig-core",
+      "sig_reason": "renderer 生命周期 shutdown 时机修复，属核心引擎范畴。",
+      "tags": ["bugfix", "low-risk", "renderer", "shutdown", "lifecycle", "offline-inference"],
+      "pr_number": 52124
+    },
+    {
+      "sha": "1b9539d37c90f179886a462d2149189e3fe38045",
+      "comment": "**背景**：AutoRound 格式 MXFP8 MoE 模型此前无 XPU 支持。**方法**：为 AutoRound MXFP8 MoE 模型增加 XPU 支持（`vllm/model_executor/layers` 3 文件，+341/-0，含单测）。**效果**：`Qwen3-30B-A3B-MXFP8-AutoRound` 在 XPU（TP=4、enforce-eager）上 PIQA acc 0.7905/acc_norm 0.7971，GSM8K 5-shot exact_match 0.9075（flexible-extract）/0.9166（strict-match）。",
+      "sig": "sig-quantization",
+      "sig_reason": "AutoRound MXFP8 MoE 的 XPU 量化支持，属量化范畴。",
+      "tags": ["feature", "low-risk", "quantization", "autoround", "mxfp8", "moe", "xpu", "qwen3"],
+      "pr_number": 51248
+    },
+    {
+      "sha": "c6c33f2b1facdcf6ace0d2f241f20507c6cc8157",
+      "comment": "**背景**：CPU AMX 后端的 align 模式为 attention KV 与 recurrent state 取公共块大小——FP32 GDN state 把 hybrid prefix caching 的对齐块撑大，加剧前缀缓存粒度损失（glassjaw）。**方法**：支持 FP16/BF16 持久 GDN state（`--mamba-ssm-cache-dtype {auto|bfloat16}`），涉及 csrc/cpu/sgl-kernels 内核与平台配置（+575/-141）。**效果**：Qwen3.6-35B-A3B-FP8 八个前缀长度几何平均下，BF16 GDN state 的输出 token 吞吐较 auto/FP32 提升 +35.18%（kv auto）/+37.51%（kv fp8）；有效对齐块从 1152→640（auto）、2176→1152（fp8）token。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CPU AMX 上 GDN state 低精度持久化与前缀缓存对齐优化，属平台性能范畴。",
+      "tags": ["performance", "low-risk", "cpu", "amx", "gdn", "mamba", "hybrid-prefix-caching", "fp16", "bf16", "mamba-ssm-cache-dtype"],
+      "pr_number": 52191
+    },
+    {
+      "sha": "2a61f060d342afb680f5a8937ed614b774bf9305",
+      "comment": "**背景**：XPU 非量化 GEMM 走 `torch.nn.functional.linear`，(N, K) 权重 N-contiguous 时表现更好；但 oneDNN matmul 存在原子操作等非确定性构造，默认保留权重原布局以求确定性。**方法**：新增 `VLLM_XPU_FORCE_N_CONTIG_WEIGHT` 开关强制权重 relayout；K>N 是唯一在 B60/B70 双 SKU 都赢且与 M 无关的条件（布局在加载时一次固定，M 动态）（+16/-0）。**效果**：Qwen3-8B 实测 B60 prefill `down_proj` 提速约 2.0x、B70 prefill 约 1.68x；K<N 在 B60 decode 反慢至 0.46x，故默认保持保守、由开关 opt-in。",
+      "sig": "sig-quantization",
+      "sig_reason": "XPU 非量化 linear 权重布局优化开关，属量化/线性层执行范畴。",
+      "tags": ["performance", "low-risk", "xpu", "gemm", "weight-layout", "n-contiguous", "onednn", "env-flag"],
+      "pr_number": 53536
+    },
+    {
+      "sha": "fdbf2ddbd22a82f8f59b97ba30e5436f0509d2c8",
+      "comment": "**背景**：CPU 路径一批缺陷合修：fused MoE 缓冲区大小溢出、Qwen3.6 router logits GEMM 问题、纯 SWA 模型 block_size 问题，外加噪声日志抑制。**方法**：修复 `csrc/cpu/cpu_fused_moe.cpp` 与 sgl-kernels 的 buffer 大小计算、router logits GEMM、纯 SWA 模型的 block_size 处理，并抑制噪声日志（+118/-85，11 文件）。**效果**：CPU 路径正确性修复合集，涉及 fused MoE、attention 与 KV connector 测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CPU fused MoE 与 SWA 等多项内核缺陷修复，属平台性能范畴。",
+      "tags": ["bugfix", "medium-risk", "cpu", "fused-moe", "buffer-overflow", "router-gemm", "swa", "block-size"],
+      "pr_number": 54042
+    },
+    {
+      "sha": "2cf82bcdd17f658486c280b0acd23274f60bdf00",
+      "comment": "**背景**：融合 DeepSeek-V3.2/GLM-5.2 attention 路径的两个 DCP 正确性缺陷（#50095）：融合 norm/RoPE kernel 在 DCP rank 无 owner-local KV-cache 槽时跳过 query RMSNorm——KV 所有权并不移除该 rank 的 query 贡献；纯 DCP 只把 rank-local query heads 送入对 owner-local KV 的 attention、且不跨 DCP rank 合并部分 output/LSE。**方法**：query RMSNorm 移到 owner-local 槽检查之前（负槽仍抑制 MLA 与 indexer KV-cache 写入）；纯 DCP 在 sparse MLA attention 前经 `MLADCPManager` gather query heads（支持时保留 direct-workspace 快路径、超大混合 batch 安全回退），attention 后经同一 manager 合并部分 output/LSE——NVIDIA 纯 DCP 混合 batch 路径不传 PCP-only decode 元数据，sparse 后端为空本地分片提供中性贡献（+102/-22）。**效果**：既有融合 norm/RoPE 测试扩展全负槽回归——query 输出有效、cache 不变、Top-K 清空。",
+      "sig": "sig-core",
+      "sig_reason": "DCP 上下文并行下 DSv3.2/GLM-5.2 融合 attention 的正确性修复，属核心模型路径范畴。",
+      "tags": ["bugfix", "medium-risk", "dcp", "context-parallelism", "deepseek-v3.2", "glm-5.2", "fused-attention", "rmsnorm", "rope", "mla"],
+      "pr_number": 50005
+    },
+    {
+      "sha": "f9d666f917941852b7d48ec20069f37480fafc28",
+      "comment": "**背景**：KV cache 事件此前无法区分 KV 二级层（如 offload tier）发出的事件与框架自有事件。**方法**：为 KV cache 事件添加可选 ownership 信息并在 offload 路径前传（+36/-10）。**效果**：`test_events.py` 单测覆盖；是 #52068（按 medium/ownership 跟踪 residency）的前置。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV cache 事件的 ownership 信息前传，属 KV 事件范畴。",
+      "tags": ["feature", "low-risk", "kv-offload", "kv-events", "ownership"],
+      "pr_number": 52067
+    },
+    {
+      "sha": "8e92248f79814bc12a195f5d2529cc245768017c",
+      "comment": "**背景**：DeepSeek-V3 专用 FP32 router GEMM CUDA kernel 已被更通用路径取代，成为纯维护负担。**方法**：退役该 kernel——移除 `fp32_router_gemm.cu` 及入口、CMake 注册、benchmark 与测试（+18/-1029，12 文件）。**效果**：净删约千行专用 kernel 代码，MoE router GEMM 统一走通用路径。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSv3 专用 router GEMM kernel 退役清理，属 kernel 维护范畴。",
+      "tags": ["refactor", "low-risk", "kernel", "router-gemm", "deepseek-v3", "cleanup", "dead-code"],
+      "pr_number": 54040
+    },
+    {
+      "sha": "da0b2d8b17c9203bdd5eeb7a9af575f75a050c09",
+      "comment": "**背景**：Dots3 NOTE 的语言模型与视觉编码器运行时路径存在多处可优化点。**方法**：`Dots3NoteForCausalLM` 默认启用 Model Runner V2；MTP speculator 的 prefill/decode 路径在 V2 下 CUDA graph 捕获；词表复制时 MTP embedding lookup 与 embedding/hidden-state RMSNorm 融合；自定义 MLA metadata builder 启用 uniform-batch CUDA graph；backbone 与 MTP 权重加载器共享稠密 MLP 权重 padding 实现；复用单一视觉 RMSNorm 实现；直连 fallback 消息改 `warning_once`（+94/-85）。**效果**：保持既有模型行为与权重加载格式；FP8 checkpoint 在 H100（DP+EP+MTP）端到端验证，融合 embedding/RMSNorm 数值与参考一致、TorchInductor 全图编译通过、多模态图像评测正常。",
+      "sig": "sig-core",
+      "sig_reason": "Dots3 NOTE 模型运行时性能优化（MR V2/CUDA graph/算子融合），属核心模型路径范畴。",
+      "tags": ["performance", "medium-risk", "dots3-note", "model-runner-v2", "cuda-graph", "mtp", "fused-embedding", "rmsnorm", "vision-encoder", "weight-loader"],
+      "pr_number": 53517
+    },
+    {
+      "sha": "7292ee2791985ff3afe38850fb34125ad0853933",
+      "comment": "**背景**：`--mm-processor-kwargs` 的模态嵌套形式（如 `videos_kwargs.size`）被 vLLM 自身的 token-budget 与 dummy-input 读取忽略——Qwen3-VL/Qwen3.8 长视频 recipe 下 encoder-cache profiling 欠预留（#52834）；扁平 `size` 覆写虽能抬升视频预算，却泄漏进图像预算。**方法**：`get_merged_mm_kwargs(..., modality=)` 按模态把 `images_kwargs`/`videos_kwargs`/`audio_kwargs` 嵌套 dict 覆盖到扁平命名空间——视频 size 抬升不再污染图像 profiling；processor 构造与 HF `__call__` 仍不传 modality，嵌套 kwargs 照常到达 HF processor；Qwen2/3-VL 读取点（`get_max_video_tokens`、dummy inputs、`_get_vision_info`、逐项视频 size 拷贝）传入匹配模态（+172/-9）。**效果**：overlay 单测 + 匹配 issue 的 CPU 复现探针（`videos_kwargs` 只抬视频、扁平 `size` 抬两者）；生成输出不变，只对齐 encoder-cache 预留。",
+      "sig": "sig-omni",
+      "sig_reason": "模态嵌套 mm_processor_kwargs 的预算读取修复，属多模态处理范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "mm-processor-kwargs", "modality-scoped", "qwen3-vl", "token-budget", "encoder-cache", "profiling"],
+      "pr_number": 53808
+    },
+    {
+      "sha": "4ae172231c633f00be275133ad91094396d3280c",
+      "comment": "**背景**：`/inference/v1/generate` 接受顶层 `cache_salt`，但 `content_parts` 路径重建 `TokensPrompt` 时未拷贝——本应正确的调用者会复用不同模型版本下创建的 prefix-cache 块。**方法**：把非空请求 salt 转发进 `TokensPrompt`，与该端点的文本及预处理特征路径对齐（+2/-0）。**效果**：token 生成 serving 测试 12 passed；不改模型计算，只在构造引擎 prompt 时保留既有 cache-key 输入。",
+      "sig": "sig-core",
+      "sig_reason": "content_parts 路径 cache_salt 转发缺失修复，属 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "cache-salt", "content-parts", "prefix-cache", "scale-out"],
+      "pr_number": 54315
+    },
+    {
+      "sha": "8fd9eb85d5a3d8f36cacb2b5d570a7a51c8200d8",
+      "comment": "**背景**：`prompt_token_offsets` 是 prompt 文本每 token 的 (start, end) 字符区间，两处文档约定长度等于 token 序列；`TokenizeParams.apply_post_tokenization` 截断 `prompt_token_ids` 却从不碰 offsets——截断实际触发时 offsets 保持截断前长度、不再描述随行的 token。触发条件为 `return_token_offsets` + `truncate_prompt_tokens` + 显式 `truncation_side`：显式 side 时故意关闭 tokenizer 级截断（tokenizer 自身 side 可能与请求不同），tokenizer 返回全序列与全序列 offsets、之后只切 token；三者皆为 `CompletionRequest` 字段，`POST /v1/completions/render` 直接把渲染的 `GenerateRequest` 返回调用者，无需额外 flag。**方法**：把既有 `_truncation_slice` 同样应用到 offsets（+106/-8）。**效果**：截断触发时 offsets 与 token 重新对齐；含 render 与渲染器测试。",
+      "sig": "sig-core",
+      "sig_reason": "prompt_token_offsets 与 prompt 同步截断修复，属前端渲染范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "token-offsets", "truncation", "render-api", "completion"],
+      "pr_number": 54407
+    },
+    {
+      "sha": "e126687a9a828d513c01a07cd69f025f27d63280",
+      "comment": "**背景**：支持新模型 Qwen/Qwen3.8-Flash-Next。**方法**：新增模型实现（含 GDN 相关 csrc kernel 与 torch 绑定），接入 lm_eval/models_basic/spec_decode 测试区（+19425/-451，124 文件）；支持 MTP 投机解码与 `VLLM_PLE_CPU_OFFLOAD=1` 的 N-gram embedding CPU offload。**效果**：无 offload 时 BF16/FP8/NVFP4 权重在 GB300/GB200/H200（MI355X 仅 BF16）TP2/TP4/TEP4 验证；offload 时 BF16/FP8 在 GB200 TP2/TP4/DEP4 验证（Inferact 提供，见 vLLM recipe）。",
+      "sig": "sig-core",
+      "sig_reason": "Qwen3.8-Flash-Next 新模型架构支持，属核心模型支持范畴。",
+      "tags": ["feature", "medium-risk", "model-support", "qwen3.8-flash-next", "gdn", "mtp", "ple-offload", "hybrid-model"],
+      "pr_number": 53896
+    },
+    {
+      "sha": "687db597440bf2b0cc65404e5f8cc238632127e0",
+      "comment": "**背景**：`TokenizeParams._validate_tokens` 的验证器顺序为 padding → truncation → len_check：`padding=max_length` 先把 pad token 追加到 `max_input_tokens`，`truncation_side=left` 的截断随后只保留最后 N 个 token——恰是刚追加的 pad token，真实内容被全部丢弃、请求成功、模型嵌入的尽是 padding，无错无警。`padding` 自 #51157（2026-08-27）可经 HTTP 设置，`PoolingBasicRequestMixin` 把三个参数暴露在同一请求模型上；`truncation_side` 还不必显式传——回退到 `tokenizer.truncation_side`，自身默认 left 的 tokenizer 只配 `padding`+`truncate_prompt_tokens` 即中招。**方法**：调整为先截断后 padding，与 Transformers `pad_truncation` 管线一致（+142/-17）。**效果**：`POST /v1/embeddings` 的 `padding=max_length` + `truncate_prompt_tokens` 组合不再产出纯 padding 嵌入；含 pooling 与渲染器测试。",
+      "sig": "sig-core",
+      "sig_reason": "pooling prompt 先 padding 后截断的顺序缺陷修复，属前端渲染范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "pooling", "embeddings", "padding", "truncation", "validator-order"],
+      "pr_number": 54364
+    },
+    {
+      "sha": "44fe2a392b71d52a8d72faf2f8278834379482c9",
+      "comment": "**背景**：Voxtral（Whisper 架构语音转写）在 CPU 后端不可用——`create_whisper_attention_backend_with_block_pooling` 的支持后端列表缺少 `CPUAttentionBackend`。**方法**：把 `CPUAttentionBackend` 加入支持列表（+5/-1）。**效果**：vllm-openai-cpu:v0.28.0 镜像上 Voxtral-Mini-4B-Realtime-2602 实时转写验证通过（mary_had_lamb 音频正确转写，openai_realtime_client 端到端）。",
+      "sig": "sig-core",
+      "sig_reason": "CPU 平台 Voxtral 语音模型的 attention 后端支持，属核心模型支持范畴。",
+      "tags": ["feature", "low-risk", "cpu", "voxtral", "speech-to-text", "whisper", "attention-backend"],
+      "pr_number": 53921
+    },
+    {
+      "sha": "648b7468b8e10dc7baf05554f6772136f7a52a46",
+      "comment": "**背景**：修复 Buildkite 构建 86259 上 Kimi K3 Eagle3 测试 fixture 的失败。**方法**：`tests/models/kimi_k3` 一行 fixture 修正（+1/-0）。**效果**：CI 恢复绿色。",
+      "sig": "sig-ci",
+      "sig_reason": "Kimi K3 Eagle3 测试 fixture 修复，属测试基础设施范畴。",
+      "tags": ["test", "low-risk", "ci", "kimi-k3", "eagle3", "test-fixture"],
+      "pr_number": 54482
+    },
+    {
+      "sha": "555ea65e8c41732e62eed93915f7ac6bf9497f6c",
+      "comment": "**背景**：多数 VLM 已实现 video embeds 支持，但前端缺失，限制了视频输入上的 EPD（encoder-prefill 分离）使用。**方法**：为 Python 前端补齐 video embeds 输入支持——`chat_utils`、`ec_transfer`、模型侧等 8 文件（+461/-24）；自 #53675 拆分以避免与 EPD NVDEC decode + 传输混杂。**效果**：视频输入可经 embeds 路径进入 EPD 流程，附 disaggregated_encoder 示例与单测。",
+      "sig": "sig-omni",
+      "sig_reason": "前端 video embeds 输入支持，属多模态前端范畴。",
+      "tags": ["feature", "low-risk", "multimodal", "video-embeds", "epd", "frontend", "ec-transfer"],
+      "pr_number": 54242
     }
   ]
 }
