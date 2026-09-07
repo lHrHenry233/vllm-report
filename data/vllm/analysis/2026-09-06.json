@@ -1,0 +1,119 @@
+{
+  "date": "2026-09-06",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-06T20:00:00+08:00",
+  "daily_summary": "9 月 6 日（周六）共 13 条变更，KV offload 正确性四连修是主线：最后一个采样 token 的越界 KV slot 污染 offload 块（投机解码下可载入被拒绝 draft 的 KV）、chunked prefill 期间 SWA store 可达性 horizon 误用、ARC 淘汰 T2 不足时未回退 T1、已清理请求的异步 lookup batch 仍被提交。E/P/D 分离式 prefill 两侧推进：scale-out 协议新增向后兼容的 `mm_metadata` 元数据通道，并对客户端回传的多模态数据补齐 engine handoff 前校验，防止篡改 render body 打挂共享引擎。性能侧 BLIP-2 Q-Former 改用 SDPA（Q-Former 提速 1.43-1.51x）、A100 80GB PCIe 落地 Qwen3.5-122B-A10B 的 MoE 调优配置、Diamond Rapids CPU 新增原生 AMX-FP8 attention。另有 Kimi-K3 前缀 checkpoint 扩展支持投机解码/部分前缀缓存/KV connector，以及 DP wave 首步同步把 RL pause 时每 rank 的 32 个 dummy forward 降为 1 个。",
+  "sig_summaries": {
+    "sig-core": "三条变更。E/P/D 分离式 prefill 的 scale-out 协议新增向后兼容的 `features.mm_metadata` 字段——render 仍返回完整 `kwargs_data` 供 encode 使用，prefill 在设置 `ec_transfer_params` 时可只接收轻量元数据（`placeholder_metadata_fields` ∪ `keep_on_cpu`），两者都缺则拒绝，旧客户端行为不变（#54659）；Kimi-K3 内部 prefill checkpoint 优化扩展至投机解码（Eagle block rewind）、部分前缀缓存（`prefix_match_unit < Mamba block size`）与经 KV connector 恢复的 checkpoint block，cache manager 与 FlashKDA worker 共享 checkpoint 有效性规则（#53614）；DP 引擎改为在 wave 第一步同步 DP 状态，节奏经 `--dp-sync-interval` 可配置（原硬编码 32、默认 16），RL pause 时每 rank 的 32 个 dummy forward 降为 1 个（#52957）。",
+    "sig-large-scale-serving": "四条变更，全部围绕 KV offload 正确性。最后一个采样 token 自身没有 KV，请求恰在 block 边界结束时会把含越界 slot 的整块 offload，哈希键控下后续重放相同 token 即命中坏块（投机解码下甚至载入被拒绝 draft 的 KV）——finished 分支改用 `max(req.num_prompt_tokens, req.num_tokens - 1)`（#54288）；chunked prefill 期间 SWA store 可达性改用 prompt 的最终可 offload 长度而非当前 step 的 chunk 数，abort 时把已计算 frontier 视为最终分段恰好一次地提交尾部 chunk（#54362）；CPU KV offload 的 ARC 淘汰在 T2 无合格候选时回退 T1，消除 T1 低于自适应目标时的存储失败（#55461）；异步 lookup batch 在 flush 前按 scheduler 持有的状态重校验，跳过已被 cleanup 的请求条目（#55075）。",
+    "sig-model-performance": "三条变更。BLIP-2 Q-Former 的 self/cross attention 改用 `scaled_dot_product_attention`，RTX 4090 上 Q-Former p50 提升 1.43-1.51x、`embed_multimodal` 整体 1.20-1.25x（#55285）；A100 80GB PCIe 新增 E=256,N=512 fused MoE 调优配置（Qwen3.5-122B-A10B TP=2 形状），bs=1024/4096 的 kernel 时间约 -18~19%（#55511）；Diamond Rapids CPU 新增原生 `AMX_FP8` attention ISA，用 `_tile_dpfp8ps`/`_tile_dpbf16ps` 硬件 intrinsic 免去 K/V 反量化，相对 BF16 AMX decode KV128 从 0.75x 提到 1.14x（#49410）。",
+    "sig-omni": "两条变更。scale-out 多模态数据在 engine handoff 前补齐校验——grid 几何须与像素张量一致、字段布局绑定当前模型声明、placeholder 区间/稀疏 `is_embed` mask/多模态缓存键逐项核验，防止认证客户端用篡改的 render body（如把 32x32 图的 grid 改成 `[1,132,132]`）触发 GPU 非法访存并停掉共享引擎（#51898）；renderer warmup 的 dummy 输入预算改从 renderer 的 scheduler config 推导，仅在启用 chunked prefill 时以 `max_num_batched_tokens` 封顶，消除长上下文 warmup 的冗余 CPU 内存（#55448）。",
+    "sig-ci": "一条变更。新增 @aoshen02 为 RL weight transfer、RLHF development API 及相关测试/示例/文档的 code owner（11 条路径均已验证存在、保留既有 owner），属 committer onboarding 治理变更（#55529）。"
+  },
+  "commits": [
+    {
+      "sha": "52358e6e192aeae73dd3764046c98fc4b156ea83",
+      "comment": "**背景**：E/P/D 分离式服务中 render 把完整 `MultiModalKwargsItem` 序列化进 `features.kwargs_data`，编码器张量（`pixel_values`）与轻量字段（`image_grid_thw`、视频时间戳等 keep_on_cpu 数据）混在一起；encode 侧已消费 `pixel_values` 并经 EC connector 发布 embedding，prefill 仍被迫接收完整 kwargs_data。**方法**：新增向后兼容的 `features.mm_metadata` 字段（与 kwargs_data 相同的 per-modality item 顺序，仅含 `placeholder_metadata_fields` ∪ `keep_on_cpu`）；`/inference/v1/generate` 仅在设置 `ec_transfer_params` 时接受 metadata-only features，两者都缺则拒绝，防止 generate 路径 encode 静默丢弃 `pixel_values`；忽略 mm_metadata 的旧客户端行为不变。**效果**：prefill 可只经 mm_metadata + EC 参数获取所需元数据，是 llm-d-router coordinator 优化在 vLLM 侧的落地。",
+      "sig": "sig-core",
+      "sig_reason": "scale-out 前端协议为 E/P/D 分离式 prefill 新增多模态元数据通道，属 API frontend 协议范畴。",
+      "tags": ["feature", "medium-risk", "scale-out", "multimodal", "disaggregated-prefill", "mm-metadata", "ec-connector", "backward-compatible"],
+      "pr_number": 54659
+    },
+    {
+      "sha": "808f8cd3ac6751278d8b7be97f6fde5295ca4653",
+      "comment": "治理变更：新增 @aoshen02 为 RL weight transfer、RLHF development API 及相关测试/示例/文档的 code owner（11 条路径均已验证存在），保留继承路径上的既有 owner，属 committer onboarding，无运行时行为变更。",
+      "sig": "sig-ci",
+      "sig_reason": "CODEOWNERS 治理变更，属仓库治理范畴。",
+      "tags": ["chore", "low-risk", "governance", "codeowners", "rl"],
+      "pr_number": 55529
+    },
+    {
+      "sha": "dc02934a07672eb778a8d819f4e35d0f93ee427b",
+      "comment": "**背景**：`_build_store_jobs` 允许已结束请求 offload 最多 `req.num_tokens` 个 token 的 KV，但最后一个采样 token 自身没有 KV（其 slot 从未被任何 forward 覆盖）；请求恰好在 block 边界结束时，offload 层会收到末位 slot 越界的整块。offload 块按 token id 哈希键控，后续多轮对话重放相同 token 即命中并加载坏块；投机解码下该 slot 还可能残留被拒绝 draft 的 KV，使模型 attend 到未接受的 token。**方法**：finished 分支改用 `max(req.num_prompt_tokens, req.num_tokens - 1)`，与 `AsyncScheduler._update_request_with_output` 和 `simple_kv_offload` 的 confirmed-token 公式对齐。**效果**：H100（Qwen3-30B-A3B-W4A16）上 4 种配置各 11 个已完成请求逐一验证公式一致（`max()` 从未改变答案），含越界 slot 的块不再入库。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 存储数量的越界 slot 修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "prefix-cache", "block-poisoning", "spec-decode", "correctness"],
+      "pr_number": 54288
+    },
+    {
+      "sha": "569adb5a9780f9c02d22a6b29826acf711512356",
+      "comment": "**背景**：chunked prefill 期间 offloading scheduler 把当前 step 的 SWA chunk 计数当作 store 可达性 horizon，等于把每个中间 frontier 当作 prompt 的最终分段，提交了 load 路径永远不会请求的 chunk（未修复时提交 152 个 SWA chunk、完成 prompt 的回归期望 150，首个 mismatch 在 chunk 248）。**方法**：prefill 活跃期间改用 prompt 的最终可 offload 长度；请求在完成 prompt 前 abort 时把已计算 frontier 视为最终分段，恰好一次地提交新可达的 SWA 尾部 chunk（含防止 abort 后重复提交）。**效果**：完成/同步 abort/异步 abort 三种 chunked prefill 生命周期的回归测试通过（断言完整有序的 SWA chunk 集合），相关 34 项可达性与 TestEagle 测试通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "chunked prefill 下 SWA store 可达性 horizon 修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "swa", "chunked-prefill", "store-reachability", "abort"],
+      "pr_number": 54362
+    },
+    {
+      "sha": "dd0760165c17fdf750b1aa8e2a26ac885eafd598",
+      "comment": "**背景**：CPU KV offload 存储在 ARC 有足够可淘汰条目时仍会失败——T1 低于自适应目标时淘汰偏好 T2，但 T2 耗尽（被 pin/保护或批次中途）后现有实现直接返回 `None`。**方法**：T2 无合格候选时回退到合格 T1 条目，保留既有偏好顺序、单调队列扫描、pin/保护规则与候选总数不足时的原子失败，并新增六个参数化用例（普通 store 与 ghost hit 构造自适应状态）复现。**效果**：基线 5 个用例失败、修复后全过，#50992 的单遍扫描优化保持不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "CPU KV offload ARC 淘汰的 T1 回退修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "cpu-offload", "arc", "eviction", "fallback"],
+      "pr_number": 55461
+    },
+    {
+      "sha": "9afb878a55eb08fd064dfaab56afd8447e97101e",
+      "comment": "**背景**：请求 A 把 KV key 加入当前 step 的异步 lookup batch 后、在调度器 `flush()` 前被取消或完成，cleanup 已移除 A 的 lookup 状态，但 flush 仍会把该 key 提交给后台 worker。**方法**：flush 时对每个条目按 scheduler 持有的 lookup 状态重新校验，只丢弃缺失或被取代的 generation，共享该 key 的其他活跃请求仍可查询；不尝试取消已入队或 in-flight 的后端调用。**效果**：回归测试确认 cleanup 先于 flush 时不再发生 `batch_lookup()` 调用，15 项测试通过，与保护结果侧的 #54872 互补。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV offload 异步 lookup batch 的生命周期校验修复，属 KV offload 范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "async-lookup", "request-cleanup", "lifecycle"],
+      "pr_number": 55075
+    },
+    {
+      "sha": "a1541f5742a29864a80087af313ad460066a1524",
+      "comment": "**背景**：BLIP-2 Q-Former attention 此前手工物化 attention score、分别执行 scale/softmax/dropout 再发起第二次 matmul（2 matmul + 1 mul + 1 softmax + 1 dropout 共 5 个 launch）。**方法**：self-attention 与 cross-attention 均改用 `torch.nn.functional.scaled_dot_product_attention`，保留既有 scale 与训练 dropout 行为，无自定义 kernel、架构门控或设备分支。**效果**：RTX 4090 上 Q-Former p50 提升 1.43-1.51x，`embed_multimodal` 整体 1.20-1.25x（FP16/BF16、batch 1/4 一致获益）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "BLIP-2 Q-Former attention 改用 SDPA 融合核，属模型 kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "blip-2", "q-former", "sdpa", "vision-encoder", "fused-attention"],
+      "pr_number": 55285
+    },
+    {
+      "sha": "144e79c8106da23141ac010394b782f730cc7fe8",
+      "comment": "**背景**：#52789 的 Kimi-K3 prefill checkpoint 优化尚不支持投机解码（Eagle block rewind）、部分前缀缓存（`prefix_match_unit < Mamba block size`）以及经 KV connector（如 MooncakeStore）恢复的 checkpoint block。**方法**：cache manager 与 FlashKDA worker 共享同一 checkpoint 有效性规则——仅当 worker 确实可写时才分配并哈希 checkpoint block；对齐的部分 checkpoint 把已预留的 request-owned block 从临时边界重新键控为 FlashKDA 实际导出的 state 位置；保留 #52789 的 block 分配/逐出/释放生命周期。**效果**：双 4-GPU 节点 TP8/EP8 上以 FlashKDA（DS conv-state 布局）+ prefix caching + DSpark 投机解码完成 1,000 样本 OCR-Bench 三轮验证；非部分前缀缓存（`prefix_match_unit=128`）下 8 流 120K 递增至 164K 的压测完成对比。",
+      "sig": "sig-core",
+      "sig_reason": "Kimi-K3 前缀 checkpoint 机制与 cache manager 的扩展，属核心 KV cache 管理与新模型支持范畴。",
+      "tags": ["feature", "medium-risk", "kimi-k3", "prefix-cache", "prefill-checkpoint", "spec-decode", "kv-connector", "flashkda"],
+      "pr_number": 53614
+    },
+    {
+      "sha": "1970f3ed4be7fa8620e4ddc4a12c36a8384cfc27",
+      "comment": "**背景**：scale-out API 的 generate 路由接受客户端回传的多模态 `features` 并重建内部张量/布局/placeholder 区间/缓存键而不校验一致性——客户端可把 32x32 Qwen 图的 grid 从 `[1,4,4]` 改成 `[1,132,132]` 重放，引擎信任放大后的 grid 而像素张量只有 4 行，导致 500、GPU 非法访存与 `/health` 503，认证客户端可用单条篡改请求停掉共享引擎，或使请求复用他人缓存的编码数据。**方法**：vision encoder 之前逐项校验——grid 几何（正值、merge 兼容、与像素张量行数一致）、字段布局绑定当前模型声明布局、placeholder 区间（正值、不重叠、在 prompt 内、与 feature 列表平行）、稀疏 placeholder `is_embed` mask 保留与长度核验、多模态缓存键派生核验。**效果**：篡改 render body 的请求在编码前被当作请求数据错误拒绝，引擎不再可被单请求打挂。",
+      "sig": "sig-omni",
+      "sig_reason": "scale-out 多模态输入在 engine handoff 前的校验加固，属多模态数据处理范畴。",
+      "tags": ["bugfix", "medium-risk", "scale-out", "multimodal", "security", "input-validation", "robustness"],
+      "pr_number": 51898
+    },
+    {
+      "sha": "f2e2936f91a794513af74d009286c69e3fb2592b",
+      "comment": "**背景**：Qwen3.5-122B-A10B 的 MoE 形状（E=256、`moe_intermediate_size=1024`，TP=2 时每 rank N=512）在 A100 80GB PCIe 上没有调优配置（仅 H100/H20 存在），启动回落默认启发式。**方法**：在 8x A100 80GB PCIe（无 NVLink）上用 `benchmark_moe.py --tune` 生成 `E=256,N=512,device_name=NVIDIA_A100_80GB_PCIe.json`（全程约 2h51m），并以 `VLLM_TUNED_CONFIG_FOLDER` 对比默认配置。**效果**：bf16 kernel 时间全 batch 尺寸改善——bs=1 -7.9%、bs=256 -8.6%、bs=1024 -19.4%、bs=4096 -17.6%，prefill 大 batch 收益最大。",
+      "sig": "sig-model-performance",
+      "sig_reason": "fused MoE Triton kernel 的 A100 PCIe 调优配置，属 MoE kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "fused-moe", "tuned-config", "a100", "triton", "qwen3.5"],
+      "pr_number": 55511
+    },
+    {
+      "sha": "1c344ed41e1e3bd44d5836fbcf5ddceb56ef5ab9",
+      "comment": "**背景**：既有 CPU AMX attention 路径即使启用 FP8 KV-cache 也先把 K/V 反量化为 BF16 再做 MMA，白白付出反量化开销。**方法**：新增专用 `AMX_FP8` ISA：QK 用 `_tile_dpfp8ps`、PV 用 `_tile_dpbf16ps` 硬件 intrinsic 直接做 FP8 MMA；`_get_attn_isa` 在 FP8 KV-cache 激活且硬件支持时自动选择 `amx_fp8`；配套把 Dockerfile base 升至 Ubuntu 25.04 + GCC-15（binutils >= 2.44 才能汇编 AMX-FP8 指令）并为 GCC >= 15 加 `-fno-tree-pre` 规避 oneDNN 的编译器 ICE。**效果**：相对 BF16 AMX，decode KV128 从 0.75x 提到 1.14x、prefill Q512/KV512 从 0.56x 提到 0.96x；594 项 attention 测试与 82 项正确性测试通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Diamond Rapids CPU 的原生 AMX-FP8 attention kernel，属 CPU kernel 性能范畴。",
+      "tags": ["feature", "medium-risk", "cpu", "amx-fp8", "attention", "diamond-rapids", "fp8-kv-cache", "dockerfile"],
+      "pr_number": 49410
+    },
+    {
+      "sha": "039ea82660621a9668c7d7e81c7144b6f2f75011",
+      "comment": "**背景**：暂停空闲 MoE DP 引擎会把每个 rank 踢进 stepping loop 以抵达 pause 共识 all-reduce，而 `_has_global_unfinished_reqs` 固定每 32 步同步一次的节奏使每次 pause 前每 rank 白跑 32 个 dummy forward；RL post-training 每次 weight sync 都 pause，这成为每个训练步的纯延迟与 GPU 消耗，`sleep()` 内部重跑 `pause_scheduler` 还要再付一次。**方法**：wave 的第一步（`step_counter == 1`）也执行同步——`step_counter` 本就各 rank 同步重置，新节奏仍是 lockstep 状态的纯函数，无新状态、无协议变更、天然免疫 elastic EP；同步节奏经 `--dp-sync-interval` 可配置（原硬编码 32，默认 16），第一步同步无条件执行、不受该值影响。**效果**：每次 pause 的 dummy forward 从 32 个降到 1 个，mid-wave pause（异步 RL 常态）的尾部开销同步收窄。",
+      "sig": "sig-core",
+      "sig_reason": "DP 引擎状态同步节奏调整与可配置化，属核心 DP engine 范畴。",
+      "tags": ["perf", "medium-risk", "data-parallelism", "dp-sync", "rl", "pause-scheduler", "moe"],
+      "pr_number": 52957
+    },
+    {
+      "sha": "f4eccdadefc6501fafeb1a0bf7f171ff24f984b0",
+      "comment": "**背景**：长上下文多模态 renderer warmup 按完整上下文构造 dummy 输入，在 CPU 上保留了不必要的内存。**方法**：`MultiModalRegistry.get_dummy_mm_inputs` 的 warmup 预算改由 renderer 的 scheduler config 推导，仅在启用 chunked prefill 时以 `max_num_batched_tokens` 封顶；既有 profiling 调用方仍保留完整上下文输入。**效果**：31 项测试通过，GLM-5.3-Flash TP2 下 50k/480k/262k token prompt 验证通过（替代 #55435 的 renderer 侧修复）。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态 renderer warmup 的内存预算约束，属多模态 registry 范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "renderer", "warmup", "memory", "chunked-prefill"],
+      "pr_number": 55448
+    }
+  ]
+}

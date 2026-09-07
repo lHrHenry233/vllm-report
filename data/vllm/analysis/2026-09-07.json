@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-07",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-07T20:00:00+08:00",
+  "daily_summary": "9 月 7 日（周日）共 8 条变更，以修复与量化为主。修复 cuda profiler 在 `AsyncLLM` 中对非 torch profiler 类型缺失、offloader prefetch 静态缓冲在模块数不被 `prefetch_step` 整除时的 slot 跨界覆写、B200 上 DSpark 启动时 adaptive verification 于 kernel warmup 阶段的断言失败。量化侧 ROCm DeepSeek V4 落地 FP8 shared expert 与 MXFP4 routed experts 的 AITER 异构融合 MoE（opt-in、fail-closed），AutoRound 新增 2/3/5/6/7-bit CUDA 支持。性能侧 SM 12.x blockwise FP8 GEMM 在权重超出 L2 时引入 CTA raster swizzle（结果位级一致），另清理约 956 行未使用的 fake 实现并对齐 H200 extraction 测试的辅助层排序契约。",
+  "sig_summaries": {
+    "sig-core": "三条变更。修复 `AsyncLLM` 中 profiler 对 torch profiler 之外类型（如 cuda profiler）报 missing 的问题（#55237）；offloader prefetch 静态缓冲在 offloaded 模块数不能被 `prefetch_step` 整除时被跨界 refill 覆写——跨 slot wrap 时改为在共享释放 slot 的模块链内推进，保留 ahead-by-step 语义（#54975）；删除 39 个文件中约 956 行未使用的自定义算子 fake 实现死代码（#55535）。",
+    "sig-quantization": "两条变更。ROCm DeepSeek V4 接入 AITER 异构融合 MoE（FHMoE）：native FP8 shared expert 与 MXFP4 routed experts 融合执行，per-rank intermediate 保持 384、W2 E8M0 scale descriptor 对齐到 16 列，gfx950/TP8 且 CSV 连续覆盖 `1 <= M <= 2048` 时启用、其余 fail-closed 回落，经 `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1` opt-in（#53161）；AutoRound 格式新增 2/3/5/6/7-bit CUDA 支持，`Intel/Qwen3.8-27B-bpw2.8-AutoRound` 验证通过（#52890）。",
+    "sig-model-performance": "一条变更。SM 12.x（GB10/DGX Spark，24 MiB L2）上 CUTLASS blockwise-FP8 GEMM 在权重超出 L2 且激活 slab 不低于 14 MiB 时把 persistent tile scheduler 的 `max_swizzle_size` 设为 8——swizzled raster 先访问完一个权重列组的全部 M tile，权重从 L2 而非 DRAM 重读，输出位级一致；GB10 上 5120x5120 权重 M=4096 从 117 提到 160 TFLOPS（#55180）。",
+    "sig-spec-decode": "一条变更。B200 LM Eval Spec Decode lane 在 DeepSeek-V4-Flash DSpark 启动时断言失败——kernel warmup 刻意先于 `capture_model`（自适应成本校准所在地）执行，合成投机解码步骤调用 `AdaptiveVerificationManager.get_num_tokens` 时 `cost_tables` 仍为 `None`；修复为 warmup 期间临时挂起 adaptive manager（固定 draft 数）、`finally` 恢复，真实请求的自适应验证不受影响（#55455）。",
+    "sig-ci": "一条变更。H200 MIG hidden-state extraction 测试与 #50514 的 auxiliary layer 规范排序契约对齐（输入仍 `[5, 2, 10]`、按 `[2, 5, 10]` 断言），predictable-model 测试改独立进程释放 GPU 内存，避免阻断后续 Qwen3.5 测试（#55457）。"
+  },
+  "commits": [
+    {
+      "sha": "c3ec0d29f54cdd450576d819b1e5229ce6ef080e",
+      "comment": "**背景**：`AsyncLLM` 的 profiler 查找只覆盖 torch profiler 类型，其他 profiler 类型（如 cuda profiler）会报 profiler 不存在。**方法**：修复 `AsyncLLM` 中的 profiler 获取逻辑，使 torch profiler 之外的类型同样可被找到，并补充 `tests/v1/engine` 测试（+48/-3）。**效果**：非 torch profiler 类型可正常启停，不再报 missing。",
+      "sig": "sig-core",
+      "sig_reason": "AsyncLLM engine 的 profiler 类型分发修复，属核心 engine 范畴。",
+      "tags": ["bugfix", "low-risk", "profiler", "async-llm", "cuda-profiler"],
+      "pr_number": 55237
+    },
+    {
+      "sha": "1f778486fc313f3599a6b59e67f65b1c186477fd",
+      "comment": "**背景**：offloaded 模块数不能被 `prefetch_step` 整除时 prefetch 静态缓冲会被破坏——静态缓冲按 `module_index % prefetch_step` 分配，refill 目标却按 `(index + prefetch_step) % module_count` 选取，跨界 wrap 可使目标落入别的 slot，覆写尚未执行模块仍需要的缓冲（如 3 个模块、`prefetch_step=2` 时模块 0/2 共享 slot 0，模块 1 执行后旧目标模块 0 在模块 2 执行前覆写 slot 0）。**方法**：ahead-by-step 目标保持 slot 所有权时维持不变；跨 slot wrap 时改为在共享该释放 slot 的模块链内推进；整除环、`prefetch_step == 1` 与非共享 slot 场景行为不变。**效果**：回归测试覆盖 3 模块/step=2 场景；Ascend 910B3 上 Qwen3-0.6B（offload_group_size=8、prefetch_step=2）手动验证输出正确（关联 vllm-ascend#10932）。",
+      "sig": "sig-core",
+      "sig_reason": "model executor offloader 的 prefetch 缓冲调度修复，属核心 model executor 范畴。",
+      "tags": ["bugfix", "medium-risk", "offloader", "prefetch", "static-buffer", "slot-ownership", "ascend"],
+      "pr_number": 54975
+    },
+    {
+      "sha": "de69e821b7c834bcf1ec96325ec8c410ac183680",
+      "comment": "**背景**：DeepSeek V4 的 ROCm 路径上 native FP8 shared expert 与 MXFP4 routed experts 此前分别执行，AITER 的异构融合 MoE（FHMoE）未接入。**方法**：在 gfx950/TP8 且 AITER 活跃 FHMoE CSV 连续覆盖 `1 <= M <= 2048` 的行上启用融合——shared W1 `[1,768,7168]`、W2 `[1,7168,384]` 与 fused intermediate `[M,7,384]`，per-rank intermediate width 保持 384（不恢复旧的 384 到 512 的 padding），仅把 W2 的 E8M0 scale descriptor 从 12 列对齐到 16 列；不支持的 M 及任何契约不满足（gfx950、TP8/DP1/PCP1、BF16、无 EP/EPLB/offload、`noaux_tc`、DSv4 量化、routed-tensor、AITER 能力查询须返回字面 `True`）都 fail-closed 回落分离路径。**效果**：经 `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1` opt-in；依赖 AITER #4891 的物理 I384 FHMoE 配置与 `supports_dsv4_i384_fhmoe` 能力查询。",
+      "sig": "sig-quantization",
+      "sig_reason": "FP8 shared expert 与 MXFP4 routed experts 的异构融合 MoE，属量化 kernel 范畴。",
+      "tags": ["feature", "low-risk", "rocm", "gfx950", "aiter", "fhmoe", "deepseek-v4", "fp8", "mxfp4", "shared-expert", "opt-in"],
+      "pr_number": 53161
+    },
+    {
+      "sha": "294fbb4f595f61743124fc2e56a99e128cbe10da",
+      "comment": "**背景**：AutoRound（INC）格式的 2/3/5/6/7-bit 低比特权重在 CUDA 上不受支持。**方法**：扩展 `vllm/model_executor/layers` 中 AutoRound 相关层对 2/3/5/6/7 bit 的 CUDA 支持，并新增 `test_auto_round.py` 测试（+152/-2）。**效果**：`Intel/Qwen3.8-27B-bpw2.8-AutoRound` 等低比特模型在 CUDA 上推理通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "AutoRound 低比特量化格式的 CUDA 支持，属量化范畴。",
+      "tags": ["feature", "low-risk", "autoround", "inc", "quantization", "low-bit", "cuda", "woq"],
+      "pr_number": 52890
+    },
+    {
+      "sha": "199cb9b964822e59ab9b58d88e7be31eb419a2ae",
+      "comment": "清理变更：删除 39 个文件中约 956 行未使用的 fake 实现（涉及 `vllm/_aiter_ops.py`、`vllm/_custom_ops.py`、`vllm/_xpu_ops.py`、`vllm/compilation/passes`、`vllm/kernels/helion`、`vllm/lora/ops` 等），纯死代码移除、无行为变更。",
+      "sig": "sig-core",
+      "sig_reason": "自定义算子 fake 实现的死代码清理，属核心算子注册范畴。",
+      "tags": ["refactor", "low-risk", "cleanup", "dead-code", "custom-ops", "fake-impl"],
+      "pr_number": 55535
+    },
+    {
+      "sha": "4df80187b5ca8453eb7b47d2914f0555acf9c12f",
+      "comment": "**背景**：SM 12.x 中 L2 装不下 FP8 权重的部件（GB10/DGX Spark，24 MiB L2）上，CUTLASS blockwise-FP8 GEMM（128x128 权重块、1x128 激活 scale）的默认 CTA raster 对同一权重 tile 的 revisit 间隔过大，M 跨多行 tile 后权重被从 DRAM 反复重读——16384x2560（42 MB）权重在 M=4096 有 165-170 TFLOPS、M=16384 只剩 52，这是这些部件上所有 FP8-blockwise 模型每次 prefill（8k-32k prompt）的固定代价。**方法**：当权重（N·K 字节）超过设备 L2（`cudaDeviceProp::l2CacheSize`，只读一次）且激活 slab（M·K）不低于 14 MiB 时，把 persistent tile scheduler 的 `max_swizzle_size` 设为 8——swizzled raster 先访问完一个权重列组的全部 M tile 再前进，权重 tile 改从 L2 重读；输出与默认顺序位级一致（每个输出 tile 的 K 规约不变）；L2 装得下权重（RTX PRO 6000/GB202）或激活低于阈值的 launch 保持默认顺序（该区间默认顺序仍略快）。**效果**：GB10 上 5120x5120 权重 M=4096 从 117 提到 160 TFLOPS，M=32768 等大 M 场景吞吐显著恢复，阈值由实测确定。",
+      "sig": "sig-model-performance",
+      "sig_reason": "SM 12.x blockwise FP8 GEMM 的 CTA raster 优化，属 GEMM kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "sm12x", "blockwise-fp8", "cutlass", "gemm", "l2", "raster-swizzle", "gb10", "dgx-spark"],
+      "pr_number": 55180
+    },
+    {
+      "sha": "6865e67f0be02d53694517f6f71d7fb96492792d",
+      "comment": "**背景**：B200 LM Eval Spec Decode lane 在 DeepSeek-V4-Flash DSpark 启动时断言失败——`GPUWorker.compile_or_warm_up_model` 刻意在 `capture_model` 之前执行 kernel warmup，而自适应成本校准发生在 `capture_model` 内，warmup 的合成投机解码步骤调用 `AdaptiveVerificationManager.get_num_tokens` 时 `cost_tables` 仍为 `None`。**方法**：kernel warmup 期间临时挂起 runner 的 adaptive manager（改用固定 draft 数），`finally` 中恢复同一未校准 manager 供 graph capture 与正式服务；真实请求的自适应验证不受影响。**效果**：新增 warmup 成功/异常两条路径均正确恢复的用例，11 项测试通过（26 项 GPU-only 跳过）；B200 精确回归 lane 已触发。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "adaptive verification 在 kernel warmup 阶段的挂起恢复修复，属投机解码 verification 范畴。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "adaptive-verification", "kernel-warmup", "dspark", "b200", "deepseek-v4-flash"],
+      "pr_number": 55455
+    },
+    {
+      "sha": "722d169339b10117cc65fec85c85279c00c82d8c",
+      "comment": "**背景**：H200 MIG hidden-state extraction lane 失败——#50514 有意把 auxiliary layer ID 排序去重规范化，集成测试仍输入 `[5, 2, 10]` 并按输入顺序断言输出（模型现返回 `[2, 5, 10]`），且首个测试的引擎保留 GPU 内存导致后续 Qwen3.5 测试无法启动。**方法**：保留未排序输入、对三种提取场景按规范序断言（与既有辅助层单测一致），并用既有 helper 把 predictable-model 测试放进独立进程释放显存。**效果**：H200 上 `-k 'predictable or qwen35'` 2 passed（132.69s）；测试与排序契约对齐，纯测试变更。",
+      "sig": "sig-ci",
+      "sig_reason": "extraction 测试与排序契约对齐及进程隔离，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "hidden-state-extraction", "auxiliary-layers", "test-isolation", "h200"],
+      "pr_number": 55457
+    }
+  ]
+}
