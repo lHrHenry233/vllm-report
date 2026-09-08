@@ -1,0 +1,144 @@
+{
+  "date": "2026-09-08",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-08T20:00:00+08:00",
+  "daily_summary": "9 月 8 日共 16 条变更，Kimi K3 生态是主线：FlashInfer KDA prefill/decode kernel 集成（decode 小 batch 相对 Triton 提速 2.2-2.5×）、deferred MoE 的 FlashInfer autotune cache-miss 修复、replayssm+投机解码组合下的 KV cache checkpoint 越界崩溃修复相继落地。性能侧 H20-3e block-FP8 MoE 低 batch 调参带来 M=1/8 约 19-21% 延迟下降，fusedQKNormRope kernel 启用 PDL。核心修复包括 sparse-MLA（DSA）模型 CPU offload 启动崩溃、compressed-tensors channel-wise W4A16 的 group_size 归一化，Sarvam MLA 新增 EAGLE3 支持；CI 侧完成 helion 死代码测试清理、TPU Dockerfile 移除、多节点 Docker 网络恢复与 offload 测试竞态修复。",
+  "sig_summaries": {
+    "sig-core": "五条变更。Kimi K3 集成 FlashInfer KDA prefill/decode backend 并支持 bf16 KDA cache，小 batch decode 相对 Triton 提速 2.2-2.5×、默认 backend 不变（#55364）；修复 replayssm+投机解码下 `kv_cache_coordinator` 的 `checkpoint_idx` 越界断言崩溃（#55747）；`DispatchPooler.for_seq_cls` 不再对 `token_classify` 强制 `AllPool()` 而忽略 STEP pooling 配置（#55307）；pooling API 开始采用请求 body 中的 `request_id`，保留 `X-Request-Id` header 优先级（#55665）；`OnlineRenderer` 错误边界扩展捕获 `VLLMValidationError`，修复 #55701 迁移后的 CI 失败（#55761）。",
+    "sig-model-performance": "三条变更。fusedQKNormRopeKernel 启用 PDL（Programmatic Dependent Launch）以重叠相邻 kernel 的启动与执行（#55755）；H20-3e block-FP8 MoE `E=256,N=256` 低 batch 配置改用 `BLOCK_SIZE_N=64`，M=1 延迟降 19.25%、M=8 降 21.11%（#54668）；修复 Kimi-K3 deferred MoE finalize 的 `(B,0)` 签名在 FlashInfer autotune 中 cache-miss、默认 `tactic=-1` 被捕获进 serving graph 的问题（#55377）。",
+    "sig-large-scale-serving": "一条变更。修复 `SimpleCPUOffloadConnector` 在 sparse-MLA（DSA）模型（DeepSeek-V3.2、GLM-5/5.2）上的启动崩溃：注册逻辑此前用单一 layer 的 block size 重解释整块 KV allocation，DSA 组内 MLA latent 与 indexer key cache 混合 page size 无法整除；改为从 `KVCacheTensor` placement metadata 按层派生 region 并按地址去重，同时修复混合组的隐性误注册（#54756）。",
+    "sig-quantization": "一条变更。`compressed-tensors` 对 channel-strategy 权重将 `group_size` 留空（`None`），三处代码将其与 int 比较——Marlin probe 在 `_backend_incompatibility_reason` 契约内直接抛异常，导致 channel-wise W4A16 MoE checkpoint 后端选择中止；将 `None` 归一化为 `-1` 修复（#53163）。",
+    "sig-spec-decode": "一条变更。Sarvam MLA（`SarvamMLAForCausalLM`）新增 EAGLE3 投机解码支持：经 `EagleModelMixin` 捕获 embeddings 与完整 layer 输出、声明 `SupportsEagle3`，默认辅助层 `(2, n//2, n-3)` 可经 draft config 覆盖，需 `--pipeline-parallel-size 1`（#53052）。",
+    "sig-ci": "五条变更。删除 `tests/kernels/helion` 中 66 行未使用的 fake 实现测试，修复 build 87584（#55797）；ROCm 上启用 HY-V4 及 MTP 模型初始化（依赖共享 sparse-MLA sink，移除临时跳过 guard）（#54405）；删除过时的 `docker/Dockerfile.tpu`（TPU 支持已迁至 vllm-tpu 项目）（#55376）；多节点 Docker 测试网络改为调用特定命名并在失败后完成全部清理，修复 L4 Distributed 2-Node lane（#55454）；shared offload unlink 测试在观察路径名前增加 worker 同步，消除竞态（#55604）。"
+  },
+  "commits": [
+    {
+      "sha": "9ea8f3ffc354901b740f0b31988900897b7221d7",
+      "comment": "**背景**：`DispatchPooler.for_seq_cls` 对 `token_classify` 强制使用 `AllPool()`，静默忽略 `tok_pooling_type=STEP` 配置。**方法**：移除该 override，让既有 factory 尊重 resolved 配置，STEP 时按需请求 token IDs；新增 ALL/STEP 回归测试，覆盖输出值、请求边界、空匹配与 token-ID 要求。**效果**：STEP pooling 生效——H100 上 Qwen3-ForcedAligner 的 STEP 输出与对应 ALL 时间戳行完全一致（最大绝对误差 0），默认/ALL 行为不变，39 项测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Pooling 层 DispatchPooler 的 pooling 类型分发修复，属核心 model executor 范畴。",
+      "tags": ["bugfix", "low-risk", "pooling", "token-classify", "step-pooling", "dispatch-pooler"],
+      "pr_number": 55307
+    },
+    {
+      "sha": "7fa2c637968e2f7f7f815f3acc9ceb847a8a462d",
+      "comment": "**背景**：Kimi-K3 decode 延迟 MoE finalize 以供消费方融合最终 top-k 归约，使 FlashInfer MoE 输出签名从 `(tokens, hidden)` 变为 `(tokens, 0)`；既有 generic full-model autotune dummy 不覆盖该 deferred-finalize 路径，FULL decode graph capture 时缺失 `(B, 0)` 缓存条目，回落 `MoERunner tactic=-1` 并把默认 tactic 捕获进 serving graph。**方法**：从 live deferred-finalize MoE 层收集 `defer_moe_finalize_max_num_tokens`，把 bounded 值追加到既有 FlashInfer autotune token counts，各计数仍走正常 full-model dummy 路径（经 `get_hybrid_num_tokens_buckets`）；最大 token 的 pass 先行调优最宽 bucket 集，后续 bounded pass 复用缓存。**效果**：autotune 由 cache-miss 变为命中；K3 B12 验证中 tuned 路径与 `tactic=-1` fallback 启动完全相同的两个 MoE BMM kernel——该 workload 性能中性，同时消除真实的默认 tactic 捕获 bug。",
+      "sig": "sig-model-performance",
+      "sig_reason": "FlashInfer autotune 对 deferred MoE finalize 路径的覆盖修复，属 MoE kernel 性能范畴。",
+      "tags": ["bugfix", "low-risk", "flashinfer", "autotune", "moe", "deferred-finalize", "cuda-graph", "kimi-k3"],
+      "pr_number": 55377
+    },
+    {
+      "sha": "eb6b619ab256df1100cb75684a9ba78485506c3a",
+      "comment": "**背景**：`SimpleCPUOffloadConnector` 在 sparse-MLA（DSA）模型（DeepSeek-V3.2、GLM-5/5.2）上启动即崩：注册逻辑用单一 layer 的 block size 重解释整个 KV allocation，仅当组内所有 layer page size 相同才能整除；DSA 中 MLA latent cache 与 indexer key cache 同为 `MLAAttentionSpec`、同 block size，落入同一 `UniformTypeKVCacheSpecs` 组（组 page size 为二者之和，单 page 却为 576 与 132 bytes/token），`view()` 抛 shape 错误。**方法**：改为从 `KVCacheTensor` 的 placement metadata（`layers`/`layer_stride`/`block_stride`/`offset`）派生 region：layer-outermost tensor 按层（LHBNC 下按 KV head group）拆成逐层 `[num_blocks, block_bytes]` region，block-outermost 保持单 region，region 按地址去重使 overlay 组只注册一次。**效果**：GLM-5.2-FP8 TP=8 等稀疏 MLA 模型可正常启用 CPU offload 并对外服务，同时修复混合组中除法碰巧成功时的隐性误注册；新增 `tests/v1/simple_kv_offload` 测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "CPU KV offload 的混合 page size 注册修复，属大规模服务的 KV cache 管理范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-offload", "cpu-offload", "sparse-mla", "dsa", "mixed-page-sizes", "kv-cache"],
+      "pr_number": 54756
+    },
+    {
+      "sha": "9c297e3b8bc8957d591ef7c244890c543cb9b19f",
+      "comment": "**背景**：fused QK-Norm+RoPE 融合 kernel（`fusedQKNormRopeKernel`）未启用 PDL（Programmatic Dependent Launch），与相邻 kernel 间存在串行启动等待。**方法**：在 `csrc/libtorch_stable/fused_qknorm_rope_kernel.cu` 中为该 kernel 启用 PDL 并调整相应 launch 逻辑（+112/-48，单文件）。**效果**：依赖 kernel 可提前启动、与上游 kernel 尾部执行重叠，降低 kernel 间 launch 开销；PR 未附描述与测试数据。",
+      "sig": "sig-model-performance",
+      "sig_reason": "CUDA kernel 的 PDL 启动重叠优化，属 kernel 性能范畴。",
+      "tags": ["perf", "medium-risk", "pdl", "programmatic-dependent-launch", "qknorm-rope", "fused-kernel", "cuda"],
+      "pr_number": 55755
+    },
+    {
+      "sha": "607a6e48c5b9780ae8405497f77bee65698c61c7",
+      "comment": "清理变更：删除 `tests/kernels/helion` 中 66 行未使用的 fake 实现测试——系 #55535 删除 fake 实现时遗留的死代码，修复 Buildkite build 87584；纯测试删除，无生产代码影响。",
+      "sig": "sig-ci",
+      "sig_reason": "未使用测试死代码清理，属 CI 测试维护范畴。",
+      "tags": ["cleanup", "low-risk", "ci", "test", "helion", "dead-code"],
+      "pr_number": 55797
+    },
+    {
+      "sha": "a69402aaa8171851232fd6cdd19a33c2a49fd670",
+      "comment": "**背景**：Kimi K3 的 KDA 此前仅有既有 cache 状态与 Triton fallback 路径，FlashInfer 的 KDA prefill/decode kernel 未接入。**方法**：新增 bf16 KDA cache state 支持，集成 FlashInfer KDA prefill 与 decode backend（新增 `--kda-prefill-backend`/`--kda-decode-backend` 参数），默认 backend 保持不变；含 `tests/models/kimi_k3/test_kda.py` 测试（+722/-155）。**效果**：微基准下 FlashInfer fused BF16 decode 相对 Triton fallback 在 1-8 tokens 提速 2.2-2.5×（128 tokens 时 1.25×）；E2E 8k1k GSM8K exact_match 0.9553 无回退；prefill kernel 目前仍慢于 flashKDA，待 FlashInfer 下版改进。",
+      "sig": "sig-core",
+      "sig_reason": "Kimi K3 模型 KDA 模块的 FlashInfer kernel 集成与 cache 状态支持，属核心模型执行范畴。",
+      "tags": ["perf", "medium-risk", "flashinfer", "kda", "kimi-k3", "bf16-cache", "prefill", "decode"],
+      "pr_number": 55364
+    },
+    {
+      "sha": "12579c7f017f1cafebeb5847227431c8da3e2041",
+      "comment": "**背景**：H20-3e 上 block-quantized FP8 fused MoE 配置（`E=256, N=256`，被 GLM-5.3 TP=8 K=6144 与 DeepSeek 系列 K=7168 共用）的低 batch 条目仍用 `BLOCK_SIZE_N=128`，窄 N tile 能暴露更多 thread block、提升 decode 阶段 SM 利用率。**方法**：对 M=1/2/4/8 的键把 `BLOCK_SIZE_N` 由 128 改为 64，M=1 `num_stages` 3→4、M=8 4→3，其余（`BLOCK_SIZE_M=16`、`BLOCK_SIZE_K=128`、`GROUP_SIZE_M=1`、`num_warps=4`）不变，M>=16 条目不动；调参在 GLM 的 K=6144 与 DeepSeek 的 K=7168 双向交叉验证（配置文件名不含 K）。**效果**：同一 H20-3e 节点 A/B：M=1 延迟降 19.25%（1.238×）、M=8 降 21.11%（1.268×）、M=2-6 降 4-6.5%；选定默认与 CUPTI 扫描最快候选差距在 0.6% 内。",
+      "sig": "sig-model-performance",
+      "sig_reason": "H20 上 block-FP8 MoE Triton kernel 低 batch 调参，属 kernel 性能范畴。",
+      "tags": ["perf", "low-risk", "h20", "block-fp8", "moe", "triton", "tuning", "low-batch"],
+      "pr_number": 54668
+    },
+    {
+      "sha": "869f78732b64454293d2ba42ae0008386fdaa6a6",
+      "comment": "**背景**：Kimi-K3 TP=8 + prefix caching + dspark 投机解码 + `--use-replayssm` 组合服务时，`kv_cache_coordinator.cache_blocks` → `single_type_kv_cache_manager.cache_blocks` 抛 `AssertionError: assert 0 <= checkpoint_idx < len(blocks)`，服务中断。**方法**：修复 `vllm/v1/core` 中 checkpoint 索引的边界处理，使该场景下索引落在合法 blocks 区间（+17/-12，含 `tests/v1/core` 回归测试）。**效果**：guidellm 8k1k 压测场景不再崩溃，可正常服务。",
+      "sig": "sig-core",
+      "sig_reason": "KV cache coordinator 的 checkpoint 索引越界修复，属核心 KV cache 管理范畴。",
+      "tags": ["bugfix", "low-risk", "kimi-k3", "kv-cache", "checkpoint", "replayssm", "dspark"],
+      "pr_number": 55747
+    },
+    {
+      "sha": "6b5a12c0f843f10aec5fd5e439a1b8091dd66b8c",
+      "comment": "**背景**：#54160 的 HY-V4 平台入口拒绝 ROCm，造成 AMD CI build 12635/12653 两处 HY 初始化失败，#55653 曾临时跳过。**方法**：借助 #54404 的共享 sparse-MLA sink 能力，允许 HY-V4 模型与 MTP import 在 ROCm 上运行（保留 XPU 限制），恢复两个 registry-import 大子集用例并删除 6 行临时跳过 guard。**效果**：HY-V4 及其 MTP 模型在 ROCm 上正常初始化，AMD CI 恢复完整覆盖。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm 上 HY-V4 模型初始化的 CI 覆盖恢复，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "rocm", "hy-v4", "model-init", "sparse-mla", "amd"],
+      "pr_number": 54405
+    },
+    {
+      "sha": "9dbdf8e9af660e3b6876b27c2d1590bcab2e2de3",
+      "comment": "**背景**：`compressed-tensors` 对 channel-strategy 权重将 `group_size` 留空（`None`），三处代码却将其与 int 比较——Marlin probe（`oracle/int_wna16.py:163` → `marlin_utils.py:378` 的 `group_size <= 0`）在 `_backend_incompatibility_reason` 契约（应返回 reason 字符串）内直接抛异常，后端选择中止而非跳过 Marlin 尝试下一候选；系 #44570 移除旧有 `or -1` 归一化引入的回归。**方法**：在三处可达的 `QuantizationArgs.group_size` 读取处将 `None` 归一化为 `-1`（第四处 Humming schema 分支不可达），新增两条 unset group_size 测试。**效果**：channel-wise W4A16 checkpoint（如 `RedHatAI/Mixtral-8x22B-v0.1-quantized.w4a16`、`lokeshe09/gemma-4-26B-A4B-it-INT4-W4A16-channelwise`）正常加载，Marlin 正确拒绝并回退；L40S 受控 A/B 由 2 failed 变 3 passed。",
+      "sig": "sig-quantization",
+      "sig_reason": "compressed-tensors WNA16 MoE 量化路径的 group_size 归一化修复，属量化范畴。",
+      "tags": ["bugfix", "low-risk", "compressed-tensors", "wna16", "moe", "group-size", "marlin", "w4a16"],
+      "pr_number": 53163
+    },
+    {
+      "sha": "06334fae2de7c8a1ea59307b724b992ddf44fb06",
+      "comment": "清理变更：删除 `docker/Dockerfile.tpu`——该文件描述已退役的 XLA 安装路径并固定旧 TPU nightly 镜像，TPU 安装与 Docker 支持已迁至专用 `vllm-tpu` 项目（#27824）；纯构建文件删除，仓库内无残留引用，无运行时影响。",
+      "sig": "sig-ci",
+      "sig_reason": "过时 Docker 构建文件清理，属 CI/构建维护范畴。",
+      "tags": ["cleanup", "low-risk", "docker", "tpu", "build"],
+      "pr_number": 55376
+    },
+    {
+      "sha": "54da70c1eb6976fe655efd535f14a01378cd08bc",
+      "comment": "**背景**：`SarvamMLAForCausalLM` 此前未暴露 EAGLE3 接口、未捕获 drafter 所需的辅助隐状态。**方法**：`SarvamMLAModel` 经 `EagleModelMixin` 捕获 embeddings 与完整 layer 输出（`hidden_states + residual`），`SarvamMLAForCausalLM` 声明 `SupportsEagle3` 并继承协议的辅助层配置钩子；默认辅助层 `(2, n//2, n-3)`，draft checkpoint 可经 `eagle_aux_hidden_state_layer_ids` 覆盖；capture 使用绝对层索引（对齐 `qwen3_moe.py`）。**效果**：Sarvam MLA 支持 EAGLE3 投机解码（需 `--pipeline-parallel-size 1`，辅助态不跨 PP 传输、未声明 `supports_aux_hidden_states_over_pp`），作者以 DSpark 端到端验证推理可用；`SarvamMoEForCausalLM` 不受影响。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "Sarvam MLA 的 EAGLE3 投机解码支持，属投机解码范畴。",
+      "tags": ["feature", "low-risk", "eagle3", "sarvam", "mla", "spec-decode", "draft-model"],
+      "pr_number": 53052
+    },
+    {
+      "sha": "fdfa0a1659a4a75de607219f9a7004d09928d572",
+      "comment": "**背景**：Pooling 请求 schema 暴露 `request_id` 并文档声明全程使用且在响应中返回，但 `PoolingBaseServing._init_ctx()` 忽略该字段、另行生成随机 ID，破坏客户端请求与日志/trace/响应的关联。**方法**：把可选 body `request_id` 转发给既有 request-ID resolver，保留 `X-Request-Id` header 优先级；不暴露该字段的 Cohere 请求维持生成 ID 行为。**效果**：body-only 时响应 `id` 与客户端提供的一致，header+body 时 header 仍优先；新增 `tests/entrypoints/pooling` 测试。",
+      "sig": "sig-core",
+      "sig_reason": "Pooling entrypoint 的请求 ID 解析修复，属核心 API 范畴。",
+      "tags": ["bugfix", "low-risk", "pooling", "request-id", "entrypoint", "api"],
+      "pr_number": 55665
+    },
+    {
+      "sha": "252ed876214a0a01a6d0ce93bb5bbe77685a4160",
+      "comment": "**背景**：#50195 为 `OnlineRenderer` 加了将 Harmony `ValueError` 转为类型化 `ErrorResponse` 的边界，#55701 随后把底层校验迁移到 `VLLMValidationError`，绕过该边界并弄坏 CI。**方法**：将既有 catch 扩展为同时捕获 `VLLMValidationError`（+2/-1）。**效果**：Responses 校验错误恢复返回类型化错误而非裸异常，回归测试 `test_online_renderer_returns_typed_error_for_bad_harmony_call_reference` 重新通过。",
+      "sig": "sig-core",
+      "sig_reason": "Responses API OnlineRenderer 校验错误边界修复，属核心 entrypoint 范畴。",
+      "tags": ["bugfix", "low-risk", "responses-api", "harmony", "validation", "error-handling", "online-renderer"],
+      "pr_number": 55761
+    },
+    {
+      "sha": "537af2c3a4ba7462ddc9bc94ec7a4ea496da6d2e",
+      "comment": "**背景**：L4 Distributed 2-Node lane 因 `docker-net` 已存在而在任何测试开始前失败，EXIT trap 又在 `docker stop node0`（容器不存在）处中止，网络永不删除——open alert 已累计 8 次失败。**方法**：恢复已存在的空 legacy `docker-net`、拒绝被占用的 legacy 网络；新网络与容器使用调用特定命名，命令执行与清理一律使用本次调用实际创建的容器 ID，防止并发调用误删；早先 stop 失败仍继续清理全部 owned 容器与网络；保留原命令错误、命令成功时报告清理失败；移除 AMD wrapper 的冗余全局清理。**效果**：七个录制式 Docker 子进程场景（空 stale 网络恢复、占用网络拒绝、部分启动失败后继续清理等）全部通过，ShellCheck 通过。",
+      "sig": "sig-ci",
+      "sig_reason": "Buildkite 多节点 Docker 网络 CI 脚本修复，属 CI 基础设施范畴。",
+      "tags": ["ci", "low-risk", "buildkite", "docker", "multi-node", "cleanup", "amd"],
+      "pr_number": 55454
+    },
+    {
+      "sha": "58f09211dd6a21207903a02c66e924ed518b74ae",
+      "comment": "**背景**：`test_mp_barrier_unlinks_file_and_survives_sigkill`（V1 Core KV Offload lane，build 87386）在 creator 完成 unlink 前就观察 mmap 路径名——构造器 barrier 只同步 mapping 建立，peer 可在 unlink 尚未完成期间提前返回检查路径。**方法**：构造完成之后、报告路径名状态之前再次同步各 worker（+2/-0），保留共享 inode、路径删除、mapping 存活至 SIGKILL 的断言。**效果**：生产行为不变；CPU 上 40 项测试通过，0.5s unlink 延迟的确定性复现中原测试失败、补丁后通过；build 87454 中该 suite 570 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "KV offload 测试的竞态同步修复，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "kv-offload", "race-condition", "synchronization", "mmap"],
+      "pr_number": 55604
+    }
+  ]
+}

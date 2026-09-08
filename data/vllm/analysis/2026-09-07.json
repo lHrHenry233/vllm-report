@@ -2,13 +2,15 @@
   "date": "2026-09-07",
   "repo": "vllm-project/vllm",
   "generated_at": "2026-09-07T20:00:00+08:00",
-  "daily_summary": "9 月 7 日（周日）共 8 条变更，以修复与量化为主。修复 cuda profiler 在 `AsyncLLM` 中对非 torch profiler 类型缺失、offloader prefetch 静态缓冲在模块数不被 `prefetch_step` 整除时的 slot 跨界覆写、B200 上 DSpark 启动时 adaptive verification 于 kernel warmup 阶段的断言失败。量化侧 ROCm DeepSeek V4 落地 FP8 shared expert 与 MXFP4 routed experts 的 AITER 异构融合 MoE（opt-in、fail-closed），AutoRound 新增 2/3/5/6/7-bit CUDA 支持。性能侧 SM 12.x blockwise FP8 GEMM 在权重超出 L2 时引入 CTA raster swizzle（结果位级一致），另清理约 956 行未使用的 fake 实现并对齐 H200 extraction 测试的辅助层排序契约。",
+  "daily_summary": "9 月 7 日（周日）共 41 条变更，模型接入与前端功能为主。新模型侧落地 Cohere Compass（North-Micro-Vision-Instruct）与 QSA FP8 indexer cache（GB300 decode 最高 1.5x、prefill 最高 1.7x），并移除 qwen4_exp NVIDIA 实现的 torch.compile 与 custom op（单 GB300 可载 FP8）。前端新增无状态 `POST /v1/responses/render` 预处理端点（scale-out renderer、opt-in gate），校验错误继续向 `VLLMValidationError` 迁移（Responses 四处、harmony 输入三处），chat 模板拒绝非法 `reasoning_effort` 从 500 改 400，chunked embedding 开始遵守 `max_embed_len`。大规模服务侧新增 `ECMooncakeConnector`（EPD encoder cache 经 Mooncake TransferEngine），修复 MooncakeStore 混合模型 finish-time save 崩溃（GB300 单轮 eval 997 次）、lmcache_mp_connector 非选中时误入 `WAITING_FOR_LOAD` 且锁泄漏、OffloadingConnector 在 MTP/EAGLE 下对整请求返回 0 可复用 token。其余修复包括 Gemma KV 共享层微调 checkpoint 加载失败、XPU moe_wna16 GPTQ MoE fused 层加载、DSv4 MXFP4 显式 backend 别名被窄化为 BF16 变体致 SM120 启动失败、Kimi K3 NVFP4 权重转换碎片化 OOM、Qwen3.5 多模态 MTP `n_predict` 解析、ROCm 音频自动解码恢复 soundfile 优先（修 MI300/MI355 语音 lane）、AITER sparse MLA 补 attention-sink 支持。性能侧 SM 12.x blockwise FP8 GEMM 引入 CTA raster swizzle，XPU grouped_topk 路由到融合 kernel（+6.8%）并补 meta 实现，Qwen Triton warmup 扩展消除首请求 JIT 尖峰；DSv4 JIT warmup 契约迁移推进 2/N（sequence/DCP）与 3/N（FA4 MLA/Inkling）。CI 侧 NPU 用例移除容器内编译安装并加 30 分钟超时、Transformers v5 测试解禁（ColQwen3、SarvamMLA）、修多处 XPU/ROCm flaky。",
   "sig_summaries": {
-    "sig-core": "三条变更。修复 `AsyncLLM` 中 profiler 对 torch profiler 之外类型（如 cuda profiler）报 missing 的问题（#55237）；offloader prefetch 静态缓冲在 offloaded 模块数不能被 `prefetch_step` 整除时被跨界 refill 覆写——跨 slot wrap 时改为在共享释放 slot 的模块链内推进，保留 ahead-by-step 语义（#54975）；删除 39 个文件中约 956 行未使用的自定义算子 fake 实现死代码（#55535）。",
-    "sig-quantization": "两条变更。ROCm DeepSeek V4 接入 AITER 异构融合 MoE（FHMoE）：native FP8 shared expert 与 MXFP4 routed experts 融合执行，per-rank intermediate 保持 384、W2 E8M0 scale descriptor 对齐到 16 列，gfx950/TP8 且 CSV 连续覆盖 `1 <= M <= 2048` 时启用、其余 fail-closed 回落，经 `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1` opt-in（#53161）；AutoRound 格式新增 2/3/5/6/7-bit CUDA 支持，`Intel/Qwen3.8-27B-bpw2.8-AutoRound` 验证通过（#52890）。",
-    "sig-model-performance": "一条变更。SM 12.x（GB10/DGX Spark，24 MiB L2）上 CUTLASS blockwise-FP8 GEMM 在权重超出 L2 且激活 slab 不低于 14 MiB 时把 persistent tile scheduler 的 `max_swizzle_size` 设为 8——swizzled raster 先访问完一个权重列组的全部 M tile，权重从 L2 而非 DRAM 重读，输出位级一致；GB10 上 5120x5120 权重 M=4096 从 117 提到 160 TFLOPS（#55180）。",
-    "sig-spec-decode": "一条变更。B200 LM Eval Spec Decode lane 在 DeepSeek-V4-Flash DSpark 启动时断言失败——kernel warmup 刻意先于 `capture_model`（自适应成本校准所在地）执行，合成投机解码步骤调用 `AdaptiveVerificationManager.get_num_tokens` 时 `cost_tables` 仍为 `None`；修复为 warmup 期间临时挂起 adaptive manager（固定 draft 数）、`finally` 恢复，真实请求的自适应验证不受影响（#55455）。",
-    "sig-ci": "一条变更。H200 MIG hidden-state extraction 测试与 #50514 的 auxiliary layer 规范排序契约对齐（输入仍 `[5, 2, 10]`、按 `[2, 5, 10]` 断言），predictable-model 测试改独立进程释放 GPU 内存，避免阻断后续 Qwen3.5 测试（#55457）。"
+    "sig-core": "十四条变更。新增 Cohere Compass（North-Micro-Vision-Instruct）模型实现（#54774）与无状态 `POST /v1/responses/render` 预处理端点（scale-out renderer，经 `VLLM_ENABLE_SCALE_OUT_ENDPOINTS` opt-in，#50195），DeepSeek V4 的 XPU 实现补齐 LoRA（#53689）；DSv4 JIT warmup 契约迁移推进两步——sequence/DCP kernel（2/N，#53564）与 FA4 MLA、Inkling relative-attention（3/N，#53565）。修复 Gemma 4/3n KV 共享层无条件创建 `k_proj`/`v_proj`/`k_norm` 致微调 checkpoint 加载失败（#54917）、`AsyncLLM` profiler 类型分发（#55237）、offloader prefetch slot 跨界覆写（#54975）、chunked embedding 忽略 `max_embed_len`（#55551）、chat 模板拒绝非法 `reasoning_effort` 以 500 暴露（改 400 带模板消息，#54022）。qwen4_exp NVIDIA 实现移除 torch.compile 与 custom op（单 GB300 可载 FP8，#55272）；校验错误向 `VLLMValidationError` 迁移两批（Responses 四处 #50257、harmony 输入三处 #55701）；另清理 39 个文件约 956 行未使用的 fake 实现（#55535）。",
+    "sig-quantization": "五条变更。ROCm DeepSeek V4 接入 AITER 异构融合 MoE（FHMoE）：native FP8 shared expert 与 MXFP4 routed experts 融合执行，per-rank intermediate 保持 384、W2 E8M0 scale descriptor 对齐到 16 列，gfx950/TP8 且 CSV 连续覆盖 `1 <= M <= 2048` 时启用、其余 fail-closed 回落，经 `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1` opt-in（#53161）；AutoRound 格式新增 2/3/5/6/7-bit CUDA 支持（#52890）。修复三处：`--quantization moe_wna16` 下 linear delegate 缺 `packed_modules_mapping` 致 GPTQ MoE fused 层加载 `AttributeError`，并把 `moe_wna16` 加入 XPU 支持列表（#52651）；DSv4 MXFP4 selector 把显式 backend 别名窄化为 BF16 变体，SM100+/SM120 上 `flashinfer_cutlass` 无法回落 W4A8 变体而启动失败（#53586）；Kimi K3 NVFP4 权重转换因逐 expert 分配在 20MB max-split 下碎片化 OOM，改为预分配 shuffled 张量逐 expert 填充（#55407）。",
+    "sig-model-performance": "五条变更。SM 12.x（GB10/DGX Spark）上 CUTLASS blockwise-FP8 GEMM 在权重超出 L2 且激活 slab 不低于 14 MiB 时把 persistent tile scheduler 的 `max_swizzle_size` 设为 8，权重改从 L2 重读、输出位级一致，GB10 上 5120x5120 权重 M=4096 从 117 提到 160 TFLOPS（#55180）；QSA indexer 落地 FP8 cache（无 scaling），GB300 decode bs=16/ctx=64k 1.5x、prefill 1.4-1.7x（#54890）；XPU grouped_topk 路由到融合 `_moe_C` kernel 并补 meta 实现（torch.compile 不再 graph break，CUDA 也受益），B70 上相对默认 +6.8%（#53580）；Qwen Triton warmup 扩展使剩余 kernel 在 JIT monitor 装配前编译，消除 pooling/generate 首请求数秒尖峰（#54797）；ROCm AITER sparse MLA 补 attention-sink 支持（graph-visible LSE + `logaddexp` 虚拟零值 sink），同时修复空行 NaN、FP16 拒绝与 64-head BF16 kernel 缺失，为 HY-V4 ROCm 启用铺路（#54404）。",
+    "sig-spec-decode": "三条变更。修复 B200 LM Eval Spec Decode lane 上 DeepSeek-V4-Flash DSpark 启动断言——kernel warmup 刻意先于 `capture_model`（自适应成本校准所在地）执行，warmup 期间临时挂起 adaptive manager（固定 draft 数）、`finally` 恢复，真实请求的自适应验证不受影响（#55455）；Qwen3.5/3.6 多模态 wrapper 的 `mtp_num_hidden_layers` 在 `text_config` 中，`SpeculativeConfig` 解析 `n_predict` 改为顶层优先、`text_config` 回落，下游整除检查不再被绕过（#55369）；OffloadingConnector 在 MTP/EAGLE trailing-block 处理下把 KV 存入 CPU tier 却对整请求返回 0 可复用 token——移除 all-groups drafter fallback、volatile-tail pop 对所有 drafter group widen、解除 trailing-chunk 存储排除（#52771）。",
+    "sig-ci": "七条变更。H200 MIG extraction 测试与 #50514 的辅助层排序契约对齐、predictable-model 测试独立进程释放显存（#55457）；NPU CI 移除容器内编译安装（40 分钟）并加 30 分钟超时（#55731）；Transformers v5 迁移解禁两处误伤——ColQwen3 测试只测 vLLM 原生实现、不受 HF Hub weight-tying bug 影响（#55588），SarvamMLA 的不兼容原因从 `vllm` 改标 `hf`（#55728）；`test_wna16_cuda_high_bit_skips_humming` 因真实设备能力检查未 mock 在 XPU 上必败，改为仅真实 CUDA 跑（#55660）；ROCm 临时跳过暂不支持的 HY-V4 初始化用例（#55653）；修复 csrc 下 pre-commit（#55630）。",
+    "sig-large-scale-serving": "三条变更。新增 `ECMooncakeConnector`：EPD 分离部署的 encoder cache 经 Mooncake TransferEngine 传输（HTTP registry + ZMQ 协调 + pull 路径），注册进 `ECConnectorFactory`，附两进程 CUDA e2e 与 EPD 全流水线脚本（#41567）；修复 `MooncakeStoreConnector` 在混合（多 KV-group）模型上的 finish-time save 崩溃——非选中 connector 记录空 block-table 致 worker per-group 循环 `IndexError`，GB300 单轮 eval 崩溃 997 次，改为无条件记录全宽表并对未覆盖 group 告警跳过（#54643）；`lmcache_mp_connector` 作为 MultiConnector 非选中子 connector 时误入 `WAITING_FOR_LOAD` 且 lookup 锁泄漏，condition 加 `num_external_tokens > 0` 守卫（#47505）。",
+    "sig-omni": "两条变更。自动音频解码顺序恢复 soundfile → TorchCodec → PyAV——#51826 改 TorchCodec 优先后，TorchCodec 0.10 + FFmpeg 4.4.2 使 Mary Vorbis fixture 多 192 个 padding 样本，MI300/MI355 语音测试失败（#55642）；XPU 视觉输入 `FusedInputNorm` 在 uint8 输入 + fp32 affine 时派发融合 kernel，单遍读写、不再物化 fp32 中间张量（#52945）。"
   },
   "commits": [
     {
@@ -74,6 +76,270 @@
       "sig_reason": "extraction 测试与排序契约对齐及进程隔离，属 CI 测试维护范畴。",
       "tags": ["test", "low-risk", "ci", "hidden-state-extraction", "auxiliary-layers", "test-isolation", "h200"],
       "pr_number": 55457
+    },
+    {
+      "sha": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+      "comment": "测试解禁：Transformers v5 迁移（#38379）期间 `test_colqwen3.py` 因 HF Hub 远程 `modeling_colqwen3.py` 的 weight-tying bug（缺 `all_tied_weights_keys`）被整体 skip，但该测试只经 `VllmRunner` 测 vLLM 原生 in-tree `ColQwen3Model`——不继承 `transformers.PreTrainedModel`、直接经 safetensors 加载权重、不调用 HF Hub 远程模型类，不受该 bug 影响；参考测试 `test_colqwen3_5.py` 同构且早已解禁。移除 skip 标记（-5 行）。",
+      "sig": "sig-ci",
+      "sig_reason": "Transformers v5 迁移中的测试解禁，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "transformers-v5", "colqwen3", "pooling", "unskip"],
+      "pr_number": 55588
+    },
+    {
+      "sha": "ad2f18e8af18f43af932e08a3dfb7c8c068aebc2",
+      "comment": "**背景**：NPU 测试用例平均跑 1 小时——容器内 vllm/vllm-ascend 编译安装占 40 分钟，vllm-interface 用例再占 20 分钟以上。**方法**：从流水线移除耗时的编译安装步骤，为 NPU 用例加 30 分钟超时，并跳过 vllm-ascend 侧持续失败的用例。**效果**：NPU CI 占用时间显著下降（+2/-21）。",
+      "sig": "sig-ci",
+      "sig_reason": "NPU CI 流水线的用时优化与超时控制，属 CI 基础设施范畴。",
+      "tags": ["ci", "low-risk", "npu", "ascend", "timeout", "buildkite"],
+      "pr_number": 55731
+    },
+    {
+      "sha": "70584f69b1bf866224604029fae038864a368019",
+      "comment": "**背景**：CohereLabs/North-Micro-Vision-Instruct（Cohere Compass）已登陆 Hugging Face 并进入 transformers（huggingface/transformers#47878），vLLM 尚无对应实现。**方法**：在 `vllm/model_executor/models` 新增 Cohere Compass 模型实现并接入 `transformers_utils/config.py` 与测试 registry（+2366/-1）。**效果**：与内部基准及 HF 实现对齐，API 冒烟测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "Cohere Compass 新模型架构接入，属核心模型支持范畴。",
+      "tags": ["feature", "low-risk", "model", "cohere-compass", "north-micro-vision", "multimodal", "vision"],
+      "pr_number": 54774
+    },
+    {
+      "sha": "7cc89a7ddabd6be3ff64535139bea20548062ca6",
+      "comment": "注册表修正：#38804 已通过 `_patch_hf_transformers_validate_rope()` 修复 vLLM 侧的 SarvamMLA Transformers v5 兼容性（HF 移除了 `validate_rope()` 的 `ignore_keys` 参数），但 `tests/models/registry.py` 仍把不兼容原因标为 `vllm`，导致检查 vLLM 的测试套件（如 `test_registry_imports`）继续跳过 `SarvamMLAForCausalLM`。把 `transformers_version_reason` 从 `vllm` 改为 `hf`（与 Step3VL 同模式）：vLLM 测试解禁，原始 HF 参考测试仍受上游 Hub 不兼容保护（+3/-3）。",
+      "sig": "sig-ci",
+      "sig_reason": "模型测试注册表的 Transformers v5 兼容性标注修正，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "transformers-v5", "sarvam-mla", "registry"],
+      "pr_number": 55728
+    },
+    {
+      "sha": "cd64c2dea9c72af333de7ec05293d54bbf1bd128",
+      "comment": "文档澄清：`max_num_queued_reqs` 与 `max_num_queued_tokens` 在 `AsyncLLM.check_admission` 中按 API 进程 `request_states` 聚合计数，DP rank 路由发生在注册之后，因此两个上限作用于整个服务（所有 DP rank 合计），而 `max_num_seqs` 是 per-rank——运营者若沿用 `max_num_seqs` 的值作 `max_num_queued_reqs` 会在 rank 仍有空闲时提前拒绝请求。在 `vllm/config/scheduler.py` 两处字段 docstring 与 `data_parallel_deployment.md` 补充作用域说明与 TTFT 容量估算示例（#49445 后续，docs-only）。",
+      "sig": "other",
+      "sig_reason": "admission control 作用域的纯文档澄清，无 SIG 归属的文档变更。",
+      "tags": ["docs", "low-risk", "admission-control", "data-parallel", "scheduler-config"],
+      "pr_number": 55124
+    },
+    {
+      "sha": "f2d45f26bd6a2c841ffbd0030ebaefe87c274e58",
+      "comment": "**背景**：transformers 只在 Gemma 4 E2B/E4B 与 Gemma 3n 的非 KV 共享层创建 `k_proj`/`v_proj`/`k_norm`，任何经 `save_pretrained` 产出的微调 checkpoint（HF Trainer/TRL/verl）都缺最后 `num_kv_shared_layers` 层的这些张量；vLLM 无条件创建这些模块，微调 checkpoint 加载报 `Following weights were not initialized from checkpoint`（Google 原版恰好冗余携带，故仅微调后暴露）。**方法**：KV 共享层条件性地不再创建 KV projection 与 `k_norm`，权重映射相应调整（+222/-99）。**效果**：CPU 单测覆盖 shared 层 `q_proj` 直载、packed 层 q/k/v 分片与冗余 K/V 名跳过；接替停滞的 #41504。",
+      "sig": "sig-core",
+      "sig_reason": "Gemma KV 共享层的模块条件创建与权重映射修复，属核心模型加载范畴。",
+      "tags": ["bugfix", "medium-risk", "gemma", "kv-shared-layers", "weight-loading", "fine-tuned-checkpoints"],
+      "pr_number": 54917
+    },
+    {
+      "sha": "42801b3a6b3bb92397a04117449f4699b09db1df",
+      "comment": "**背景**：DSv4 JIT warmup 契约迁移系列（#49349，依赖 #50175）第 3/N 部分，FA4 MLA prefill 与 Inkling FA4 relative-attention 仍走 legacy 外部 warmup 编排。**方法**：把两者的 specialization 与 compile-only warmup 迁移到共享 JIT warmup 契约，compile-key 生成与 warmup 搜索空间移到运行时 kernel 旁，删除对应的 legacy 编排，保留既有 compile-only adapter 与 specialization 行为。**效果**：新增迁移前后 warmup key 一致性对比测试（+52/-67）。",
+      "sig": "sig-core",
+      "sig_reason": "FA4 MLA 与 Inkling kernel 向共享 JIT warmup 契约的迁移，属核心 warmup 架构范畴。",
+      "tags": ["refactor", "low-risk", "warmup", "jit", "fa4", "mla", "cutedsl", "inkling", "dsv4"],
+      "pr_number": 53565
+    },
+    {
+      "sha": "1713b9866ae5c380d97da5796217064ac7ab57b8",
+      "comment": "**背景**：DSv4 attention 路径使用的 sequence-layout 与 decode-context-parallel（DCP）JIT kernel 尚未纳入共享 warmup 契约（系列 2/N，依赖 #50175）。**方法**：迁移 sequence packing/unpacking 与 attention CP-output 校正 kernel、DCP index-correction 与 candidate-processing CuTeDSL kernel；specialization 所有权移至各运行时 kernel 旁；新增基于 fake tensor descriptor 的 compile-only CuTeDSL 路径，用 kernel 自有的 traced dispatch space 取代代表性运行时输入。**效果**：为迁移 kernel 增加 dispatch 等价性测试（+1461/-583）。",
+      "sig": "sig-core",
+      "sig_reason": "sequence 与 DCP kernel 向共享 JIT warmup 契约的迁移，属核心 warmup 架构范畴。",
+      "tags": ["refactor", "low-risk", "warmup", "jit", "dcp", "cutedsl", "sequence-packing", "dsv4"],
+      "pr_number": 53564
+    },
+    {
+      "sha": "ecd600d91e373d939ede33253a75d86bc5bf7338",
+      "comment": "**背景**：chunked embedding 请求忽略显式配置的 `max_embed_len`——tokenization 无条件使用无限 token 数，`max_model_len=4`、`max_embed_len=8`、输入 9 token 的请求在 main 上被接受（`accepted_tokens: 9`）而非拒绝。**方法**：在 chunk 创建前恢复请求长度校验，遵守配置上限（+1/-1）；`max_embed_len=None` 保持原有无限 chunked 处理，tokenization、MRV2 执行、pooling 与聚合对合法输入均不变。**效果**：超限请求返回 HTTP 400、8 token 边界请求仍 200；46 项聚焦 pooling 测试与 5 项 MRV2 长文本 E2E 通过。",
+      "sig": "sig-core",
+      "sig_reason": "chunked embedding 入口的 max_embed_len 校验修复，属核心 pooling 入口范畴。",
+      "tags": ["bugfix", "low-risk", "pooling", "chunked-embeddings", "max-embed-len", "validation"],
+      "pr_number": 55551
+    },
+    {
+      "sha": "167858ea174efd0655ae821d3f3a50b51d721525",
+      "comment": "**背景**：Responses harmony input 解析中仍有三处对畸形用户输入抛 raw `ValueError`（message 缺 `role` 键、`function_call_output` 无匹配 call、未知 input 类型），属客户端错误（4xx）层级却无法指明出错字段。**方法**：三处全部迁移为 `VLLMValidationError`，`parameter` 均为 `input`；解析模型生成 Harmony 输出的失败（未知 channel/browser action、流式未知函数名）刻意保留——它们不是用户输入，`parameter=input` 会错误归因，应另行迁移到 server-error 类型。**效果**：测试改为断言 `VLLMValidationError` 且 `parameter` 为 `input`，并补上此前未测的缺 `role` 路径（+36/-7）。",
+      "sig": "sig-core",
+      "sig_reason": "Responses harmony 输入校验向 VLLMValidationError 层级迁移，属 API 前端错误处理范畴。",
+      "tags": ["refactor", "low-risk", "frontend", "responses-api", "harmony", "validation", "error-handling"],
+      "pr_number": 55701
+    },
+    {
+      "sha": "b339d75a410e4e889049dff59042f385909bad67",
+      "comment": "**背景**：Qwen3.5/3.6 多模态 wrapper checkpoint（如 `Qwen3.6-35B-A3B`、`Qwen3.8-27B`）的 `mtp_num_hidden_layers` 位于 `text_config` 而非外层 wrapper config，`SpeculativeConfig.hf_config_override` 此前只查顶层 `hf_config`，`n_predict` 保持 `None` 并使下游整除检查被绕过（#55322）。**方法**：经 `get_hf_text_config(hf_config)` 提取 `text_config`，先查顶层 `hf_config.mtp_num_hidden_layers` 再回落 `text_config.mtp_num_hidden_layers`，保留顶层优先与纯文本 checkpoint 解析。**效果**：新增 `test_qwen3_5_mtp_config.py` 覆盖多模态 wrapper、纯文本与优先级场景，并接入 Buildkite `models_basic` CPU lane（+101/-9）。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "SpeculativeConfig 对多模态 MTP 层数的解析修复，属投机解码配置范畴。",
+      "tags": ["bugfix", "low-risk", "spec-decode", "mtp", "qwen3-5", "multimodal", "config-resolution"],
+      "pr_number": 55369
+    },
+    {
+      "sha": "6a2a2bb02b563b83f946012959fd3927984d072a",
+      "comment": "**背景**：分离式部署（llm-d、Dynamo、自定义 frontend）需要 GPU-less 预处理服务：应用模型特定格式化、tokenization、多模态处理、工具元数据与采样配置后产出 `GenerateRequest`，交由独立的 token-in 生成服务。**方法**：新增无状态 `POST /v1/responses/render` 端点，复用与 `/v1/responses` 相同的 prompt 渲染——确定性渲染移入 `OnlineRenderer.render_responses`，response 状态、生成、流式与输出解析留在 `OpenAIServingResponses`，无状态边界拒绝 `previous_response_id`，共享 renderer 内强制 chat-template 信任检查，保留 Harmony tool-choice 与 Cohere 格式行为。**效果**：受 #54579 scale-out gate 控制——标准 `vllm serve` 仅在 `VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1` 时注册该端点，`vllm launch render` 服务默认暴露；多模态渲染产物可能远大于源媒体，调用方需原样转发并预留传输与内存（+1228/-298）。",
+      "sig": "sig-core",
+      "sig_reason": "无状态 /v1/responses/render 预处理端点，属 API 前端与 scale-out 渲染范畴。",
+      "tags": ["feature", "low-risk", "frontend", "responses-api", "render", "scale-out", "disaggregated-serving", "opt-in"],
+      "pr_number": 50195
+    },
+    {
+      "sha": "5e6f6a8ed42fd420ef206b938e3bb48739a95d6c",
+      "comment": "**背景**：`--quantization moe_wna16` 加载 GPTQ MoE checkpoint 失败——`MoeWNA16Config.get_quant_method` 从原始 HF 量化 dict（`full_config`，只列 shard 名不含 fused 名）重建 linear delegate，`qkv_proj`/`gate_up_proj` 匹配不到而返回 `UnquantizedLinearMethod`，加载在 `linear.py` 抛 `AttributeError`（同 #53107）；XPU 上更早在 `Platform.verify_quantization` 就拒绝，`moe_wna16` 不在 `XPUPlatform.supported_quantization`。**方法**：向 linear delegate 转发 `packed_modules_mapping`，并把 `moe_wna16` 加入 XPU 支持列表（核心改动 +12/-6）。**效果**：`auto` 路径完全不受影响（delegate 不会被要求构建 linear method），两条 CPU-only 新测试覆盖显式 flag 路径。",
+      "sig": "sig-quantization",
+      "sig_reason": "moe_wna16 量化配置的 fused linear 权重加载修复，属量化范畴。",
+      "tags": ["bugfix", "medium-risk", "quantization", "moe-wna16", "xpu", "gptq", "packed-modules-mapping", "weight-loading"],
+      "pr_number": 52651
+    },
+    {
+      "sha": "4a806d08ee94b35356dd749bf814ee91ee93f8d0",
+      "comment": "**背景**：混合架构下开启 MTP/EAGLE trailing-block 处理后，`OffloadingConnector` 把 KV 存入 CPU tier 却对整个请求返回 0 可复用 token（#52735），三个缺陷叠加：(1) `SchedulerOffloadConfig.from_spec` 的 all-groups drafter fallback 把无 `is_eagle_group` 标注的组（共享组 MTP 模型的常态，见 `qwen3_5_mtp.py`）全当 drafter 组；(2) `_lookup_complete_chunks` 的 volatile-tail pop 未在非 SW 组上 widen，使 `max_hit_size_tokens` 缩到查询值之下、确认边界落回 0；(3) `storable_chunks` 的 decode 期排除会永久漏存最后一个完整 drafter chunk。**方法**：移除 all-groups fallback（drafter 组留空并记一次日志）、widening 应用到每个 drafter group、解除 trailing-chunk 存储排除。**效果**：B70/H200 报告输出无变化（greedy 字节一致），未做受控 acceptance-rate A/B；#53388 的 `use_eagle_block_drop` 能力保留。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "OffloadingConnector 在 MTP/EAGLE 投机解码下的 offload 命中清零修复，属投机解码与 KV offload 交互范畴。",
+      "tags": ["bugfix", "high-risk", "spec-decode", "mtp", "eagle", "offloading-connector", "kv-offload", "hybrid-models"],
+      "pr_number": 52771
+    },
+    {
+      "sha": "94e26dd3dd7d6363b524c96521c78feb501bdc61",
+      "comment": "**背景**：Qwen3.8-Flash-Next 的 QSA indexer cache 此前仅 BF16，长上下文下 indexer 计算（decode bs=16/ctx=64k 达 16.9ms）成为瓶颈。**方法**：为 QSA indexer 增加 FP8 支持（不含 scaling），在 `vllm/models/qwen4_exp` 落地（+142/-24）。**效果**：GB300 上 decode bs=16/ctx=64k 从 16.9 降到 11.1ms（1.5x）、bs=4/ctx=64k 1.3x；prefill 1.4-1.7x（8k/2048 行 27.7→15.8ms）；GSM8K 0.9678 vs 0.9682、LongBench-v2 0.5050 vs 0.4871，均在噪声内；提速非线性提示 Triton 效率问题，CuTeDSL decode 与 Triton TMA prefill 优化另行走后续 PR。",
+      "sig": "sig-model-performance",
+      "sig_reason": "QSA indexer 的 FP8 cache 带来的 decode/prefill kernel 提速，属模型 kernel 性能范畴。",
+      "tags": ["performance", "low-risk", "qwen3-8-flash-next", "qsa", "fp8", "indexer-cache", "gb300"],
+      "pr_number": 54890
+    },
+    {
+      "sha": "58ad1f3b8973b23943107b51230d594050b42ec3",
+      "comment": "文档变更：把 `allenai/OLMo-2-0425-1B-Instruct` 加入 batch-invariance 已验证模型列表（#27433）。L4 上 `test_batch_invariance.py` 19 项测试全过（989s），附 HF Job 链接（+1/-0）。",
+      "sig": "other",
+      "sig_reason": "batch-invariance 验证模型的纯文档补充，无 SIG 归属的文档变更。",
+      "tags": ["docs", "low-risk", "batch-invariance", "olmo-2", "determinism"],
+      "pr_number": 55691
+    },
+    {
+      "sha": "86484465153f08f4523d8be964fd6309146eab09",
+      "comment": "移植变更：#53361 为 DeepSeek V4 增加 LoRA 支持但只改了 NVIDIA 实现（`nvidia/model.py`），本 PR 把相同变更移植到 `vllm/models/deepseek_v4/xpu/model.py`（+31/-1）。与 #53361 一致不新增仓库内测试（经外部 verl E2E 验证），后续若上游补 DSV4+LoRA 测试应同步扩展到 XPU。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4 XPU 实现的 LoRA 支持移植，属核心模型 LoRA 层范畴。",
+      "tags": ["feature", "low-risk", "lora", "deepseek-v4", "xpu"],
+      "pr_number": 53689
+    },
+    {
+      "sha": "9b85112e130d8beffe9928ec0c86a4029d6ba7a8",
+      "comment": "**背景**：vllm-xpu-kernels 的 fused grouped_topk（noaux_tc）kernel 注册在 CUDA 同用的 `_moe_C::grouped_topk` op 上，但两个 gate 都判 `is_cuda()`，XPU 始终回落 eager 分解；且该 op 无 fake（meta）实现，torch.compile 无法 trace 导致 graph break（非 XPU 特有，CUDA 也受影响）。**方法**：XPU 上把 grouped_topk 路由到融合 kernel 并注册 meta 实现。**效果**：B70 XPU、Trinity-Nano（4096-in/1024-out、并发 48）上 torch.compile+融合+meta 相对默认 +6.8%（1136.1→1213.0 tok/s，routing kernel 启动数 33912→4752）；惠及全部 noaux_tc MoE 模型（DeepSeek-V3/R1、Kimi-K2.6、GLM-4.5、Longcat-Flash 等）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "XPU grouped_topk 融合 kernel 路由与 meta 注册的吞吐优化，属 routing kernel 性能范畴。",
+      "tags": ["performance", "low-risk", "xpu", "grouped-topk", "noaux-tc", "moe", "meta-kernel", "torch-compile"],
+      "pr_number": 53580
+    },
+    {
+      "sha": "7dbe38683325126de96d442d6b494f4266001bec",
+      "comment": "**背景**：/v1/responses 服务路径仍有 4 处校验错误抛 raw `ValueError`（#49665 迁移的遗漏），被 api_server.py 的 fallback handler 捕获后 param 为 None，错误响应无法指明字段（#50256，api_server 的 TODO 注释明确要求迁移）。**方法**：encrypted reasoning content 映射到 `parameter=input`、`reasoning_effort` 非法值映射 `reasoning_effort`、不支持的 tool 类型映射 `tools`、未知首消息类型映射 `input`，共 2 文件 4 处 raise 点。**效果**：全部落入客户端错误（4xx）层级并携带字段名（+27/-10）。",
+      "sig": "sig-core",
+      "sig_reason": "Responses API 校验错误向 VLLMValidationError 层级迁移，属 API 前端错误处理范畴。",
+      "tags": ["refactor", "low-risk", "frontend", "responses-api", "validation", "error-handling"],
+      "pr_number": 50257
+    },
+    {
+      "sha": "e476556189506df612218c0888dc675e6ecbfc06",
+      "comment": "**背景**：HY-V4 在 #54160 引入可学习 attention sink，但其 ROCm 初始化不受支持（AMD build 12635/12653 失败），阻塞 #54405 的模型启用；本地 MI300 验证还暴露 empty-row NaN、拒绝 FP16 输入、64-head bucket 缺原生 BF16 kernel 等问题。**方法**：新增 graph-visible、非持久化的 AITER op（返回 LSE），以 `logaddexp` 应用虚拟零值 sink 并重缩放输出，空行贡献严格为零；FP16 与不支持的头形状走既有 Triton fallback（保留查询 dtype 与请求的 value 宽度）；校验 sink 元数据、拒绝不支持的 DCP 组合并声明支持的连续 cache 布局。**效果**：测试覆盖 ragged/dense 输入、FP8 scale、头 padding、空行与算子契约，FP64 参考 + 基于精度的误差预算跑在 CDNA 3/4（+997/-67）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm AITER sparse MLA backend 的 attention-sink 支持与正确性修复，属注意力后端范畴。",
+      "tags": ["feature", "medium-risk", "rocm", "aiter", "sparse-mla", "attention-sink", "hy-v4", "mi300"],
+      "pr_number": 54404
+    },
+    {
+      "sha": "392db567b260cb4d1e5f91547b65d527038fe641",
+      "comment": "测试修复：`test_wna16_cuda_high_bit_skips_humming` 在 XPU CI 上失败（`INC quantization with bits=4, sym=True is not supported`）——测试 mock 了 `is_cuda/is_xpu/is_cpu` 模拟 CUDA，但 `AutoGPTQLinearMethod.__init__` 及其前的 `check_marlin_supported()` 执行真实的（未 mock 的）设备能力检查，真实 XPU host 上必失败。加 `skipif` 仅在真实 CUDA 硬件上运行，与本文件其他 CUDA-only 用例的模式一致（+4/-0）。",
+      "sig": "sig-ci",
+      "sig_reason": "CUDA-only 量化测试在 XPU 上的跳过修复，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "auto-round", "marlin", "xpu", "skipif"],
+      "pr_number": 55660
+    },
+    {
+      "sha": "49eb2accf0610d220f451f2f3c1dfe93fe395c79",
+      "comment": "**背景**：`lmcache_mp_connector` 作为 MultiConnector 中未被选中的子 connector 时，`update_state_after_alloc` 收到 `num_external_tokens=0`；其状态机却以 `needs_retrieve()`（比较 `num_lmcache_hit_blocks > num_vllm_hit_blocks`）判定，LMCache 有缓存而别的 connector 被选中时错误转入 `WAITING_FOR_LOAD` 创建 retrieve 任务，且 lookup 锁不释放（泄漏至 TTL 过期）。**方法**：condition 加 `and num_external_tokens > 0`——非选中 connector 强制 `condition=False`，走既有分支转 READY 并释放全部锁（+6/-2）。**效果**：非选中/选中/冷请求三种场景逐一验证，选中与冷请求路径不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MultiConnector 下 lmcache_mp_connector 的状态机与锁泄漏修复，属 KV connector 范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-connector", "lmcache", "multi-connector", "lock-leak", "state-machine"],
+      "pr_number": 47505
+    },
+    {
+      "sha": "5893426b88f7b3cd21101d194eb1c6f0a6f0e27b",
+      "comment": "**背景**：DeepSeek-V4 类 MXFP4 模型显式传非 b12x MoE backend（如 `--moe-backend flashinfer_cutlass`）在 SM100+/SM120 上可能直接失败——DSv4 selector 把显式别名经 `_get_requested_backends(alias, None)` 处理，无模型 activation 声明时 BF16 偏好过滤只保留别名的 BF16 变体，而 FlashInfer CUTLASS 的 BF16 变体 gate 在 SM90，选择死路而非回落到实际支持这些设备的 W4A8（MXFP4 权重 + MXFP8 激活）变体。**方法**：显式非 b12x 别名按优先级尝试全部变体（`map_mxfp4_backend`）；narrowing 仅保留在 `b12x`（那里编码了 W4A8 默认 backend 策略）。**效果**：SM120 gate 模拟回归测试要求 `flashinfer_cutlass` 选出 `FLASHINFER_CUTLASS_MXFP4_MXFP8`（修复前失败）；4x RTX 6000 Pro 上 DSv4-Flash TP4 + DSpark 从启动报错变为正常跑完 8K/1K 基准零失败。",
+      "sig": "sig-quantization",
+      "sig_reason": "DSv4 MXFP4 MoE backend 选择器的别名窄化修复，属量化 backend 派发范畴。",
+      "tags": ["bugfix", "medium-risk", "quantization", "mxfp4", "moe-backend", "backend-selector", "deepseek-v4", "sm120", "w4a8"],
+      "pr_number": 53586
+    },
+    {
+      "sha": "34b1e9f7a61e802b870c7d7f78bf90b000b691cc",
+      "comment": "**背景**：混合（多 KV-group）模型（如 Kimi-K3 的 MLA+GDN）上 `MooncakeStoreConnector` finish-time save 崩溃——MultiConnector 下非选中 connector 收到 `num_external_tokens=0`，store scheduler 据此记录空 block-table tuple，finish-time save 重建 tracker 后 worker 的 per-group 循环对空 tuple 取下标抛 `IndexError`，每次崩溃静默丢弃该请求的 store save；GB300 上一轮 eval 崩溃 997 次（约 7GB save 仍经 in-schedule 路径成功），单组模型不触发。**方法**：`update_state_after_alloc` 无条件记录全宽 per-group block table（去掉 `num_external_tokens > 0` 条件）；`_handle_request` 对元数据未覆盖的 group 告警跳过，畸形条目不再杀死发送线程。**效果**：三个 mooncake store 单测文件 183 项测试通过（+33/-1）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MooncakeStore 在混合模型上的 finish-time save 崩溃修复，属 KV connector 存储路径范畴。",
+      "tags": ["bugfix", "medium-risk", "kv-connector", "mooncake", "store", "hybrid-models", "kimi-k3", "multi-connector"],
+      "pr_number": 54643
+    },
+    {
+      "sha": "195bc9c4a1b480c7d2a6131cd8dbb49e9be72762",
+      "comment": "CI 临时跳过：HY-V4 的 CUDA-only 实现（#54160）在 ROCm 初始化时抛 `NotImplementedError: hy_v4 does not yet support ROCm`，导致 AMD build 失败。仅跳过 ROCm 上的 `HYV4ForCausalLM` 与 `HYV4MTPModel` 两个初始化用例，待 #54405（模型启用）与 #54404（backend 依赖）落地后随 ROCm 启用一并移除（+6/-0）。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm 上暂不支持的 HY-V4 初始化用例临时跳过，属 CI 测试维护范畴。",
+      "tags": ["test", "low-risk", "ci", "rocm", "hy-v4", "skip", "temporary"],
+      "pr_number": 55653
+    },
+    {
+      "sha": "6fbb00b18874e27ba7d7adc0a3b8e93fee763ab1",
+      "comment": "**背景**：EPD 分离部署中消费方加载 encoder cache（EC）张量此前只能依赖共享文件系统。**方法**：新增 `ECMooncakeConnector`——EC 张量经 Mooncake TransferEngine 传输（HTTP registry + ZMQ 协调 + pull 路径）；注册进 `ECConnectorFactory` 并文档化 `ECTransferConfig.ec_connector` 选项；附带两进程 CUDA e2e（producer `cuda:0` / consumer `cuda:1` + registry 与张量相等校验）、EPD 全流水线脚本（baseline vs 1E+1PD + Mooncake EC + proxy）与 README 说明。**效果**：需 2+ GPU、`mooncake-transfer-engine`、`pyzmq` 等依赖，`MOONCAKE_EC_PROTOCOL=tcp` 可跑 smoke e2e（+5777/-304）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EPD 分离部署的 encoder cache Mooncake 传输 connector，属大规模分离服务范畴。",
+      "tags": ["feature", "medium-risk", "epd", "encoder-cache", "mooncake", "ec-connector", "disaggregated-serving", "transfer-engine"],
+      "pr_number": 41567
+    },
+    {
+      "sha": "f7f060d253fb67c9b83f45a22a1eeeba4d72a2be",
+      "comment": "**背景**：#51826 把 TorchCodec 设为首选自动音频解码器后，TorchCodec 0.10 + FFmpeg 4.4.2 下 Mary Vorbis fixture 在 16 kHz 多出 192 个 padding 样本，改变重复音频边界、识别短语重复次数从十降到七，MI300/MI355 的 `test_long_audio_request` 失败（git bisect 定位到该合并提交）。**方法**：自动解码顺序恢复为 soundfile → TorchCodec → PyAV——soundfile 支持的格式保留原波形长度；文档记录恢复后的顺序与并发解码时显式选 TorchCodec 的做法，视频容器等不支持的格式仍回落 TorchCodec。**效果**：AMD 语音 lane 恢复通过（+38/-29）。",
+      "sig": "sig-omni",
+      "sig_reason": "自动音频解码器优先级回归的修复，属多模态音频输入范畴。",
+      "tags": ["bugfix", "low-risk", "audio", "soundfile", "torchcodec", "pyav", "decoding-order", "multimodal", "rocm"],
+      "pr_number": 55642
+    },
+    {
+      "sha": "ed29dfae6e76235e01fcc0eca21cf0dcbfc40af1",
+      "comment": "**背景**：XPU 上视觉输入的 `FusedInputNorm` 走 eager 路径：物化 fp32 中间张量再 cast 回视觉 dtype，额外的设备侧计算抵消了传输 uint8 `pixel_values` 省下的带宽。**方法**：输入为 uint8 且 affine weight/bias 为 fp32 时派发到 `fused_input_norm` 融合 kernel（vllm-xpu-kernels 提供），单遍读 uint8 直写视觉 dtype；其余情况保留 broadcasted multiply-add fallback，与融合路径数值一致（+51/-0）。**效果**：uint8 视觉输入的 norm 在 XPU 上单遍完成。",
+      "sig": "sig-omni",
+      "sig_reason": "XPU 视觉输入 FusedInputNorm 的融合 kernel 派发，属多模态视觉输入预处理范畴。",
+      "tags": ["performance", "low-risk", "xpu", "fused-input-norm", "vision", "uint8", "multimodal"],
+      "pr_number": 52945
+    },
+    {
+      "sha": "d9105ea8001e0a6d77a96327d17515bb5791fb36",
+      "comment": "**背景**：qwen4_exp NVIDIA 实现经 `@support_torch_compile` 走 torch.compile，为绕过 compile 检查注册的 custom op（`qwen4_exp_compute_ple_ngram_ids`、`qwen4_exp_ple_short_conv`、`qwen4_exp_qsa_with_output`）维护成本高，且 compile 对 embedding op 的 autotune 会额外产生约 50GB 的 ngram 表张量，导致 FP8 checkpoint 无法在单张 GB300 上加载（OOM）（#54688）。**方法**：移除模型装饰器与全部 custom op 注册，在适当位置插入 eager break 点（+165/-185）。**效果**：单 GB300 可载 FP8；GSM8K 96.7-96.9%、MMMU-Pro 75.6-77.6%（BF16/FP8 x MTP 0/3 四组）与基线持平；e2e 吞吐 -4.8%~+5.2% 波动（视为噪声），后续手动融合另行优化。",
+      "sig": "sig-core",
+      "sig_reason": "qwen4_exp NVIDIA 实现移除 torch.compile 与 custom op，属模型实现范畴。",
+      "tags": ["refactor", "medium-risk", "qwen3-8-flash-next", "torch-compile", "custom-ops", "fp8", "oom", "eager-breaks"],
+      "pr_number": 55272
+    },
+    {
+      "sha": "9cc7793e32f8340e111a6c822f231aa526a8ea21",
+      "comment": "**背景**：chat template 在内部校验输入并拒绝非法请求（如 Qwen3.8 模板只接受 `xhigh`/`medium`/`low` 的 `reasoning_effort`，标准值 `high` 触发模板内 `raise_exception`），此前以服务端 500 暴露而非可用响应（#54017）。**方法**：generic HF renderer 在 `safe_apply_chat_template` 中把模板抛出的异常重抛为 `VLLMValidationError`（warning 级日志），entrypoint 错误层将其映射为携带模板自身消息的 400（通常列出支持的取值）；完全通用、无模型特定逻辑。**效果**：覆盖所有经 generic HF renderer 的入口（`/v1/chat/completions`、`/v1/responses`、Anthropic `/v1/messages`、offline chat、batch）；测试覆盖不支持/支持的 effort 与无关模板错误三条路径（+121/-4）。",
+      "sig": "sig-core",
+      "sig_reason": "chat template 拒绝输入时的 400 错误映射，属前端渲染与错误处理范畴。",
+      "tags": ["bugfix", "low-risk", "frontend", "chat-template", "reasoning-effort", "validation", "error-handling"],
+      "pr_number": 54022
+    },
+    {
+      "sha": "f43ef1531d10d556e616abb8e069ecb24578bde7",
+      "comment": "CI 修复：修正 `csrc/libtorch_stable/quantization` 下的 pre-commit 问题（+2/-2），无行为变更。",
+      "sig": "sig-ci",
+      "sig_reason": "pre-commit 修复，属 CI 工具链范畴。",
+      "tags": ["ci", "low-risk", "pre-commit", "csrc"],
+      "pr_number": 55630
+    },
+    {
+      "sha": "3dc7a68ce45ce1b98c2879139465833611f117cb",
+      "comment": "**背景**：Qwen3.5/Qwen3-Next 的部分 Triton kernel 在首个真实请求时才 JIT 编译——pooling 模式 Qwen3.5 上首个请求因此多付数秒（L20 实测第二个请求快 >2s），对延迟敏感的在线 embedding/分类服务是重击；jit_monitor 报出 `_bilinear_pos_embed_kernel`、`rotary_kernel`、`_causal_conv1d_fwd_kernel`、`_fused_post_conv_kernel`、`layer_norm_fwd_kernel` 及 M-RoPE/`batch_memcpy_kernel` 等残留（#43009 部分）。**方法**：扩展 `qwen_triton_warmup` 使剩余 kernel 在 JIT monitor 装配前完成编译：generate VL 路径补 `_bilinear_pos_embed_kernel`、`rotary_kernel`、`layer_norm_fwd_kernel`、`triton_mrope`、`batch_memcpy_kernel`，pooling 路径取消 `is_pooling_model` 提前返回并覆盖 GDN prefill 的两个 kernel。**效果**：新增 qwen/qwen-vl/mamba Triton warmup 三组测试（+368/-19）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Qwen Triton warmup 扩展消除首请求 JIT 编译尖峰，属模型冷启动性能范畴。",
+      "tags": ["performance", "low-risk", "warmup", "triton", "jit", "first-request-latency", "qwen3-5", "qwen3-next", "pooling", "gdn"],
+      "pr_number": 54797
+    },
+    {
+      "sha": "6748217fb949952b4db418d09e64952cd7d8e352",
+      "comment": "**背景**：Kimi K3 NVFP4 运行时量化后处理因内存碎片喷出约 15000 行 CUDACachingAllocator OOM 警告（单卡 287GB、free 仅 16MB 时仍尝试分配 20MB），部分场景致命 OOM。**方法**：优化 NVFP4 MoE 权重后处理的内存占用——预分配最终 FlashInfer TRT-LLM shuffled 张量、逐 expert 填充，不再为 per-expert 结果单独分配（在 `_scoped_allocator_max_split(max_split_size_mb=20)` 下大块无法切分而失败）（+71/-83）。**效果**：碎片化 OOM 警告与致命失败消除。",
+      "sig": "sig-quantization",
+      "sig_reason": "NVFP4 MoE 权重转换的内存分配策略修复，属量化范畴。",
+      "tags": ["bugfix", "medium-risk", "quantization", "nvfp4", "moe", "kimi-k3", "weight-conversion", "oom", "flashinfer"],
+      "pr_number": 55407
     }
   ]
 }
