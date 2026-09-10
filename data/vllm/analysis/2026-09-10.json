@@ -1,0 +1,192 @@
+{
+  "date": "2026-09-10",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-10T20:00:00+08:00",
+  "daily_summary": "9 月 10 日共 22 条提交。ROCm/AMD 是当日最重主线：MiniMax-M3 稀疏注意力接入 aiter indexer 打分与 top-k kernel（+1077/-58）、修复 AITER attention 共享 KV prefill 回归（#54917 去除 Gemma 冗余 K/V 投影后后端仍切片缺失张量，曾击穿 MI300/MI355 翻译服务器语音任务），另有 6 条 CI 提交覆盖 MI300 分布式编译按图分区拆分、MI355 超时上调、FP8 dtype 与容差测试修复及 XPU triton shim 升级。性能侧修复 flashinfer TRTLLM ragged prefill 回归——把检查从每次 kernel 调用内上移到 MLA prefill 元数据准备阶段、消除逐调用 CUDA 同步，ISL=8k 吞吐最高 +4.5%、agentic 回放与无检查基线的差距由 -3.24% 收敛至 -0.04%。投机解码与量化交叉落地 NVFP4 DSpark gathered top-k 投影（packed NVFP4 行 gather+反量化 Triton kernel，解锁 Nemotron-3.5-Lightning NVFP4-DSpark 运行），并修复 PP draft broadcast 缺 record_stream 引发的偶发 device-side assert（需 PP≥2 + drafter 同时满足、自 #50514 起隐匿）。核心侧统一 XD-RoPE 入 M-RoPE（净删约 319 行、按 section 数推导通道数，顺带修复 HunyuanOCR 四段 M-RoPE 崩溃）、Rust 前端强类型化 wire dtype 与统一 parser 选择、修复 Seed-OSS 轮次边界、Step-3.5 结构化输出 reasoning 解析、多模态 encoder cudagraph 漏归一化致 Qwen2.5-VL 视觉输出乱码等。",
+  "sig_summaries": {
+    "sig-core": "十条变更。Rust 前端两连：强类型化 wire dtype——以 `TensorDtype`/`NumpyDtype` 与共享 `WireArray<Dtype>` 取代字符串张量元数据、协议模态统一于 `MmModality`（#56174）；统一/分裂 parser 名称解析一致化——先查 `UnifiedParserRegistry`，Kimi K3 的 `kimi_k3` 不再被 split registry 的宽泛 `kimi` 模式抢先匹配、删除 `register_unified_dummy`（#56018）。解析器修复两连：Seed-OSS 以 `<seed:bos>`/`<seed:eos>` 覆写继承自 Qwen3 的 ChatML 轮次边界、恢复 #54089 的当前轮作用域（#54264）；Step-3.5 改为见 `</think>` 即结束且 `is_reasoning_end*` 无状态化，修复结构化输出无法掩蔽首 token 与 spec decode 拒绝 draft 后的状态翻转（#53174）。前端与协议：HF 渲染器内容格式检测支持经宏参数传递 `message.content` 的模板（MiMo-V2.5，#53824）；Cohere Chat/Embed/Generative Scoring 的 `priority` 约束到 MessagePack int64 范围、超限由校验而非序列化报错（#56146）；Pooling 响应正确上报 LoRA adapter 名（#56004）。执行与配置：PP draft broadcast 为 `idx_mapping` 补 `record_stream`，修复 PP≥2 + drafter 下分配器回收引发的 device-side assert（#55745）；LoRA adapter 零权重应用时输出一次性 debug 日志、不再静默服务基座模型（#55310）；XD-RoPE 统一并入 M-RoPE、按 section 数推导通道数，净删约 319 行并修复 HunyuanOCR 四段 M-RoPE 崩溃（#56078）。",
+    "sig-model-performance": "三条变更。MiniMax-M3 稀疏注意力接入 aiter indexer 打分与 top-k kernel（依赖 #52849 与 aiter#4787，+1077/-58），相对 Triton BF16 基线 TPUT/TPOT/ITL 全面提升（#52664）；AITER attention 支持共享 KV prefill——#54917 让 Gemma 不再计算冗余 K/V 投影后后端仍切片缺失张量、曾击穿 MI300/MI355 翻译服务器语音任务，`git bisect` 定位后按 attention group 维度分配 gather workspace、只 gather 新增 prefill/extend token，18 个回归用例覆盖 NHD/SHUFFLE/FP8/滑窗（#55887）；修复 flashinfer TRTLLM ragged prefill 回归（flashinfer#4928）：检查上移到 MLA prefill 元数据准备每 forward 一次、消除逐 kernel 调用的 CUDA 同步，ISL=8k 吞吐最高 +4.5%、agentic 回放较无检查基线差距由 -3.24% 收敛至 -0.04%，同步提升 flashinfer 版本（#55499）。",
+    "sig-ci": "六条变更。MI300 Distributed Compile 按 `inductor_graph_partition` 轴拆分为两个 Buildkite step——该组 64 参数化、77.7 分钟为 AMD CI 长杆，两半 32+32 不相交且覆盖不变，预计 ~44.5/~42.1 分钟、超时 65 分钟（#53602）；MI355 Language Models (Standard) 超时 40→60 分钟（#54695 校准过低于实测约 44 分钟，#56114）；MoE 层测试改用 `current_platform.fp8_dtype()`/`is_fp8()` 兼容 ROCm `float8_e4m3fnuz`（#56106）；merged-column fuser 测试 monkeypatch 平台无关 GEMM，修复 ROCm 上 CPU 张量调 `rocm_unquantized_gemm` 报 NotImplementedError，2 failed → 143 passed（#56130）；AITER FP8 KV 测试容差由 atol=0.15 收紧——参考反量化同一 FP8 cache、残差仅为 bf16/fp16 尺度 kernel 误差（#53590）；XPU 更新 triton-xpu 3.8.0 shim layer 备后续 PyTorch 升级（#56014）。",
+    "sig-omni": "一条变更。`mm_device_do_normalize`（#50411）的 `input_norm` 只在 tower 外的 `_process_*_input` 应用，encoder cudagraph 路径直接调 `self.visual()` 导致归一化被跳过——未缩放的 uint8 像素进入视觉塔、embedding 静默错误，Qwen2.5-VL 视觉问答输出完全乱码（近乎全空白）；把 `input_norm` 所有权移入视觉塔 forward、对齐 eager 调用链后恢复正常描述（#55370）。",
+    "sig-quantization": "一条变更。DSpark 的 Markov head 需要从 W2 投影选行计算 draft 修正，量化 W2 的行为 packed NVFP4 值 + per-group/global scale、无法按稠密权重索引；新增 Triton gathered-row 反量化+bias kernel（CUDA BF16）、ModelOpt 加载在启用 draft top-k 时保留 packed 权重，保留 CPU/CUDA FP16/W4A16 的 dequantize/scatter 回退，解锁 `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark` 运行，top-k=512 相比关闭 TPS/user +3.3%~+3.7%（#55713）。",
+    "other": "一条变更：修复 `SupportsMRoPE.get_mrope_input_positions` docstring 的 griffe 缩进告警——`Returns:` 下的自由列表改写为 `llm_positions`/`mrope_position_delta` 两个命名返回值，与 `tuple[torch.Tensor, int]` 注解配对、文档渲染为规范返回表（#56112）。"
+  },
+  "commits": [
+    {
+      "sha": "41cffa9af0b7317d71838262004186b68e976773",
+      "comment": "**背景**：Rust 前端与 engine-core 间的张量元数据此前以字符串表示，`TensorKind` 与 `ScalarType` 两套表示重复，协议模态与 prompt-limit 键也散落多处。**方法**：以 `TensorDtype`、`NumpyDtype` 与共享 `WireArray<Dtype>` 强类型化替换字符串元数据，经 `Display`/`FromStr` serde 保留 Torch dtype 名与 NumPy 字节序描述符（prompt logprobs 兼容原生 Torch 名输入）；多模态降级与 logprobs 解码复用类型化元数据并内联存储校验、删除重复表示，协议模态与 prompt-limit 键统一于 `MmModality`（+453/-270、15 文件，为 #55047 的前置重构）。**效果**：聚焦套件 279 passed（含 18 个受影响序列化/logprobs 测试与 Python MessagePack 兼容性），clippy/rustfmt 通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端协议层 dtype/模态强类型化重构，属核心 API 前端范畴。",
+      "tags": ["refactor", "low-risk", "rust-frontend", "wire-dtype", "multimodal", "msgpack", "serde"],
+      "pr_number": 56174
+    },
+    {
+      "sha": "285cbce6bd0982f5936d729d3fa2ac310dfeca59",
+      "comment": "**背景**：Rust 侧统一/分裂输出解析器的名称解析不一致——如 Kimi K3 输出使用 `kimi_k3`，而引擎侧自动选择可能匹配 split registry 更宽泛的 `kimi` 模式；统一解析器此前还需在 `ToolParserRegistry`/`ReasoningParserRegistry` 里 `register_unified_dummy` 占位。**方法**：共享解析逻辑先查 `UnifiedParserRegistry` 再回退 split registry，统一/分裂选择跨输出解析、managed-engine 参数与 parser 元数据保持一致；统一解析器只在 `UnifiedParserRegistry` 注册一次、删除 dummy 注册（+129/-148、10 文件）。**效果**：45 项聚焦测试（parser 选择、Display 错误消息、名称校验、managed-engine 转发）通过，格式与提交钩子通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端输出解析器注册与选择逻辑修复，属核心范畴。",
+      "tags": ["bugfix", "low-risk", "rust-frontend", "parser-registry", "unified-parser", "kimi-k3"],
+      "pr_number": 56018
+    },
+    {
+      "sha": "978c22f54b3076ccd98becc9318011104451fec7",
+      "comment": "CI 变更：`.buildkite/scripts/xpu` 将 triton-xpu 3.8.0 shim layer 指针更新（+2/-2），该 shim 层供后续 PyTorch 升级使用；单处依赖指向变更，无运行时代码影响。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU CI 构建脚本的 triton shim 版本更新，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "xpu", "triton-xpu", "shim"],
+      "pr_number": 56014
+    },
+    {
+      "sha": "65f3fca5683b4c7d48906ff8b2fd44903ec5dba6",
+      "comment": "**背景**：`SeedOssParser` 自 `Qwen3Parser` 继承了 ChatML 轮次边界（`<|im_start|>`/`<|im_end|>`），但这两个 token 不在 Seed 词表中，#54089 引入的当前轮作用域在 Seed-OSS 上被静默禁用；且 #54089 的全部边界测试都在 thinking 开启下运行，边界回退的 CONTENT 分支未经验证。**方法**：以 `<seed:bos>`/`<seed:eos>` 覆写 `TURN_BOUNDARIES`（对照真实 `ByteDance-Seed/Seed-OSS-36B-Instruct` tokenizer 验证为单 token，id 0/2）；补 thinking 关闭的边界回退用例与启用态对照（+69/-7）。**效果**：H100 上 `test_seed_oss.py` 11 passed（含 3 个新轮次边界用例）、`test_qwen3_reasoning.py` 59 passed（含 2 个新回退用例）、全量 `tests/parser` 4091 passed。",
+      "sig": "sig-core",
+      "sig_reason": "Seed-OSS 推理解析器轮次边界修复，属核心解析器范畴。",
+      "tags": ["bugfix", "low-risk", "seed-oss", "reasoning-parser", "turn-boundary", "current-turn-scoping"],
+      "pr_number": 54264
+    },
+    {
+      "sha": "4ebf61ebda8dc8bf090bd4ee14d2855f694111b0",
+      "comment": "**背景**：Cohere Chat、Cohere Embed 与 Generative Scoring 三个端点接受任意大的 Python 整数 `priority`，到 MessagePack 序列化时才抛 `OverflowError`，而非在校验层返回客户端错误。**方法**：为三处请求模型补上 MessagePack int64 范围边界校验（+4/-2、3 文件）。**效果**：超限 `priority` 由校验拒绝（HTTP 400），合法值正常服务；51 项协议测试与手动 HTTP E2E（/v2/chat、/v2/embed、generative scoring，oversized 全部 400、valid 全部 200）验证通过。",
+      "sig": "sig-core",
+      "sig_reason": "Cohere 兼容端点的请求参数边界校验修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "cohere", "priority", "msgpack", "request-validation", "int64"],
+      "pr_number": 56146
+    },
+    {
+      "sha": "83252ea899c6538eaa0c1fb31f28a92c661bbffc",
+      "comment": "**背景**：MiniMax-M3 的稀疏注意力 indexer 打分与 top-k 路径此前基于 Triton BF16 实现，ROCm 上存在更优的 aiter kernel（aiter#4787）可用。**方法**：将 aiter indexer scoring 与 top-k kernel 集成进 MiniMax-M3 稀疏注意力路径（+1077/-58、6 文件，依赖 #52849 与 aiter#4787），配合 `VLLM_ROCM_USE_AITER` 系列环境变量、FP8 indexer KV（`--attention-config` 的 `indexer_kv_dtype`）与 SHUFFLE KV 布局、aiter MoE backend 运行；新增 `tests/kernels/attention` 回归覆盖。**效果**：相对 Triton BF16 基线，各并发下 TPUT/P90 TPOT/P90 ITL 均有提升（PR 附详细对比表），MXFP4 模型 TP4 服务验证可跑。",
+      "sig": "sig-model-performance",
+      "sig_reason": "MiniMax-M3 ROCm 稀疏注意力 aiter kernel 集成提速，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "rocm", "aiter", "minimax-m3", "sparse-attention", "indexer", "top-k", "fp8-kv"],
+      "pr_number": 52664
+    },
+    {
+      "sha": "6983a0883dc831d33ffa2713b955159894a350d7",
+      "comment": "**背景**：`test_tp2_ar_rms.py::test_tp2_ar_rms_fusions` 参数化膨胀到 64 组（4 模型/实现 × 4 attention backend × 2 custom-op 组合 × 2 graph partition 模式），每组新建 2-GPU 引擎，使 MI300 Distributed Compile 成为 AMD CI 长杆（build 12767 达 77.7 分钟）。**方法**：按 `inductor_graph_partition` 轴把该测试拆为两个 Buildkite step——`-k` 过滤 `inductor_partition`/`dynamo_partition` 参数化 id，两半不相交且完备（32+32，并集等于未过滤的 64）；`test_async_tp.py` 两侧都跑保持自包含；超时按实测 +20 分钟余量取 65 分钟、不再沿用未拆分任务的 95 分钟，第一步重命名为 (Inductor Partition) 保持对称（+22/-3）。**效果**：两 step 预计 ~44.5/~42.1 分钟（原 73.4–77.7 分钟），覆盖不变（64 中 48 passed、16 skipped 均为 Blackwell 专属 FLASHINFER 跳过）。",
+      "sig": "sig-ci",
+      "sig_reason": "AMD CI MI300 分布式编译长组按参数轴拆分，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "rocm", "mi300", "buildkite", "test-split", "distributed-compile", "graph-partition"],
+      "pr_number": 53602
+    },
+    {
+      "sha": "dcd544486b7f4672b3c2e60ea289f19d86cf355c",
+      "comment": "**背景**：#54917 让 Gemma 等模型不再计算冗余 K/V 投影，但 AITER attention 仍尝试切片那些缺失张量——`git bisect` 自 nightly 12674 定位该回归，曾击穿 build 12711 的 MI300/MI355 翻译服务器语音任务。**方法**：当某层只提供 Q 时，AITER attention 从共享 cache 读取 K/V（覆盖 prefill 与 chunked prefill）；gather workspace 按各 attention group 的 KV 维度分配、只 gather 新增 prefill/extend token（+220/-2、2 文件）。**效果**：18 个回归用例覆盖 NHD/SHUFFLE 布局、FP8 cache、滑窗与 cache 不可变性，翻译服务器语音任务恢复，后端共享 cache 支持回归。",
+      "sig": "sig-model-performance",
+      "sig_reason": "AITER attention 后端共享 KV prefill 回归修复，属 attention backend 范畴。",
+      "tags": ["bugfix", "medium-risk", "rocm", "aiter", "shared-kv", "prefill", "attention-backend", "gemma", "regression"],
+      "pr_number": 55887
+    },
+    {
+      "sha": "26fec6d183c3957ee4dc0022452c430e745dd20f",
+      "comment": "**背景**：Step-3.5-Flash 的 reasoning 解析器在 `</think>` 后还要多等一个额外 token（`_end_token_pending` 标志逐调用翻转），带来两个问题：think 结束后首 token 未受约束、结构化输出无法对其掩蔽；`is_reasoning_end*` 非纯函数——结构化输出会多次调用（`should_advance`、`_find_reasoning_end_index`），spec decode 下被拒 draft 或回放可能在错误 token 上把标志翻成 True，grammar rollback 无法撤销。**方法**：改用 `BaseThinkingReasoningParser`——见 `</think>` 即报告 reasoning 结束，`</think>` 前后换行修剪不变；使结束判定成为 token id 的纯函数（无状态、幂等）（+26/-91；PR 中 MTP `layer_types` 启动修复部分已剥离不在此提交）。**效果**：结构化输出可正确掩蔽 think 后首 token，spec decode 回放/拒绝场景判定安全；step3p5 解析测试更新通过。",
+      "sig": "sig-core",
+      "sig_reason": "Step-3.5 reasoning 解析器与结构化输出/spec decode 协同修复，属核心结构化输出范畴。",
+      "tags": ["bugfix", "medium-risk", "step3.5", "reasoning-parser", "structured-output", "spec-decode", "stateless-predicate"],
+      "pr_number": 53174
+    },
+    {
+      "sha": "8c87c333b84c85908b1d11f0044457692277c6f3",
+      "comment": "**背景**：flashinfer TRTLLM ragged prefill 存在性能回归（flashinfer#4928）：kernel 调用内部的检查引发 CUDA 同步，每次 kernel 调用都付出该代价。**方法**：跳过 kernel 调用内的检查、改在 MLA Prefill 元数据准备阶段每 forward 检查一次（+51/-4、6 文件），同步更新 docker/versions.json、requirements/cuda.txt 与 Dockerfile 中的 flashinfer 版本。**效果**：ISL=8k/OSL=128 下各并发吞吐较 main +0.7%~+4.5%（并发 16 时 26,085→27,271 tok/s）；agentic 轨迹回放较无检查基线的差距由 -3.24% 收敛至 -0.04%，P90 ITL 同步改善（如并发 8 由 15.87 ms 降回约 15.8 ms 水平）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "TRTLLM ragged prefill attention 路径性能回归修复，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "trtllm", "ragged-prefill", "flashinfer", "mla", "cuda-sync", "version-bump"],
+      "pr_number": 55499
+    },
+    {
+      "sha": "56d001faf0f53c72fcedbbdd77e5418f68fe7494",
+      "comment": "**背景**：部分 chat template（如 MiMo-V2.5）把 `message.content` 经宏参数（形如 `message_content`）传入宏内再循环，而 `_detect_content_format` 只识别直接循环 `message.content` 或循环名为 `content` 的变量，这类模板被误判为 `string` 而非 `openai` 内容格式（#53820）。**方法**：`vllm/renderers/hf.py` 追踪接收 `message.content` 实参的宏参数——在 AST 中定位宏定义、找到传入 `message.content` 的调用、记录对应参数名，循环检查时同时匹配这些已知宏参数；纯增量变更、既有检测路径不变（+118/-3）。**效果**：MiMo-V2.5 类模板正确检出 `openai` 格式，新增 6 项回归测试（直接循环、`content` 变量、宏参数等形态）全部通过。",
+      "sig": "sig-core",
+      "sig_reason": "HF chat template 渲染器内容格式检测修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "hf-renderer", "chat-template", "content-format", "jinja", "macro-parameter", "mimo-v2.5"],
+      "pr_number": 53824
+    },
+    {
+      "sha": "cce50657b742598a5b8874fc9fe3a94dc4344a14",
+      "comment": "CI 测试修复：`test_merged_column_fuser_supports_any_number_of_linears` 在 AMD CI 失败——`UnquantizedLinearMethod` 构造时绑定平台 GEMM，ROCm 上 forward 对测试的 CPU 张量调用 `vllm::rocm_unquantized_gemm` 抛 `NotImplementedError`。**方法**：monkeypatch `dispatch_unquantized_gemm` 改用 `default_unquantized_gemm`、移除不再需要的 `dispatch_cpu_unquantized_gemm` 调用，使测试与平台 GEMM 后端解耦、聚焦 merged-column fuser 行为本身（+6/-2）。**效果**：ROCm 上由 2 failed 转为 143 passed、2 skipped。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI 测试与平台 GEMM 后端解耦修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "ci", "rocm", "gemm", "merged-column-fuser", "cpu-tensors"],
+      "pr_number": 56130
+    },
+    {
+      "sha": "e8064a96d02db70ebc1ca922bc9aba967a654483",
+      "comment": "**背景**：`PPHandler.broadcast_drafts` 在 broadcast stream 上读取主流张量 `input_batch.idx_mapping` 却缺 `record_stream` 守卫——CUDA 缓存分配器可在 gather 仍在途时回收该块，回收后的索引越界触发 device-side assert（经 `pp_broadcast` watchdog 以 `CUDA error: device-side assert triggered` 杀死 EngineCore）；需 PP≥2 + drafter + 异步 launch 同时满足才复现，自 #50514 起隐匿（无 speculator 的 PP 运行不调 `broadcast_drafts`，`CUDA_LAUNCH_BLOCKING=1` 完全掩盖，最后 rank 每步释放 `idx_mapping` 不像 `receive` 那样暂存）。**方法**：为 `broadcast_drafts` 唯一漏掉的主流输入 `idx_mapping` 补 `record_stream(self.broadcast_stream)`（`draft_tokens` 为 `RequestStates` 持久缓冲无需处理），与下方 `broadcast` 采样 token 兄弟路径的既有做法对齐（+3/-1）。**效果**：gather 不再读到被回收内存，PP + 投机解码长跑不再偶发 device-side assert。",
+      "sig": "sig-core",
+      "sig_reason": "PP draft broadcast 的 CUDA 流内存安全修复（投机解码 + 流水并行触发路径），属核心 worker 范畴。",
+      "tags": ["bugfix", "low-risk", "pp", "spec-decode", "record-stream", "cuda-allocator", "broadcast"],
+      "pr_number": 55745
+    },
+    {
+      "sha": "c69d5d72a6018db6ff55efc66097d377c25828cc",
+      "comment": "CI 变更：MI355 Language Models (Standard) 任务超时由 40 上调至 60 分钟——#54695 曾把该任务从 180 分钟校准至 40，但套件在 mi355_1 上实跑约 44 分钟，Buildkite 会在最后一个测试中途取消；对齐 #55919 对 MI300 任务的同批修正（+1/-1）。",
+      "sig": "sig-ci",
+      "sig_reason": "AMD MI355 CI 任务超时调整，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "rocm", "mi355", "timeout", "buildkite"],
+      "pr_number": 56114
+    },
+    {
+      "sha": "3fb676bfad0f1c7099af6296983e739be3fe29cc",
+      "comment": "CI 测试修复：MoE 层测试硬编码 `torch.float8_e4m3fn`，在 ROCm 的 `float8_e4m3fnuz` 上失败（`kernels/moe/test_moe_layer.py::test_moe_layer_no_parallel`）。**方法**：改用 `current_platform.fp8_dtype()` 按平台取 dtype、以既有 `is_fp8()` 工具替换显式 dtype 判断，并为 `fp8.normalize_e4m3fn_to_e4m3fnuz` 补 mock override 兼容两条 import 路径（+11/-8、2 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "MoE 层测试的 ROCm FP8 dtype 兼容修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "ci", "rocm", "fp8", "e4m3fnuz", "moe"],
+      "pr_number": 56106
+    },
+    {
+      "sha": "a207d7ce1d0cc33121726a7189080a0fa40ebb4d",
+      "comment": "**背景**：LoRA adapter 此前可以在零 LoRA 权重应用的情况下成功激活，静默继续服务基座模型（#55193）——`--lora-target-modules` 配错时用户无从察觉。**方法**：`LoRAModelManager.activate_adapter()` 统计当前 worker 上成功的 `set_lora()` 调用数，为零时输出一次性 debug 日志（指明 adapter 名、提示请求可能使用基座模型、建议检查 `--lora-target-modules`）（+9/-0）；刻意选 debug 级而非 error/warning——PP/EP 下个别 worker 无本地 LoRA 权重是合法情形，激活与注册语义不变。**效果**：32 项 LoRA manager 测试通过，误配 target modules 可被日志发现。",
+      "sig": "sig-core",
+      "sig_reason": "LoRA 管理器静默零权重激活的可观测性修复，属核心范畴。",
+      "tags": ["bugfix", "low-risk", "lora", "observability", "model-manager", "debug-log", "target-modules"],
+      "pr_number": 55310
+    },
+    {
+      "sha": "22d95d1adc24d5834ec45bb697170a76cf4c9a95",
+      "comment": "**背景**：`mm_device_do_normalize`（#50411 引入）的 `self.input_norm` 只在 tower 外的 `_process_*_input` 应用，而 encoder cudagraph 路径（`encoder_cudagraph_forward`）直接调用 `self.visual()`，归一化被跳过——未缩放的 uint8 像素进入视觉塔、图像 embedding 静默错误，Qwen2.5-VL 视觉问答输出完全乱码（近乎全空白），引擎不崩溃故难以察觉。**方法**：把 `input_norm` 所有权移入视觉塔 forward、对齐 eager 模式调用链（eager：`embed_multimodal` -> `_process_*_input` -> `input_norm` -> `visual`；cudagraph：`cg_manager.execute` -> `visual`）（+28/-18、3 文件）。**效果**：开启 `--compilation-config.cudagraph_mm_encoder True` 的 Qwen2.5-VL-3B-Instruct 视觉问答恢复正常内容输出（main 上近乎全空白）。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态视觉输入归一化在 encoder cudagraph 下的正确性修复，属多模态模型范畴。",
+      "tags": ["bugfix", "medium-risk", "multimodal", "encoder-cudagraph", "input-normalization", "qwen2.5-vl", "vision-tower"],
+      "pr_number": 55370
+    },
+    {
+      "sha": "83fe99399ec0603b32393a14324b65c67ad04af2",
+      "comment": "**背景**：DSpark 的 Markov head 通过从 W2 投影选行计算 draft 修正；W2 被量化后行为 packed NVFP4 值 + per-group/global scale，无法像稠密权重那样直接索引使用——`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark` 的 draft top-k 因此不可运行或落入不兼容的稠密权重假设。**方法**：ModelOpt 加载后在启用 DSpark draft top-k 时保留 packed NVFP4 W2 权重与 scale；新增 Triton gathered-row 反量化+bias kernel（CUDA BF16），选中的行 gather 后反量化再进修正 matmul；保留 CPU 与 CUDA FP16/W4A16 的 dequantize/scatter 回退（+491/-3、4 文件）。**效果**：Nemotron 3.5 Lightning（DL=5）可运行量化 Markov head：top-k=512 相比关闭 TPS/user +3.3%（T=0）~+3.7%（T=1），5/5 请求零错误；gathered 路径 batch 1/2/4/8 配对测试通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "NVFP4 量化权重的 gathered 反量化投影支持 DSpark draft top-k，属量化范畴。",
+      "tags": ["feature", "low-risk", "nvfp4", "dspark", "spec-decode", "triton", "dequant", "markov-head", "nemotron"],
+      "pr_number": 55713
+    },
+    {
+      "sha": "af51d0ef03ecf62302b51e7ab3042b088449d6b5",
+      "comment": "**背景**：Pooling 请求选了 LoRA adapter 也确实以该 adapter 执行，但响应中 model 名仍是基座——`PoolingBaseServing._init_ctx` 在解析请求 adapter 之前就取了模型名，scoring 路径又独立地把 ctx 的模型名替换回基座。**方法**：先解析 adapter 再选定响应模型名，并在 score/rerank 响应构造中保持该名字（+2/-2），与 chat、completion、responses、generative-scoring 路径对齐。**效果**：pooling 响应元数据如实上报 adapter 名，mock 复现脚本验证修复前后行为翻转。",
+      "sig": "sig-core",
+      "sig_reason": "Pooling 服务路径 LoRA adapter 名上报修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "pooling", "lora", "response-metadata", "scoring", "rerank"],
+      "pr_number": 56004
+    },
+    {
+      "sha": "1454b7172796c00955ae32e3fe865b98b262855a",
+      "comment": "CI 测试修复：FA 与 unified-attention 的 FP8-KV 路径测试参考会对同一批 FP8 cache 张量做反量化，e4m3 舍入相互抵消、残差只是 bf16/fp16 尺度的 kernel 误差（毫位小数级），并非 fp8 尺度噪声——原 atol=0.15 松到抓不住有意义的回归；收紧对比容差（+20/-12、2 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "AITER FP8 KV kernel 测试容差收紧，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "ci", "rocm", "aiter", "fp8-kv", "tolerance"],
+      "pr_number": 53590
+    },
+    {
+      "sha": "42d76ee35a2ad2352fa4f58e2781ea607d0c39bd",
+      "comment": "文档修复：`SupportsMRoPE.get_mrope_input_positions` 的 `Returns:` 段以自由 bullet 列表记录返回值，折行相对该节缩进 6 空格（大于条目 4、小于续行 8），griffe 无法归类并告警；改写为 `llm_positions`/`mrope_position_delta` 两个命名返回值，与 `tuple[torch.Tensor, int]` 注解配对，文档渲染为规范返回表而非三个无类型条目（+3/-4）。该文件为 API reference 中此类告警的唯一来源；griffe.parse_google 全量解析无告警、pre-commit 通过。",
+      "sig": "other",
+      "sig_reason": "纯 docstring 文档告警修复，不属于任何特定 SIG。",
+      "tags": ["docs", "low-risk", "griffe", "docstring", "mrope", "api-reference"],
+      "pr_number": 56112
+    },
+    {
+      "sha": "719284fe158f1be8a9dd92953295fc9d49015730",
+      "comment": "**背景**：XD-RoPE 为原生 HunYuan-VL 实现而加，该模型已迁往 Transformers 建模后端，不再有任何 `SupportsXDRoPE` 实现——`uses_xdrope_dim` 只能返回 0、所有 XD-RoPE 分支不可达，误触检测的配置只会撞 `supports_xdrope` 断言而非运行；Transformers 上游也已把 `xdrope_section` 更名 `mrope_section`，两条路径仅差在 decode 是否加 position delta，带模型提供 delta 的 M-RoPE 完全覆盖 delta 恒为零的 XD-RoPE。**方法**：将 XD-RoPE 折叠进 M-RoPE 路径，`xdrope_section` 保留为 legacy alias 避免配置失配；位置 buffer 尺寸改为按模型 section 数推导而非硬编码 3——顺带修复 HunyuanOCR（#55140）四段 M-RoPE 撞 3 通道 buffer 的 `profile_run` 崩溃；`get_rope_index` 只传其签名接受的 grid 参数（`HunYuanVLModel` 无 `video_grid_thw` 也无 `**kwargs`）（+186/-505、18 文件，取代 #55436）。**效果**：净删约 319 行、消除不可达分支，HunyuanOCR 恢复可跑，legacy 配置不丢支持。",
+      "sig": "sig-core",
+      "sig_reason": "M-RoPE/XD-RoPE 位置编码核心统一与通道数推导，属核心范畴。",
+      "tags": ["refactor", "medium-risk", "mrope", "xdrope", "hunyuan-vl", "hunyuanocr", "cleanup", "position-encoding", "legacy-alias"],
+      "pr_number": 56078
+    }
+  ]
+}
