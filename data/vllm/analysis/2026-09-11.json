@@ -1,0 +1,153 @@
+{
+  "date": "2026-09-11",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-11T20:00:00+08:00",
+  "daily_summary": "9 月 11 日共 17 条提交。KV 传输与分离部署是当日主线：SimpleCPU offload 为混合模型加载细粒度外部前缀命中（消费显式边界 handoff、按各组物理块大小映射外部 token 区间，+982/-110），NIXL connector 支持混合 Mamba 模型（Kimi K3）对称 DCP + dspark 分离部署，ROCM_AITER_UNIFIED_ATTN 后端解锁 KV connector 支持。ROCm 性能与正确性并进：多流共享专家 decode 扩大启用并修复 wvSplitKrc 多流不安全与读回截断缺陷，新增 bpreshuffled blockscaled FP8 GEMM（DSv3 TP8+DPA +4-8% QPS），另有 TheRock 镜像 profiler 修复与 GLM-5.3-Flash MTP 稀疏 MLA dispatch 修复（曾致 GSM8K 0% 正确率，修复后 91.74%）。核心侧修复延迟 KV 释放下的零进展抢占级联、MRv2 解锁 KV 共享 fast-prefill、HF tokenizer 路径强制 mistral_format=False 摆脱 MistralCommonBackend 泄漏、Anthropic 流式 message_delta 显式携带 stop_sequence，并修复 scale_out 前端 EC 逐项校验、多模态缓存音频 UUID 恢复、XPU 混合模型 RMSNorm 前向（eager 吞吐 +25.4%）与 linear bias requires_grad 引发的 AITER dlpack 崩溃等。",
+  "sig_summaries": {
+    "sig-core": "八条变更。调度器修复延迟 KV 释放下的零进展抢占级联：新增 `_should_defer_request_block_free` 谓词统一判定，受害者释放被 fence 时本轮分配重试直接停止、不再空转移除请求（#49675）；MRv2（v2 model runner）解锁 KV 共享 fast-prefill——`FastPrefillHelper` 按步武装、logits 索引填充至 piecewise cudagraph 捕获尺寸，未武装步回退全 batch 元数据并删除不支持校验（#56145）；tokenizer 路径强制 `mistral_format=False`，`MistralCommonBackend` 不再泄漏进 HF processor 与结构化输出后端、删除兼容包装（#54192）；Anthropic `/v1/messages` 流式 message_delta 在非 stop-sequence 分支显式置 `stop_sequence=None`，`exclude_unset` 序列化不再丢必填可空字段（#55325）。前端与执行层：scale_out 前端 EC 参数改为逐 metadata 项校验，堵住全量项放行 metadata-only 项的漏洞（#56070）；XPU 为 Mixer2RMSNormGated/FusedRMSNormGated 补 forward_xpu（复用 in-tree Triton），Zamba2-1.2B eager 吞吐 +25.4%（#54968）；ROCm AITER 升级后 linear bias 因 `requires_grad=True` 触发 flydsl dlpack 导出 BufferError、gpt-oss GPQA 崩溃，bias 改为不要求梯度（#56161）；TheRock 镜像 profiler 因 rocm_sdk 预加载与 rocprofiler `find_clients` 时序交互丢失 GPU 事件，以 `RTLD_GLOBAL` 预加载 `libtorch_cpu.so` 规避（#56190）。",
+    "sig-large-scale-serving": "三条变更。SimpleCPU offload 支持混合模型细粒度外部前缀命中加载：对块表位置不稳定的 cache 组消费 KV cache manager 已发布的显式边界 handoff、跳过位置扫描，外部 token 区间按各组物理块大小映射并在请求结束存储 full-attention prompt 尾部，修复混合查找归零问题（#54736，+982/-110）；NIXL connector 支持混合 Mamba 模型（如 Kimi K3）对称 DCP + dspark 分离部署，`--cp-kv-cache-interleave-size` CLI 参数优先于自动转换、对称场景手动设 1，GB300 上 GSM8K 0.950（#55531）；ROCM_AITER_UNIFIED_ATTN 本为 block-first 布局却从 `ROCM_ATTN` 继承 KV connector 禁用，解除后经 MoRI、NIXL、DecodeBench 三类连接器在 MI300 Gemma4 FP8 上验证（#53695）。",
+    "sig-model-performance": "两条变更。ROCm 多流共享专家 decode 放宽启用门槛并按实测调优，定位原实现被回退的根因为 gfx950 skinny GEMM `wvSplitKrc` 静态 buffer 多流不安全——workspace 扩容 8 倍按流分槽、超额回退按需分配，并修复特定 GEMM 形状读回截断的静默错误与 `topk_topp_triton` buffer cache 未可靠清理问题（#56098）；新增 bpreshuffled blockscaled FP8 GEMM（形状与调优配置允许时激活），DSv3 1k/1k TP8+DPA +4-8% QPS、TP8+EP +0-4%，MLA decode o-proj 较 ck-tile 快逾 2 倍（#51692）。",
+    "sig-spec-decode": "一条变更。ROCm 稀疏 MLA 选择器把 `max_query_len > 1` 的 MTP 投机验证行排除在 Triton ragged 路径外、落入不兼容 AITER kernel，GLM-5.3-Flash 输出损坏、GSM8K 0% 正确率；改为对全部活跃 BF16 rope-free prefill/decode 行按几何特征选择 ragged 路径、FP8 行为不变，MTP5 恢复 91.74% 且运行时 153.1s 对无 MTP 的 173.0s（#55239）。",
+    "sig-omni": "一条变更。文档化的缓存音频请求（`input_audio` 载荷 null、仅带 uuid）此前在 chat 解析被拒或于缓存查找前撞 `assert_never`；保留 null 载荷与缺失项直至 processor cache 以 UUID 解析，缓存占位与新音频混排时保持位置、新音频仍走重采样与通道归一化（#56310）。",
+    "sig-ci": "一条变更。Naver 更新 `HyperCLOVAX-SEED-Think-32B` 移除 remote-code 改为原生 Transformers 支持，但 CI 所用 Transformers 版本不识别新 `hyperclovax_vision_v2` 配置、CPU 多模态 processor 测试构造 `ModelConfig` 即失败；将测试 registry 条目钉到最后兼容 revision，保持模型覆盖确定性（#56335）。",
+    "other": "一条变更：CPU 安装文档为带变量的 wheel URL 加引号——复制未加引号的命令会引入多余反斜杠、破坏 `${VLLM_VERSION}` 展开；加引号既保留正常 shell 展开又保证渲染后命令复制正确（#56286）。"
+  },
+  "commits": [
+    {
+      "sha": "07b75534651a0dd584c6f3be75d8c62fb8426397",
+      "comment": "**背景**：混合模型上 SimpleCPU offload 无法可靠服务细粒度外部前缀命中——Mamba `align` 模式会把内部状态置空并就地重排投机块，其块表无法由单调前进的位置游标解析；且 prompt 可能终止在哈希边界而非 full-attention 有效块边界，位置扫描只保留完整 attention 块，循环组与 full-attention 组边界不一致时混合查找归零。**方法**：对块表位置不稳定的 cache 组改为消费 KV cache manager 已发布的显式边界 handoff、跳过位置扫描（Mamba `all` 模式等追加型组保留扫描）；接受的 external token 区间按各组解析出的物理块大小映射（哈希块对齐、按组向上取整）；eager 存储覆盖对齐查找粒度而非截断到调度器块 LCM；启用细粒度命中时请求结束存储 full-attention prompt 尾部；lazy offload 禁用部分哈希命中保持调度器块对齐；丢弃同一步内已完成/被抢占请求的过期 handoff 并逐个记账；store 事件对同时贡献位置块与显式 Mamba 边界的请求 ID 去重（+982/-110、6 文件，堆叠于 #54735）。**效果**：混合模型上细粒度外部前缀命中可正确加载服务，PR 附 eager 模式 runtime 验证数据。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "SimpleCPU KV offload 细粒度前缀命中加载，属 KV 传输/大规模服务范畴。",
+      "tags": ["feature", "medium-risk", "simplecpu", "kv-offload", "hybrid-model", "mamba", "prefix-cache", "boundary-handoff"],
+      "pr_number": 54736
+    },
+    {
+      "sha": "828f4f19b4d8ea6a97a047409a90b563d166002f",
+      "comment": "**背景**：ROCm 稀疏 MLA 选择器仅将普通 BF16 rope-free decode 路由到 Triton ragged kernel，`max_query_len > 1` 或 `num_decode_tokens != num_decodes` 的 MTP 投机验证行被排除、落入不兼容的 AITER kernel，GLM-5.3-Flash 输出损坏、GSM8K 0% 正确率（issue #53943）。**方法**：对全部活跃 BF16 rope-free prefill 与 decode 行按几何特征选择 Triton ragged 稀疏 MLA 路径，FP8 dispatch 行为不变，并补多 token 投机验证形状的回归覆盖（+11/-5）。**效果**：4×MI355X TP=4 下 MTP5 由 0% 恢复 91.74%（eager 基线 91.13%、无 MTP 全图 90.67%），加权接受率 62.7%，运行时 153.1s 对无 MTP 的 173.0s；15 项聚焦单测通过。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "GLM-5.3-Flash MTP 投机验证行的稀疏 MLA dispatch 修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "sparse-mla", "mtp", "spec-decode", "glm-5.3-flash", "ragged"],
+      "pr_number": 55239
+    },
+    {
+      "sha": "84030bbe3d74d99bad477a3d2e37a973ccd8865c",
+      "comment": "**背景**：延迟释放（deferred free）开启时，running 请求分配重试存在一个零进展转移：被 FCFS/PRIORITY 选中的受害者若其 KV 释放尚被 fence（`last_sched_seq > processed_step_seq`），移除它也不会立刻增加可用块，调度器继续级联抢占毫无进展的请求（#49674）。**方法**：新增 `_should_defer_request_block_free` 谓词统一判定延迟释放条件，改动 running 队列前先作用于已选受害者——释放被 fence 则本轮分配重试直接停止，待输出处理推进 fence 后恢复正常抢占/分配路径；守卫的重试不做受害者移除、预算回滚、状态转移与抢占记账，#49206 的 victim_index 修正保留，关闭延迟释放时守卫禁用（+130/-27）。**效果**：消除零进展抢占级联；代价是可能留空一次调度的剩余额度（队头延迟/瞬时欠利用），为保持既有受害者顺序的显式取舍。",
+      "sig": "sig-core",
+      "sig_reason": "调度器分配重试的零进展抢占级联修复，属核心调度范畴。",
+      "tags": ["bugfix", "medium-risk", "scheduler", "preemption", "deferred-free", "kv-cache", "allocation-retry"],
+      "pr_number": 49675
+    },
+    {
+      "sha": "5b6cf93e8e229aa0901e8c152eba4511a6195d28",
+      "comment": "**背景**：`Mixer2RMSNormGated` 与 `FusedRMSNormGated` 只定义 forward_cuda、无 forward_xpu，XPU 上回退 forward_native；而两者 CUDA 路径调用的 in-tree Triton `rms_norm_gated` 本身可移植，XPU 可直接复用。**方法**：补 forward_xpu 走同一 Triton kernel（+23/-0），影响 FalconH1、GraniteMoeHybrid、Mamba2、Zamba2、KimiLinear、Kimi K3、BailingMoeV3 等混合架构（依 TP 与变体而定）；仅影响 eager 执行，TC 模式默认仍走 forward_native。**效果**：Zamba2-1.2B（B70、TP=1、bf16）eager 输出吞吐 305.4→383.1 tok/s（+25.4%），设备时间 -20.7%、kernel 启动次数 -34.3%，逼近 torch.compile 水平（391.5 tok/s）。",
+      "sig": "sig-core",
+      "sig_reason": "混合模型 RMSNorm 门控层的 XPU 前向补齐，属核心 kernel 层平台支持。",
+      "tags": ["feature", "low-risk", "xpu", "rmsnorm", "triton", "hybrid-model", "zamba2", "mamba"],
+      "pr_number": 54968
+    },
+    {
+      "sha": "a89de950a43896cfd97a3b7f051a8f0984ea6be0",
+      "comment": "CI 修复：Naver 将 `HyperCLOVAX-SEED-Think-32B` 更新为移除 remote-code、改 advertise 原生 Transformers 支持，但 vLLM CI 所用 Transformers 版本尚不识别新 `hyperclovax_vision_v2` 配置，CPU 多模态 processor 测试构造 `ModelConfig` 即失败；将测试 registry 条目钉到最后兼容 revision（+1/-0），在原生 Transformers 支持就绪前保持模型覆盖确定性。",
+      "sig": "sig-ci",
+      "sig_reason": "测试模型 registry revision 钉住以修复 CI 失败，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "hyperclovax", "model-registry", "revision-pin"],
+      "pr_number": 56335
+    },
+    {
+      "sha": "360f33f61ce02bda04bcb7ea876f1d2e5af8d06d",
+      "comment": "**背景**：`/v1/messages` 流式路径的终止 `message_delta` 事件在非 stop-sequence 分支不设置 `stop_sequence`，经 `model_dump_json(exclude_unset=True)` 序列化后该字段从线上消失——Anthropic schema 将其列为 `MessageDelta` 必填可空成员，做 schema 校验的代理会在答案完整送达后、距流结束一个事件处拒绝整条流；`end_turn`/`max_tokens`/`tool_use` 三种停止原因都走同一 else 分支（#55324）。**方法**：else 分支显式置 `stop_sequence=None` 使 `exclude_unset` 保留字段（与 `message_start` 构造器及 #45376 对 type/role 的同类处理一致），新增流式回归用例断言终止事件携带 end_turn 停止原因与显式 null 的 stop_sequence（+29/-1）。**效果**：schema 校验代理不再在流尾拒绝，转换测试全部通过。",
+      "sig": "sig-core",
+      "sig_reason": "Anthropic 兼容端点流式终止事件字段缺失修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "anthropic", "streaming", "message-delta", "stop-sequence", "exclude-unset", "schema-validation"],
+      "pr_number": 55325
+    },
+    {
+      "sha": "9163190dda009a310d8c175d63860ac7c671ca90",
+      "comment": "**背景**：#55099 改善 ROCm 多流性能后，多流共享专家 decode（#52033）带来收益的工况区间发生变化；且原实现（#48223）被回退的根因已定位为 gfx950 专用 skinny GEMM `wvSplitKrc` 的缺陷——其静态分配 workspace 可被两条以上流同时访问。**方法**：放宽并按实测调优多流共享专家 decode 的启用门槛；`wvSplitKrc` workspace 扩容 8 倍（每 buffer 7.5 MiB、共 60 MiB）按流分槽、流数超额时回退按需分配（安全但有开销），并覆盖 stream A 捕获、stream B 回放的情形；修复其特定 GEMM 形状下读回截断导致静默错误的潜在 bug 并重调 `CHUNKK`；顺带修复多流内存分配模式暴露的 `topk_topp_triton.py` buffer cache 未可靠清理、可能与 KV cache 分配同段而 pin 的问题（+369/-77、6 文件）。**效果**：多流共享专家 decode 在更多工况可用，PR 附调优后的性能数据。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm 多流共享专家 decode 调优与 wvSplitKrc 多流正确性修复，属模型性能范畴。",
+      "tags": ["perf", "medium-risk", "rocm", "multi-stream", "shared-experts", "wvsplitkrc", "skinny-gemm", "aiter", "buffer-cache"],
+      "pr_number": 56098
+    },
+    {
+      "sha": "ae71862c51f2e069998e0dd5dc30a03a3b475ab9",
+      "comment": "**背景**：scale_out token-in-token-out 的 `GenerateRequest` 只要任一 metadata 项带全量 `kwargs_data` 就接受无 `ec_transfer_params` 的请求——两图请求中第一张图的全量载荷可让仅 metadata 的第二张图绕过 EC 检查。**方法**：metadata 与 kwargs 槽位成对逐项检查，任一项有 metadata 而无全量 kwargs 即要求 EC 参数；两槽均为 `None` 的哈希缓存条目仍合法（+56/-6，与 render 元数据槽位对齐修复 #56069 相互独立）。**效果**：新增同模态/跨模态缺失 EC 用例由错误接受转为正确拒绝，修复前两个缺失 EC 用例被错误放行、修复后 26 项测试通过；A10 + Qwen3.5-0.8B 红蓝双图 HTTP 冒烟验证合法请求 200、第二图改 metadata-only 后按预期处理。",
+      "sig": "sig-core",
+      "sig_reason": "scale_out 前端多模态 EC 参数逐项校验修复，属核心 API 前端范畴。",
+      "tags": ["bugfix", "low-risk", "scale-out", "token-in-token-out", "ec-transfer", "multimodal", "request-validation"],
+      "pr_number": 56070
+    },
+    {
+      "sha": "a36dfc93cb1e4ca11425cfde48b5ed2264027aa2",
+      "comment": "**背景**：文档化的缓存音频请求（`input_audio` 载荷 null、仅带 uuid）在 chat 解析被当作缺失 type 拒绝；改传空对象虽过检但产生含 None 的 audio 列表、在缓存查找前就撞上音频解析器的 `assert_never`（与 #43414 修复的非空载荷提取互补，#55583/#55616 分别处理图像/视频与 URL 缓存键）。**方法**：保留 null 载荷与缺失音频项直至 processor cache 以 UUID 解析；缓存占位与新音频混排时保持位置，新音频仍走重采样与通道归一化，未知 UUID 仍报既有缓存未命中错误（+32/-5、4 文件）。**效果**：聚焦回归由 4 failed/6 passed 转 10 passed，解析模块 14 项、音频 chat 测试 9 项通过；Phi4 多模态 processor 的 sync/async 解析四种组合验证通过。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态缓存音频输入的 UUID 恢复修复，属多模态范畴。",
+      "tags": ["bugfix", "low-risk", "multimodal", "audio", "uuid", "processor-cache", "chat-parsing"],
+      "pr_number": 56310
+    },
+    {
+      "sha": "7de70fa7ae9fdda688257eed13639b56cc677fde",
+      "comment": "**背景**：#55968 将 ROCm AITER 升级到 v0.1.21.post2 后，gpt-oss-20b（quark-mxfp4-fp8-triton）GPQA 正确性测试崩溃——flydsl 的 jit_argument 对 bias 张量做 `__dlpack__` 导出时因 `requires_grad=True` 抛 `BufferError`，gpt-oss 模型大量 linear 层带 bias。**方法**：`ReplicatedLinear`/`ColumnParallelLinear`/`RowParallelLinear` 的 bias Parameter 以 `requires_grad=False` 创建（推理引擎 bias 无需梯度，+9/-4）；顺带将 MI355 Weight Loading Multi-GPU 任务超时 30→40 分钟。**效果**：ROCm 上该正确性测试失败消除，全量 AMD CI 无新回归。",
+      "sig": "sig-core",
+      "sig_reason": "linear 层 bias 创建的 requires_grad 修复 ROCm AITER dlpack 崩溃，属核心模型执行层范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "aiter", "linear-bias", "requires-grad", "dlpack", "flydsl"],
+      "pr_number": 56161
+    },
+    {
+      "sha": "48cb12c184e9b753c5de1c8ecab7953ded127b87",
+      "comment": "**背景**：ROCm 10（TheRock）镜像中 vLLM profiling 不可靠——TheRock 的 `rocm_sdk` wheel 在 `import torch` 时预加载 ROCm 库的方式与 `rocprofiler` 的 `find_clients`（一次性 static）存在微妙交互，部分模型（如 DeepSeek V4）的 trace 中没有任何 GPU 工作。**方法**：ROCm 上于 import 时尝试以 `RTLD_GLOBAL` 预加载导出 `rocprofiler_configure` 的 `libtorch_cpu.so` 作为规避（+74/-11，`vllm/env_override.py`）。**效果**：profiler 恢复捕获 GPU 工作，全量 AMD CI（build 12793）无新回归。",
+      "sig": "sig-core",
+      "sig_reason": "TheRock ROCm 镜像 profiler 环境预加载修复，属核心运行时环境范畴。",
+      "tags": ["bugfix", "low-risk", "rocm", "therock", "profiler", "rocprofiler", "rtld-global", "env-override"],
+      "pr_number": 56190
+    },
+    {
+      "sha": "7cdd9304ae2e46572f220741bf86e0b3c2da569c",
+      "comment": "**背景**：NIXL connector 在 DCP 分离部署下会自动把 `cp_kv_cache_interleave_size` 设为块大小，但既有 attention backend 不支持该值大于 1 时的 DCP + dspark，混合 Mamba 模型（如 Kimi K3）的对称 DCP 分离部署因此不可用。**方法**：让 CLI 参数 `--cp-kv-cache-interleave-size` 优先于自动转换，对称 DCP + dspark 分离部署手动设 1 即可运行（+31/-12、5 文件，涉及 parallel/vllm 配置、kv_transfer 与 engine arg_utils）。**效果**：GB300 上 DCP8+DCP8 + dspark 的 Kimi K3 GSM8K 准确率 0.950、316 output tok/s、无效响应率 0.001。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "混合 Mamba 模型对称 DCP 分离部署支持，属大规模服务范畴。",
+      "tags": ["feature", "low-risk", "dcp", "dspark", "disaggregated-prefill", "kv-connector", "nixl", "hybrid-mamba", "kimi-k3"],
+      "pr_number": 55531
+    },
+    {
+      "sha": "983b7e28c9f87c3a150081640e0fdeafec5d553a",
+      "comment": "**背景**：Transformers 已支持以 `mistral_format=False` 经标准 HF 后端加载 Mistral tokenizer，但 vLLM 的 tokenizer_mode 为 hf 的路径仍会让 `MistralCommonBackend` 到达 HF processor 与结构化输出后端，需要层层兼容包装（#50706，取代 #50752）。**方法**：HF 路径强制 `mistral_format=False`，删除 MistralCommonBackend 专属的 tokenizer 缓存、结构化输出处理与相关测试（净删 28 行）；显式 mistral 模式不变；对 HF 与 slow 模式显式拒绝冲突的 `mistral_format=True` 而非静默覆写（+129/-157、7 文件）。**效果**：registry 参数化测试 10 项通过，Mistral 系模型经 HF 后端加载不再走 MistralCommon 兼容层。",
+      "sig": "sig-core",
+      "sig_reason": "HF tokenizer 加载路径与 MistralCommonBackend 解耦，属核心 tokenizer 范畴。",
+      "tags": ["bugfix", "medium-risk", "tokenizer", "mistral", "hf-backend", "structured-output", "cleanup"],
+      "pr_number": 54192
+    },
+    {
+      "sha": "8359e15aae32dee9dc1f259a9b2574fb72b5507e",
+      "comment": "**背景**：`ROCM_AITER_UNIFIED_ATTN` 是 block-first 布局、本可安全支持 KV connector，但此前从 `ROCM_ATTN`（非 block-first 布局）继承了 False 的支持开关，分离部署下该后端不可用。**方法**：解除该继承禁用，使 ROCM_AITER_UNIFIED_ATTN 支持 KV connector（+154/-3、4 文件），并补 MoRI/NIXL connector 相关测试。**效果**：MI300X 上 Gemma4-31B FP8 + FP8 KV cache 分别以 MoRIIOConnector（xgmi 代理 + vllm-router PD 分离）、DecodeBenchConnector、NIXL connector 跑通 GSM8K 验证。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "ROCM_AITER_UNIFIED_ATTN 后端解锁 KV connector 支持，属大规模服务分离部署范畴。",
+      "tags": ["feature", "low-risk", "rocm", "aiter", "unified-attention", "kv-connector", "disaggregated-prefill", "mori", "nixl"],
+      "pr_number": 53695
+    },
+    {
+      "sha": "e6cb56337b49e606f55fde1870adbbb051e23f9f",
+      "comment": "**背景**：KV 共享 fast-prefill（共享 KV 层跳过 prefill token、只对 logits 索引跑缩减 batch，如 Gemma3n）此前在 MRv2（v2 model runner）上被显式标记为不支持。**方法**：`gpu/attn_utils.py` 新增 `FastPrefillHelper` 与 `FastPrefillBatchMetadata`，按步决定是否武装该路径（纯 decode 步、FULL cudagraph 模式或多 ubatch 步不启用），把 logits 索引复制进持久 buffer 并填充到捕获的 piecewise cudagraph 尺寸、尾部以 GPU 端广播填充避免上轮残留索引无效；model_runner/input_batch/ubatch_utils/model_states 接线；attention backend utils 在路径未武装时（如 cudagraph 捕获或纯 decode 步）回退全 batch 元数据（原为断言）；删除 VllmConfig 的不支持校验与 cache.py 相关注释（+233/-12、12 文件）。**效果**：MRv2 上 KV 共享 fast-prefill 可用，新增 attn_utils 单测并扩展 e2e `test_kv_sharing_fast_prefill` 覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "MRv2 model runner 解锁 KV 共享 fast-prefill 路径，属核心调度/执行范畴。",
+      "tags": ["feature", "medium-risk", "mrv2", "model-runner", "fast-prefill", "kv-sharing", "cudagraph", "logits-indices"],
+      "pr_number": 56145
+    },
+    {
+      "sha": "7470082f57a0245703be7482544f4b0fd410e1f2",
+      "comment": "**背景**：ROCm 上 DeepSeek 类 blockscaled FP8 模型的部分 GEMM 仍走较慢路径（如 MLA decode o-proj 的 ck-tile kernel，trace 中 52us）。**方法**：`vllm/_aiter_ops.py` 与 `model_executor/kernels` 新增 bpreshuffled blockscaled FP8 GEMM，形状允许且调优配置就绪时激活（+159/-5；当前需 `VLLM_ROCM_USE_AITER_FP8BMM=0` 规避 issue #51957）。**效果**：8×MI350 DSv3 1k/1k 下 TP8+DPA +4-8% QPS、TP8+EP +0-4% QPS，o-proj 21us 较 ck-tile 快逾 2 倍，GSM8K 精度验证通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm blockscaled FP8 GEMM kernel 性能优化，属模型性能范畴。",
+      "tags": ["perf", "low-risk", "rocm", "aiter", "fp8", "blockscaled-gemm", "bpreshuffled", "deepseek", "mla"],
+      "pr_number": 51692
+    },
+    {
+      "sha": "3078e7cbe1efb7dfcdeabceea9a6f890bc724976",
+      "comment": "文档修复：CPU 安装文档为带变量的 wheel URL 加引号——复制未加引号的命令会引入多余反斜杠、破坏 `${VLLM_VERSION}` 的正常展开；加引号既保留 shell 展开又保证渲染后的命令复制正确（+5/-5、3 文件），mkdocs 本地预览与复制验证通过。",
+      "sig": "other",
+      "sig_reason": "纯安装文档 URL 引号修复，不属于任何特定 SIG。",
+      "tags": ["docs", "low-risk", "installation", "wheel-url", "shell-quoting"],
+      "pr_number": 56286
+    }
+  ]
+}
