@@ -1,0 +1,144 @@
+{
+  "date": "2026-09-14",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-14T20:00:00+08:00",
+  "daily_summary": "9 月 14 日共 16 条提交，上下文并行（DCP/PCP）与 KV 传输连接器构成主线。DCP 侧删除稀疏 indexer 对 interleave>1 的九行守卫（整模型精度等价性留有免责说明）、修复 PCP gather 映射的 interleave 语义，NIXL 则把 TP1 PCP+DCP 的 KV 分片暴露为传输 rank 并保留各分片 rank 完成报告；MooncakeStore 大改（+381/-52）改为只按可前缀缓存组构建存储布局，修复 Qwen3.8-Flash-Next 的 QSA 环形缓存崩溃。ROCm 内核优化两条：gfx950 MiniMax-M3 解码 top-k 选择器短上下文工况改单 CTA（选择器耗时 -27%）、prefill 累计 KV 长度标量上传改 in-place device zero 消除主机阻塞。启动性能方面，Fast Start 快速加载器经 per-node daemon 扩展多节点 TP、mHC pre-norm warmup 并行编译提速 2.19x、Gemma 4 FA4 内核纳入统一 JIT warmup 契约、FP8 dummy 初始化去冗余转换。其余包括 DSV4.1 tokenizer 支持 Responses 文本类型、DSv4 MegaMoE + dspark 投机解码启动修复、EPD Python proxy 序列化优化（MUIRBench 吞吐 +51%），以及两条 CI 修复（XPU 测试依赖对齐、V2 QSA 测试 fixture 初始化 warmup registry）。",
+  "sig_summaries": {
+    "sig-core": "三条变更。Fast Start 快速加载器经 per-node daemon（每节点守护进程）扩展支持多节点张量并行部署（#55468）；DeepSeek V4.1 tokenizer 把 Responses API 的 `input_text`/`output_text` part 归一化为文本、修复 #56297，图像处理不变（#56299）；Gemma 4 de-JITification——新建 `FA4DenseAttentionKernel`（`VllmJitKernel` 子类、frozen dataclass 编译键）把 FA4 dense attention 纳入统一 warmup 契约，model runner 的 `init_attn_backend` 移入 `jit_warmup_registry.activate()` 上下文，使 metadata builder 选择的内核在启动期预热编译、替代运行时 JIT（#55768）。",
+    "sig-model-performance": "六条变更，DCP/PCP 上下文并行与 ROCm 内核各占其半。DCP/PCP 侧：删除 `DeepseekV32IndexerMetadataBuilder` 对 DCP + interleave>1 的九行守卫并附 TP1 注意力输出回归测试，但整模型精度等价性未确立（#55802）；PCP indexer KV gather 映射改用配置的 interleave，修复 interleave64 下 token 读错 key 的全局顺序错乱（#56715）。ROCm 侧：gfx950 MiniMax-M3 解码 top-k 选择器在 topk==16 且图容量不超过 128 块的短上下文工况改用单个 B128/C1 CTA、融合选择器+稀疏表耗时降 26.73-28.80%（#55235）；MiniMax-M3 prefill 累计 KV 长度初始化改 in-place device zero，消除 4 字节 `hipMemcpyWithStream` 的主机阻塞（#56170）。另有 mHC pre-norm JIT warmup 用 TileLang `par_compile()` 以至多 4 个编译 worker 并行编译，GB200 上九变体 95.03s→43.39s（#56683）；无 Triton 环境在 autotune 检查前直接返回 False，修复 Arm CPU 确定性导入崩溃（#56676）。",
+    "sig-large-scale-serving": "三条变更。MooncakeStore 只按可前缀缓存组构建 hash/store/lookup 布局——`KVCacheConfig` 新增 `prefix_cacheable_group_ids`/`prefix_cacheable_groups` 投影，QSA 环形 scratch 组（`prefix_cacheable=False`）不再触发只为可存储前缀组设计的整除检查，Mamba align 模式改由 `mamba_cache_mode == 'align'` 直接判定，修复 Qwen3.8-Flash-Next 崩溃（#55027，+381/-52）；NIXL 把 TP1 PCP+DCP 的 KV 分片暴露为传输 rank、`get_transfer_results()` 保留每个分片 PCP rank 的完成报告（#56645）；EPD Python proxy 改用既有 `msgspec` 依赖处理 JSON 请求与 E/P 元数据、最终响应字节直传，MUIRBench 吞吐 61.40→92.77 req/s（+51.09%）（#56657）。",
+    "sig-spec-decode": "一条变更：`SpeculativeConfig` 为 draft 模型构建的 `ParallelConfig` 此前不继承 `enable_expert_parallel`，DeepSeek V4 MegaMoE + dspark 投机解码尽管命令行已启用 EP 仍启动即报 `NotImplementedError`；draft 并行配置构造时补上该字段（一行修复），投机 + MegaMoE 配置可正常启动（#55914）。",
+    "sig-quantization": "一条变更：FP8 dummy 权重初始化去掉冗余转换——FP16 scratch 改用 `empty_like` 分配、填充后由 `param.copy_` 直接转换写入目标，省去读取将被覆盖的旧参数值与中间 FP8 分配拷贝；GB200 上 128Mi 元素 FP8 张量中位 GPU 时间 0.665ms→0.301ms、峰值 scratch 384MiB→256MiB，24 个用例新旧输出逐位一致（#56688）。",
+    "sig-ci": "两条变更：XPU 测试依赖与 `cuda.in` 对齐，修复 Intel CI 上 gpt-oss-20b 的 harmony/MCP 工具测试失败（#56704）；V2 QSA runner 测试 fixture 以 `__new__` 创建 `GPUModelRunner` 跳过了正常构造 `jit_warmup_registry` 的构造函数，#55768 让注意力后端初始化激活 registry 后测试提前失败，fixture 补初始化（#56707）。"
+  },
+  "commits": [
+    {
+      "sha": "52dd0d7562adb3c2d556ce6fe7ca7c3226e1976b",
+      "comment": "**背景**：Fast Start 快速加载器此前仅支持单节点，多节点张量并行（nnode>1）部署无法受益。**方法**：通过 per-node daemon（每节点守护进程）扩展 fast loader，使其覆盖多节点 TP 部署场景（+72/-14）。**效果**：多节点张量并行部署可走快速加载路径；PR 的测试计划与结果栏尚空缺。",
+      "sig": "sig-core",
+      "sig_reason": "模型加载器多节点支持扩展，属核心 model loader 范畴。",
+      "tags": ["feature", "medium-risk", "fast-start", "model-loader", "multi-node", "tensor-parallelism"],
+      "pr_number": 55468
+    },
+    {
+      "sha": "eb42686a30cddf325ffeff7b3bd5e3a7298c2c00",
+      "comment": "**背景**：DeepSeek V4.1 tokenizer 处理 Responses API 时未把 `input_text`/`output_text` part 当作文本归一化（#56297）。**方法**：把 Responses API 的 `input_text` 与 `output_text` part 归一化为 text，图像处理路径不变；新增测试断言 Responses 文本 part 与既有 `text` part 渲染一致（+19/-1、2 文件）。**效果**：32 项测试与 pre-commit 全过；不改变模型执行与输出精度。",
+      "sig": "sig-core",
+      "sig_reason": "DeepSeek V4.1 tokenizer 对 Responses API 文本类型的归一化修复，属核心前端范畴。",
+      "tags": ["bugfix", "low-risk", "deepseek-v4.1", "tokenizer", "responses-api", "frontend"],
+      "pr_number": 56299
+    },
+    {
+      "sha": "dfa1984e58dc898610a320de26f94b6039fccec3",
+      "comment": "**背景**：gfx950 上 MiniMax-M3 解码稀疏注意力的 top-k 选择器在短上下文工况（topk==16 且图容量不超过 128 个稀疏块）仍沿用 B512/C16 的大 CTA launch 配置，开销偏高。**方法**：该工况改用单个 B128/C1/W2/S1 CTA，更大容量、其他 top-k 取值与其他架构保持原策略不变；扩展选择器测试覆盖生产 74 块容量、128/129 派发边界、精确排序与 graph replay（+90/-48、2 文件）。**效果**：生产 8k1k 图容量下融合选择器+稀疏表耗时 4.138-4.440us→2.947-3.213us（降 26.73-28.80%），含 BF16 分数的全链路亦有 5.36-16.16% 改善；仅改 launch 几何，BF16 索引缓存、FP32 分数算术与确定性排序不变，与独立 CPU 全序参考逐位一致，121 项测试通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "gfx950 MiniMax-M3 解码 top-k 选择器 CTA 调优，属内核性能范畴。",
+      "tags": ["perf", "low-risk", "rocm", "gfx950", "minimax-m3", "top-k", "sparse-attention", "decode", "cta-tuning"],
+      "pr_number": 55235
+    },
+    {
+      "sha": "58d45fd767ff81229afd92543400f5c8c93f4000",
+      "comment": "**背景**：Qwen3.8-Flash-Next 开前缀缓存 + `MooncakeStoreConnector` 启动失败（#54726）——其 QSA 环形 scratch cache 可传输（`enable_kv_transfer=True`）但 `CircularBufferSpec.prefix_cacheable` 为 False、容量仅 4/8，MooncakeStore 却按全部可传输组构建 hash/store/lookup 布局，环形组撞上只为可存储前缀组（块大小 800）设计的整除检查；Mamba align 模式还以全局改写的 `cache_config.block_size` 推断，异构组下误判。**方法**：`KVCacheConfig` 新增 `prefix_cacheable_group_ids`/`prefix_cacheable_groups` 投影，`KVCacheBlocks.get_block_ids(group_ids=...)` 支持按组投影；MooncakeStore 的校验、协调器、调度器与 worker 张量注册全部只用可前缀缓存投影，保留调度器到 store 的组重映射（跳过 QSA 环而不偏移 store 组 ID）；Mamba 支持改为直接校验 `spec.mamba_cache_mode == 'align'`；`transfer_group_ids` 等传输投影有意不动，NIXL 等 P/D 连接器仍传输全部组（含 QSA 环）（+381/-52、11 文件）。**效果**：修复 #54726，非前缀缓存组不再进入 MooncakeStore 存储布局，异构组下 align 模式判定正确。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MooncakeStore KV 连接器按前缀可缓存组过滤布局的修复，属大规模 KV 传输范畴。",
+      "tags": ["bugfix", "medium-risk", "mooncake", "kv-connector", "prefix-cache", "qsa", "circular-buffer", "mamba", "kv-cache-config"],
+      "pr_number": 55027
+    },
+    {
+      "sha": "fe49665eb3b28283eb95d6fb143e5c6ea26c0923",
+      "comment": "CI 维护：XPU 测试依赖与 `cuda.in` 对齐，修复 Intel CI 上 gpt-oss-20b 的 harmony/MCP 工具相关测试失败（+23/-15、2 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU 测试依赖更新，属 CI 范畴。",
+      "tags": ["ci", "low-risk", "xpu", "test-requirements", "dependency-update"],
+      "pr_number": 56704
+    },
+    {
+      "sha": "3b533197a9419302987c12bcea5e4e06c9d40858",
+      "comment": "**背景**：DSV4.1 mHC pre-norm 的 JIT warmup 变体逐个串行编译，冷缓存下启动预热偏慢（GB200 上九个变体串行编译 95.03s）。**方法**：`VllmJitKernel` 新增 `compile_many()` 钩子（默认仍为串行），mHC 预热改用 TileLang `par_compile()` 以每进程至多 4 个编译 worker 并行编译缺失的 `MHCPreNormKernel` 变体；已缓存变体保留、重复键去重，TileLang 先串行展开模块再并行编译，注册键与运行时 dispatch 不变（+23/-4、2 文件）。**效果**：九个 DSV4.1 pre-norm 变体（hidden size 5120、hc_mult 4、三种输入/pre-mix 配置、split 1/4/16）编译 95.03s→43.39s（2.19x）；60 项 warmup 测试通过，GB200 上三组 GPU 参考/CUDA graph 回放用例（broadcast/identity/carried pre-mix）在批量预热后全部通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "mHC pre-norm JIT warmup 并行编译的启动提速，属内核 warmup 性能范畴。",
+      "tags": ["perf", "low-risk", "jit-warmup", "tilelang", "mhc", "deepseek-v4.1", "parallel-compile", "startup"],
+      "pr_number": 56683
+    },
+    {
+      "sha": "9f03b510c33575fe40c320b2d266a289e8a4b83a",
+      "comment": "**背景**：DeepSeek-V4-Pro 以 dspark 投机解码 + MegaMoE 启动即报 `NotImplementedError: DeepSeek V4 MegaMoE currently requires expert parallel`——`SpeculativeConfig` 为 draft 模型构建的 `ParallelConfig` 未继承目标模型的 `enable_expert_parallel`，尽管命令行已启用 EP，draft 侧校验仍视为未开启。**方法**：draft `ParallelConfig` 构造时补上 `enable_expert_parallel=target_parallel_config.enable_expert_parallel`（+1/-0）。**效果**：dspark 投机解码 + MegaMoE 配置可正常启动。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "投机解码 draft 并行配置丢失 expert parallel 设置的启动修复，属投机解码范畴。",
+      "tags": ["bugfix", "low-risk", "deepseek-v4", "megamoe", "spec-decode", "dspark", "expert-parallelism", "parallel-config"],
+      "pr_number": 55914
+    },
+    {
+      "sha": "319cc5ef19946d34c2e66cbbec5bda29d0bfa328",
+      "comment": "**背景**：EPD 分离部署的 Python proxy 对请求与 E/P 元数据做完整 JSON 编解码，最终响应还要先解码 SSE 文本再重新编码转发，序列化开销在高并发下成为吞吐瓶颈。**方法**：改用既有 `msgspec` 依赖处理 JSON 请求与 E/P 元数据，最终响应字节直接透传、不再 JSON 重编码或 SSE 文本解码；路由、重试与缓存键生成逻辑不变（+160/-25、2 文件）。**效果**：MUIRBench（Qwen3.5-35B-A3B，4E+4PD 双 GB200 节点、Mooncake RDMA、并发 96）吞吐 61.40→92.77 req/s（+51.09%）、平均延迟 -33.37%、P99 -40.45%、精度持平（+0.05pp）；6000/6000 请求成功，历史对照仅供参考。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EPD 分离部署 proxy 序列化开销优化，属大规模分离部署范畴。",
+      "tags": ["perf", "low-risk", "epd", "disaggregated-serving", "proxy", "msgspec", "serialization", "throughput"],
+      "pr_number": 56657
+    },
+    {
+      "sha": "b23433088bf29980d20dff1bd64c753dd8883506",
+      "comment": "**背景**：稀疏 indexer 此前直接拒绝 DCP + `cp_kv_cache_interleave_size > 1` 的组合（#46076 因当时 GSM8K 失败加入该守卫），DCP with NIXL（interleave 64）等配置无法使用；历史失败根因从未定位（#50005/#54908 两个相关缺陷修复已在本分支基底中）。**方法**：删除 `DeepseekV32IndexerMetadataBuilder` 中九行 interleave 守卫——该 builder 的 interleave/ownership 算术与模型身份、KV 传输连接器无关，无 GLM/NIXL 白名单；新增对完整未分片 TP1 KV 的注意力输出直接回归测试（+0/-9）。**效果**：DCP + interleave>1 配置可用；测试的注意力输出在既定 FP8 容差内一致，但整模型输出数值敏感、精度等价性未确立（三次受控 GSM8K 配对结果有高有低、不一致），后端与 MTP 兼容性检查保持不变，PR 对证据边界有明确免责说明。",
+      "sig": "sig-model-performance",
+      "sig_reason": "稀疏 indexer 移除 DCP interleave 限制并附注意力输出回归测试，属注意力/indexer 内核范畴。",
+      "tags": ["feature", "medium-risk", "dcp", "context-parallelism", "indexer", "interleave", "nixl", "attention", "accuracy-caveat"],
+      "pr_number": 55802
+    },
+    {
+      "sha": "186a1e62221c02cdf8ef0433eb4ad33d1b48c7f7",
+      "comment": "**背景**：Gemma 4 的 FA4 dense attention（`flash_attn_varlen_func`）此前未接入统一 JIT warmup 契约，内核变体在运行时按需 JIT 编译，冷启动后首批请求承担编译延迟。**方法**：新建 `FA4DenseAttentionKernel`（`VllmJitKernel` 子类），以 frozen dataclass CompileKey（q_stage/dtype/qhead_per_kvhead/head_dim/page_size/window 边界/softcap/单 batch/num_splits）归一化编译键，`compile_flash_attn_varlen_func_from_specs` 支持按 specs 预编译预热；model runner 的 `init_attn_backend` 移入 `jit_warmup_registry.activate()` 上下文执行，使 metadata builder 选择的注意力内核注册进启动期 warmup（+287/-27、4 文件）。**效果**：Gemma 4 FA4 内核在启动阶段完成预热编译、去除运行时 JIT；该改动顺带暴露 V2 QSA runner 测试 fixture 未初始化 registry 的问题（由同日 #56707 修复）。",
+      "sig": "sig-core",
+      "sig_reason": "Gemma 4 FA4 注意力内核接入统一 JIT warmup 契约，属核心注意力/warmup 基础设施范畴。",
+      "tags": ["refactor", "medium-risk", "gemma-4", "fa4", "flashattention", "jit-warmup", "warmup-registry", "de-jit"],
+      "pr_number": 55768
+    },
+    {
+      "sha": "586f652f8d9e841901c40634c024a2ebbfe3402f",
+      "comment": "**背景**：PCP 的 indexer KV gather 映射假设 interleave 为 1，DCP4/interleave64 下 token 1 会读到 token 64 的 key，gather 恢复的全局 token 顺序错乱。**方法**：把 gather 分片映射回 token 位置时改用配置的 interleave，并保证 padded gather 不越界；不引入新内核；与移除 interleave 限制的 #55802 相互独立、该守卫保持不变（+40/-13、2 文件）。**效果**：72 个排序用例（CPU、覆盖 interleave1/64、DCP2/4/8、短/边界上下文与拆分请求行）通过，回退旧算法则 36 个 interleave64 用例全部失败；GLM-5.2-NVFP4 PCP4+TP1+EP4+DCP4 → TP4 在 eager 与 CUDA graph 模式下 GPU 与 CPU offload 各 28/32 GSM8K、32 对 GPU/CPU 输出 token/logprob 完全一致，6155-token 检索用例通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "PCP indexer KV gather 映射的 interleave 语义修复，属注意力/indexer 内核范畴。",
+      "tags": ["bugfix", "medium-risk", "pcp", "dcp", "context-parallelism", "indexer", "kv-gather", "interleave", "ordering"],
+      "pr_number": 56715
+    },
+    {
+      "sha": "7fe8fc803d904795fd10b785776e20181aee64c5",
+      "comment": "**背景**：PCP+DCP 下 TP1 producer 的 KV 分片此前未作为 NIXL 传输 rank 暴露，分片 PCP 各 rank 的传输完成报告也无法完整送达消费方。**方法**：把 TP1 PCP+DCP 的 KV 分片暴露为 NIXL 传输 rank，`get_transfer_results()` 保留每个分片 PCP rank 的完成报告，复制的 PCP 仍只从 rank 0 报告；构建于已合并的 #56157、取代 #54496（+124/-44、13 文件）。**效果**：B300 上 18 项 PCP producer/拓扑测试（含 NCCL 初始化）通过、CPU 上 72 项 TP 映射/push 测试通过；修守卫前 4 个非零 PCP+DCP 用例全失败、之后 8 个全过。组合头 GLM-5.2-NVFP4 PCP4+TP1+EP4+DCP4 → TP4 在 eager 与图模式均通过（GPU/CPU offload 各 28/32 GSM8K）；PCP 需 `-cc.cudagraph_mode=PIECEWISE`（默认 FULL_AND_PIECEWISE 启动失败）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL 暴露 PCP+DCP KV 分片为传输 rank，属大规模 KV 传输范畴。",
+      "tags": ["feature", "medium-risk", "nixl", "pcp", "dcp", "kv-transfer", "transfer-ranks", "disaggregated-prefill", "tp-mapping"],
+      "pr_number": 56645
+    },
+    {
+      "sha": "71888f507ad5df5af2fae2ab39a6c1b0cc465eb1",
+      "comment": "**背景**：FP8 dummy 权重初始化先读旧参数值再转换回 FP8 目标，存在将被立即覆盖的读取与中间 FP8 分配拷贝；同日 #56682 漏掉该优化。**方法**：FP16 scratch 张量改用 `empty_like` 分配、填充后由 `param.copy_` 直接转换写入目标参数（+3/-4）。**效果**：GB200 上 128Mi 元素 FP8 张量中位 GPU 时间 0.665ms→0.301ms、峰值 scratch 分配 384MiB→256MiB（孤立初始化测量）；24 个用例（CPU/CUDA、FP8 E4M3/E5M2、连续/转置/strided、双种子）新旧输出完全一致，32 项 weight_utils 测试通过，真实权重加载与推理不受影响。",
+      "sig": "sig-quantization",
+      "sig_reason": "FP8 dummy 权重初始化的去冗余转换优化，属量化范畴。",
+      "tags": ["perf", "low-risk", "fp8", "dummy-weights", "weight-loading", "initialization", "memory-traffic"],
+      "pr_number": 56688
+    },
+    {
+      "sha": "b6e2aa748b2bef8d72f2003cd881a77ac47dcb57",
+      "comment": "CI 测试修复：`test_qsa_circular_group_uses_custom_slot_mapping` 的 fixture 以 `__new__` 创建 `GPUModelRunner`、跳过了正常构造 `jit_warmup_registry` 的构造函数，#55768 让注意力后端初始化激活 registry 后测试在到达块表/slot 映射断言前即失败（Buildkite #88652）；fixture 补初始化 registry（+2/-0），7 项测试通过、失败版本用例的原始断言恢复通过。",
+      "sig": "sig-ci",
+      "sig_reason": "V2 QSA runner 测试 fixture 初始化 warmup registry，属 CI 测试范畴。",
+      "tags": ["ci", "low-risk", "test-fixture", "jit-warmup-registry", "qsa", "gpu-model-runner", "v2"],
+      "pr_number": 56707
+    },
+    {
+      "sha": "dec0b5d63fc42dc1d1789caf572195c73dd86ea6",
+      "comment": "**背景**：Arm CPU 镜像正确禁用 Triton 并安装 `TritonPlaceholder`，但导入 `vllm.v1.spec_decode.utils` 会构造 warmup dispatcher，其 autotune 检查无条件解引用 `triton.runtime`，nightly #88612 的 Arm CPU shard 2/3 在 `jit_warmup_triton_helper.py:_is_autotuned` 处确定性 `AttributeError`（#56323 引入该检查的 PR 构建未跑到 Arm CPU shard）。**方法**：`HAS_TRITON` 为假时在 Triton autotune 检查前直接返回 False，运行时 dispatch 行为不变；新增回归测试以无 runtime 的占位对象替换 Triton 后构造并调用 dispatcher（+23/-1、2 文件）。**效果**：无 Triton 环境 `import vllm.v1.spec_decode.utils` 冒烟通过、新增单测通过；确切 Arm CPU CI 验证仍待完成。",
+      "sig": "sig-model-performance",
+      "sig_reason": "JIT warmup dispatcher 无 Triton 环境的导入崩溃修复，属内核 warmup 基础设施范畴。",
+      "tags": ["bugfix", "low-risk", "triton", "jit-warmup", "arm-cpu", "import-failure", "autotune"],
+      "pr_number": 56676
+    },
+    {
+      "sha": "f09c52a587f205963d3a2b8f1c42820a831ee4b0",
+      "comment": "**背景**：MiniMax M3 首个 prefill 的累计 KV 长度以 Python 标量赋值初始化，ROCm 上 PyTorch 将其降为 4 字节 `hipMemcpyWithStream`——计算流有排队工作时该 API 阻塞主机、延迟后续命令提交；TP4 混合恢复 trace 中每 rank 12 个 context 步共 12 次标量上传、累计 727-802ms 主机时间。**方法**：ROCm 上改用单元素 view 的 in-place device zero 入队初始化，保持流序且不阻塞主机；其他平台保留既有标量赋值（+4/-1）。**效果**：ROCm device-zero trace 中各 rank 该类调用归零（仍捕获 13 个 context 步）；两个 trace 窗口含不同调度批次，PR 不据此宣称端到端加速。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm MiniMax M3 prefill 元数据初始化的主机阻塞消除，属模型/内核性能范畴。",
+      "tags": ["perf", "low-risk", "rocm", "minimax-m3", "sparse-attention", "host-blocking", "hipmemcpy", "stream-ordering"],
+      "pr_number": 56170
+    }
+  ]
+}
