@@ -1,0 +1,87 @@
+{
+  "date": "2026-09-20",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-20T20:00:00+08:00",
+  "daily_summary": "周日轻量日，9 条提交全部为新增。主线一：Model Runner V2 补齐自定义 logits processors 能力（+1210/-505，32 文件），建立 V2 原生 LogitsProcessor 接口并从 V2 不支持 gate 移除该项，配置该能力不再静默回退 V1 runner。主线二为正确性双发：统一 SM90/SM100 的 `fp8_ds_mla` cache scale 契约（恒取 2 的幂，消除写入方与读取方 scale 转换不一致），以及 `sparse_attn_indexer` 对 ragged decode 批次的 reshape 崩溃修复（GB10 TP=2 实测）。性能侧 GLM-5 sparse indexer decode workspace 改按池化长度定尺寸，默认 1M 上下文节省 3072 MiB 显存。CI 侧 4 条测试修复集中于跨平台可移植性：两条 XPU UT 去 CUDA 硬编码、prefix-cache 命中率下限改为按解析块大小计算理论最优（消除平台取整伪影误报）、MoE reprocess 测试 mock 适配 #57405 内核重构。另有 recipes 一键部署脚本落地。后续关注 fp8 scale 契约统一对 SM90 存量输出数值的轻微扰动，以及 MRV2 大改的回归面。",
+  "sig_summaries": {
+    "sig-core": "两条变更，一修一建。`sparse_attn_indexer` 修复 ragged decode 批次崩溃：`requires_padding` 对 mixed/warmup 批次可能算出 False，非 padded 路径的 `num_decode_tokens // batch` 均分 reshape 在不能整除时直接崩溃（SM120/GB10 TP=2 实测 6 请求 8 token），现追加不可整除即走 padded 路径的严格安全超集条件，均匀批次保持快速路径、无性能变化。Model Runner V2 原生支持自定义 logits processors：以持久槽索引的单 `add_request()` 生命周期、冻结窄结构 `LogitsProcRequestState` 与每步批布局 `LogitsContext` 适配 V2 行不等于请求的批模型，内置 logit bias/penalties/bad words 采样状态同步采纳新接口，V1 路径字节级不变。",
+    "sig-quantization": "一条变更：统一 `fp8_ds_mla` cache scale 契约。此前 FP32 scale 字段可取任意值，而两个读取方转换不同（SM90 转 BF16、SM100 转 E8M0），任意值会让写入方与读取方使用不同 scale 造成量化不一致；现恒取 `2 ** ceil(log2(max(amax/448, 1e-4)))`，幂次值在两种转换下都精确存活，`1e-4` 下界对齐 FlashMLA UE8M0 参考余量。规则应用到原生 CUDA、DeepSeek-V3.2 融合 Triton、Kimi K3 三个写入方，656 字节条目物理布局不变；测试强制三路输出位级一致并实跑原生 writer 到 sparse FlashMLA reader 真实路径，GB300 全量验证通过。",
+    "sig-model-performance": "一条变更：GLM-5 sparse indexer decode workspace 按池化长度定尺寸。workspace 此前按原始 `max_model_len` 分配，而 indexer 实际以 `index_kpool` 池化后的长度工作；现改为 `max_pool_len = max_model_len // index_kpool` 并将参数更名正名语义，模型行为不变。默认 `1,048,576` 上下文下 workspace 缩小 4x、节省 3072 MiB GPU 显存，精度由既有单测覆盖并经不同模型长度 sweep 验证。",
+    "sig-ci": "四条测试修复，主题是跨平台可移植性与对重构的适应性。两条 XPU UT 去 CUDA 硬编码：`test_mnnvl_alltoall` 的设备与分布式后端选择改平台无关，`test_multiproc_executor` 改用 `device_control_env_var` 按平台限制可见设备；`test_prefix_cache_hit_rate` 的硬编码命中率下限（0.90/0.75 源自 GB200 544-token 块实测）在 XPU 576-token 块下理论最优仅 86.6% 而误报，改为从 `vllm:cache_config_info` 读解析块大小计算理论最优，消除取整伪影；`test_unquantized_flashinfer_trtllm_weights_can_be_reprocessed` 因 #57405 将 `process_weights_after_loading` 委托到 `moe_kernel.fused_experts` 而裸 `object()` 哨兵缺属性报错，换 `MagicMock` 吸收委托调用，恢复 H100/B200 两条红线。",
+    "other": "一条变更：`tools/recipes` 新增 `serve_with_recipe.sh` 一键部署入口，按 `--model`/`--hardware` 生成 `config.yml` 与 `env.sh`、自动为 Xeon 6 启用硬件检测、加载生成环境并以生成配置拉起 `vllm serve`；recipe 相关资产存于 `/vllm-workspace` 时从该目录启动，生成物保留在调用方工作目录。从 #56340 拆出、独立于 staged sweep 工作流，本地实测通过。"
+  },
+  "commits": [
+    {
+      "sha": "03f83013872015f6addb66954e2752d2d9bccd96",
+      "comment": "**背景**：用户拿到 vLLM Recipe 后需要手工完成配置生成、环境加载、再启动 `vllm serve` 多个步骤（本 PR 从 #56340 拆出，独立于 staged sweep 工作流）。**方法**：新增 `tools/recipes/serve_with_recipe.sh` 一键入口：按 `--model`/`--hardware` 生成 `config.yml` 与 `env.sh`，自动为 Xeon 6 启用硬件检测并加载生成环境；recipe 相关资产存于 `/vllm-workspace` 时从该目录启动，同时在调用方工作目录保留生成的输出文件，最后以生成配置拉起 `vllm serve`，配套 README（+65/-0，2 文件）。**效果**：从 Recipe 到服务启动缩短为一条命令，`bash -n` 语法检查与本地实际启动均验证通过。",
+      "sig": "other",
+      "sig_reason": "recipes 一键部署脚手架属用户工具资产，非任何运行时 SIG 领域。",
+      "tags": ["feature", "low-risk", "recipes", "deployment", "serving", "tooling"],
+      "pr_number": 57306
+    },
+    {
+      "sha": "1c3ef2ad4cabfbc2e5d74494b0b2bf8c3cb3f936",
+      "comment": "**背景**：`test_mnnvl_alltoall` 硬编码 CUDA 设备与分布式后端，XPU 等非 CUDA 设备上运行报错。**方法**：去除硬编码，改为平台无关的设备与分布式后端选择（+11/-3，2 文件）。**效果**：该 UT 在 XPU 设备上恢复通过。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU 平台 UT 设备与后端硬编码修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "xpu", "mnnvl", "alltoall", "distributed"],
+      "pr_number": 57591
+    },
+    {
+      "sha": "f4fc5aae7fea790e78bb2b5ed62f636dc20c71d8",
+      "comment": "**背景**：XPU 控制可见设备的标志与 CUDA 不同，`test_multiproc_executor_multi_node` 在 XPU 上因设备可见性控制方式不一致而失败（Node 1 failed）。**方法**：测试改用统一的 `device_control_env_var` 按平台限制可见设备（+11/-5）。**效果**：XPU 上该分布式 UT 报错消除。",
+      "sig": "sig-ci",
+      "sig_reason": "XPU 平台 UT 设备可见性控制修复，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "xpu", "device-control", "multiproc-executor", "distributed"],
+      "pr_number": 57581
+    },
+    {
+      "sha": "708c2495c0c6d0fc576224ecfc54efacc6414981",
+      "comment": "**背景**：`test_prefix_cache_hit_rate` 断言硬编码命中率下限 0.90/0.75，数值源自 GB200 实测（hybrid cache 解析为 544-token 块，base 3264 / MTP 2720 缓存 token）。但块大小在启动时由 mamba 状态大小除以每 token KV 大小、再向上取整到 attention 后端最小 kernel 块推导，是平台相关的：XPU 上同模型解析为 576-token 块，理论最优命中 `5*576=2880`（86.6%）仍低于 0.90 而误报失败——两个引擎都返回了最优值，差距纯粹是取整伪影，改 GPU、TP 或 KV dtype 都可能翻转结果，硬编码下限编码的是运气而非契约。**方法**：改为从引擎握手暴露的 `vllm:cache_config_info` 读取解析后的块大小（`block_size`/`mamba_block_size`），以 `round_down(已算前缀, scheduler_block_size)` 计算理论最优作为期望值；MTP 变体允许掉一个块（EAGLE prefill-lookahead drop）；并在 `.buildkite/intel_jobs/test-intel.yaml` 接入该测试（+53/-11）。**效果**：测试跨平台可移植，XPU 不再误报；纯测试变更不影响运行时。已知限制：第三个 KV cache group 会使真实 `scheduler_block_size` 大于此处推导（当前模型不受影响，经握手直接暴露留作后续）。",
+      "sig": "sig-ci",
+      "sig_reason": "prefix-cache 命中率测试改为按解析块大小计算理论最优，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "prefix-cache", "hit-rate", "hybrid-cache", "xpu", "buildkite"],
+      "pr_number": 57467
+    },
+    {
+      "sha": "a7fda4c88bfc421d31e33acc5e01e86ebe467ad8",
+      "comment": "**背景**：`fp8_ds_mla` 缓存条目中的 FP32 scale 字段此前可取任意值，但两个读取方的转换方式不同——SM90 FlashMLA 把 scale 转 BF16、SM100 转为 E8M0，任意 FP32 值无法在两种转换下同时精确存活，导致写入方量化用的 scale 与读取方使用的 scale 不一致的正确性问题。**方法**：统一 scale 契约为恒取 2 的幂：`2 ** ceil(log2(max(amax / 448, 1e-4)))`——幂次值经 BF16 与 E8M0 两种转换都精确不变；`1e-4` 下界对齐 FlashMLA UE8M0 参考余量，全零 tile 映射为 `2^-13`。656 字节物理条目布局不变（512 个 FP8 NoPE 值 + 4 个 FP32 scale 字段 + 128 字节 BF16 RoPE 尾部）；同一规则应用到全部三个写入方：原生 CUDA cache writer、DeepSeek-V3.2 融合 Triton writer、Kimi K3 共享 prefill/decode CUDA writer（+76/-38，8 文件）。**效果**：测试强制 native/Triton/Kimi 三路输出位级一致，并实跑原生 writer 到 sparse FlashMLA reader 的真实路径（reader 用定宽 `-1` padding 索引同时兼容 SM90 V3.2 与 SM100）；GB300/SM103 + CUDA 13.1 全量构建安装通过，聚焦测试 9 passed / 6 skipped，完整 sparse FlashMLA 测试文件通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "fp8 MLA KV cache scale 契约统一，属 FP8 量化 KV cache 范畴。",
+      "tags": ["bugfix", "medium-risk", "fp8", "mla", "flashmla", "sm100", "deepseek-v3.2", "kimi-k3", "kv-cache"],
+      "pr_number": 49435
+    },
+    {
+      "sha": "674b6d95d6d0bd63b44cae0abe2bf304328c73e9",
+      "comment": "**背景**：#57405 把 `process_weights_after_loading` 重构为委托到 `self.moe_kernel.fused_experts.process_weights_after_loading(layer)`，而测试 monkeypatch 的 `_init_moe_kernel` 仍装裸 `object()` 作哨兵 kernel，main 上 `test_unquantized_flashinfer_trtllm_weights_can_be_reprocessed` 全部 4 个参数化失败（`AttributeError: object 没有属性 fused_experts`）；受影响 lane 在该 PR CI 中被 block-gate 从未运行（选择泄漏）。**方法**：把裸 `object()` 哨兵换成 `MagicMock` 吸收委托调用；被测的 padding 清理逻辑仍在方法本身，断言不受影响（+3/-1）。**效果**：H100 FP8 MoE Kernels 与 B200 Kernels Shard 3 两条红线恢复。",
+      "sig": "sig-ci",
+      "sig_reason": "MoE reprocess 测试 mock 适配内核重构，属 CI 测试范畴。",
+      "tags": ["test", "low-risk", "moe", "flashinfer-trtllm", "mock", "ci-red"],
+      "pr_number": 57641
+    },
+    {
+      "sha": "36fa72d2d0d2f86c7c83e1e99c9012b7bd26463b",
+      "comment": "**背景**：GLM-5 sparse indexer 的 decode workspace 此前按原始 `max_model_len` 分配，而 indexer 实际以 `index_kpool` 池化后的长度工作，默认 `1,048,576` 上下文下 workspace 明显超配。**方法**：将 GLM indexer 参数更名 `max_model_len` → `max_pool_len` 以正名语义，并按池化长度定尺寸：`max_pool_len = max_model_len // index_kpool`，据此缩减 decode logits workspace，模型行为不变（+17/-17，3 文件）。**效果**：默认 1M 上下文下 workspace 缩小 4x、节省 3072 MiB GPU 显存；精度由既有单测覆盖，另对不同模型长度做了 sweep 验证。",
+      "sig": "sig-model-performance",
+      "sig_reason": "GLM-5 sparse indexer workspace 显存优化，属模型性能 sprint 范畴。",
+      "tags": ["performance", "medium-risk", "glm-5", "sparse-indexer", "memory", "workspace"],
+      "pr_number": 57701
+    },
+    {
+      "sha": "133b71e0beec3c7bcaae5b0839a03e7e88d20bc7",
+      "comment": "**背景**：`decode_metadata.requires_padding` 对 ragged 的 mixed/warmup decode 批次可能算出 False（SM120/GB10 TP=2 实测：6 个请求共 8 个 decode token），`sparse_attn_indexer` 的非 padded 路径随后做 `num_decode_tokens // batch` 的均分 reshape，token 数不能整除时直接崩溃；metadata 侧 `requires_padding = min_decode_len != max_decode_len` 的计算在 main 上未变，ragged 场景仍可达。**方法**：在路径选择上追加条件——`num_decode_tokens % decode_lens.shape[0] != 0` 时也走 padded 路径，是现有条件的严格安全超集，可整除批次保持快速路径（+15/-2）。**效果**：修复前 SM120 TP=2 warmup/混合 decode 批次 reshape 崩溃；修复后 2× DGX Spark (GB10) TP=2 服务 DeepSeek-V4-Flash-0731 稳定，均匀批次无性能变化。",
+      "sig": "sig-core",
+      "sig_reason": "sparse_attn_indexer 共享层 ragged 批次崩溃修复，属核心模型执行层范畴。",
+      "tags": ["bugfix", "medium-risk", "sparse-attn-indexer", "ragged-decode", "gb10", "deepseek-v4-flash"],
+      "pr_number": 52500
+    },
+    {
+      "sha": "5302d1fe40e6969b854e0ab288d34825653767c6",
+      "comment": "**背景**：自定义 logits processors 在 V1 已可用，但 Model Runner V2 的批模型（#47172）下不支持：该能力被列在 V2 不支持 gate 中，配置后要么静默回退 V1 runner、要么强制 V2 时硬报错；V2 每步重排并扩展 logits 行（行不等于请求）、槽位持久不复用，V1 接口无法直接平移。**方法**：为 V2 建原生接口：`vllm/v1/worker/gpu/sample/logits_processor/` 下新增 `LogitsProcessor` ABC，生命周期只有按持久槽索引的 `add_request()`（V2 槽位不搬移、已释放槽不被索引，add 侧覆盖即可，无需 BatchUpdate 台账与移除钩子）；`LogitsProcRequestState` 冻结窄结构只暴露 token 历史/设备/max_num_reqs/vocab_size，把 `RequestState` 挡在接口外；`LogitsContext` 传入每步批布局供 `apply()` 使用；V2 专属 loader 在加载时校验 entrypoint 插件与 FQCN 是否实现 V2 接口，拒绝 V1 接口处理器并给出明确报错而非采样中途崩溃；内置 sampler 状态（logit bias/penalties/bad words）采纳该接口——`add_request() -> bool` OR 进 `needs_logits_processing`，`apply_staged_writes()` 作为 host 暂存写的可选每步 flush 钩子；`validate_params` 移植为可选 classmethod、由活跃 model runner 在请求准入时分发（V1 路径字节级不变）；并从 V2 不支持 gate 移除该项，撰写 `docs/features/custom_logitsprocs.md`（+1210/-505，32 文件）。**效果**：自定义 logits processors 在 V2 原生可用、不再触发回退；既有采样阶段流水线顺序不变，自定义处理器运行在内置阶段之后、thinking-budget 强制与温度之前；相比 #47585 的 V1 桥接方案（每步 diff 行到请求的映射）避免逐步桥接开销。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 自定义 logits processors 接口与采样管线接入，属核心 model runner/sampler 范畴。",
+      "tags": ["feature", "high-risk", "mrv2", "logits-processors", "sampler", "sampling", "plugin-loader"],
+      "pr_number": 56497
+    }
+  ]
+}
