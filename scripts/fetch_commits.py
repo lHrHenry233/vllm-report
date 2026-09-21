@@ -323,8 +323,24 @@ def get_commit_detail_local(local_repo, sha):
         if lines[i].startswith("diff --git"):
             body_end = i
             break
-    message_lines = lines[body_start:body_end]
-    message = "\n".join(message_lines).strip()
+
+    # 单独调用只取 %B：`git show --stat --patch` 的输出会在 message 与补丁之间
+    # 插入 `---` 分隔符和整个 diffstat，若从同一份输出截取 message 会把 diffstat
+    # 混入 message 字段（前端展示成乱糟糟的“文件路径”竖排文本）
+    try:
+        msg_result = subprocess.run(
+            ["git", "show", "-s", "--format=%B", sha],
+            cwd=local_repo,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if msg_result.returncode == 0:
+            message = msg_result.stdout.strip()
+        else:
+            message = "\n".join(lines[body_start:body_end]).strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        message = "\n".join(lines[body_start:body_end]).strip()
 
     diff_start = None
     for i in range(body_end, len(lines)):
