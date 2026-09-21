@@ -1,0 +1,112 @@
+{
+  "date": "2026-09-21",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-21T20:00:00+08:00",
+  "daily_summary": "12 条提交全部为新增。DSv4.1 专项双发：ROCm 上启用 Engram 表 host pinned memory 卸载（TP=4 每 rank 释放 47.2 GiB 显存），mHC 系数生成与 attention/FFN 重叠令 ≤16 token 小 batch 前向最多提速 4.42%（TP4 实测）。正确性修复三条：MRV2 spec decode + DP 下 idle rank 的 dummy draft 经 stale block-table 行写入污染 prefix cache（GLM-5.2 上 MTP 接受率恒为零的根因）、sleep 期间 prefix-cache reset 失败不再被静默吞掉、XPU 进程看不到全量 world_size 时 reduce_scatterv 非均匀路径导致流式输出错乱。大规模服务侧 MoRIIO READ 模式扩展至 hybrid attention + Mamba/KDA 模型（+2746 行，recurrent 状态随 KV 迁移），为当日最大变更。另有跨 GPU/CPU/XPU 的 profiler 统一重构（吸收两个冲突 PR）、MI355 DPX CI 准备第一步、559 行死 kernel 代码清理与两条集成文档；关注 MoRIIO 新数据路径的回归面与 profiler 重构后的多轮采集行为。",
+  "sig_summaries": {
+    "sig-core": "三条变更，主题是平台统一与命名收尾。Profiler 完成 #56542 的 A+B+C 拆分：每轮重建一次性 torch profiler 对象修复多轮采集（#45987）、新增平台校验的 activities 配置、CUDA-only 时跳过 annotation 计算，GPU/CPU/XPU worker 逻辑统一且 RPC 签名不变，并吸收合并 #45992/#55751 两个冲突 PR。DSv4.1 Engram 表在 ROCm 上启用 host pinned memory 卸载：放宽两处 `is_cuda()` gate 复用 CUDA 既有 UVA 路径，TP=4 每 rank 释放 47.2 GiB 显存。另有 `--enable-mamba-fine-grained-prefix-cache` 更名为 `--enable-mamba-shared-prefix-checkpoint` 的机械收尾。",
+    "sig-large-scale-serving": "三条变更。MoRIIO READ 模式扩展至 hybrid attention + Mamba/KDA 模型（+2746 行）：recurrent conv/SSM 状态作为独立区域随 KV 迁移、producer 停在 `h(N-1)` 由 decode 重算末 token 推导 `h(N)`，范围刻意收窄为 READ、同构 TP、无 spec decode。sleep 期间 prefix-cache reset 失败改为立即抛出并经 pause Future 传播，不再带错入睡。XPU 修复 external LB DP 下进程看不到全量 world_size 时 `reduce_scatterv` 非均匀路径不可用导致的流式输出错乱。",
+    "sig-model-performance": "一优化一清理。DSv4.1 mHC 系数生成与 attention/FFN 重叠在 ≤16 token 小 batch 生效（TP4 实测 6 token 提速 4.42%、8 token 4.28%），能力判定泛化为 hidden width/hc_mult 通用条件并移除 H5120/hc4 特判，大 batch 与 draft layers 保持 native，79 个 GPU 测试覆盖输出一致性与 CUDA graph replay。清理 csrc 下 12 处共 559 行死 kernel 代码（cpu/sgl-kernels、moe、quantization、sampler 等）。",
+    "sig-spec-decode": "修复 MRV2 spec decode + data parallelism 下的 prefix cache 污染：idle DP rank 的 dummy batch 经 drafter 多步 decode 用 stale block-table 行算出真实 slot mapping，把 K/V 写进已注册进 prefix cache 的块——GLM-5.2（MTP k=5、DP=4 EP）实测 MTP 接受率恒为 0、出现 NaN 毒化行，`/reset_prefix_cache` 后消失。修复置于 `_compute_slot_mappings_kernel` 内：`idx_mapping < 0` 的行输出 `PAD_SLOT_ID` 不解引用负行（覆盖 CUDA graph 捕获内的融合多步路径），speculator 为 dummy 行统一标 -1。",
+    "sig-ci": "MI355 DPX CI 准备第一步：GPU teardown 等待的内存测量改用 `torch.cuda.mem_get_info`（HIP partition-scoped 逻辑设备，NPS2 下 ~144 GiB）替代 amdsmi 物理索引——后者在 DPX `gpu-0` 上报告的是父 MI350 卡（~288 GiB）并计入 sibling partition VRAM，导致 `_wait_for_gpu_memory_release` false-fail；ROCm teardown headroom 提至 4 GiB，HfRunner 内存检查不再经物理索引重映射。",
+    "other": "两条集成文档。Kthena 集成指南刷新至 v1.0.0：数字开头的 `405b` role 名被新 webhook 拒绝，改名 `llama-405b` 并同步 gang policy 与 pod 名，补上缺失的 Service 创建与清理步骤，manifest 经 dry-run 验证。EPD 分离文档新增 ECMooncakeConnector 使用示例：链接既有全流程集成脚本、给出可运行的 1E + 1PD 命令并说明默认模型与 TCP/RDMA 选择。"
+  },
+  "commits": [
+    {
+      "sha": "3918f3c5a3e389fb17d9c0d629811f3745014db0",
+      "comment": "**背景**：落实 #56542 提出的 profiler-core A+B+C 拆分：一次性 `torch.profiler.profile` 对象跨 profiling 轮次复用导致无法多轮采集（#45987），worker activities 不可配置，且普通 profiler 逻辑在 GPU/CPU/XPU worker 中重复实现。**方法**：每轮 profiling 重建一次性 torch profiler 对象（吸收 #45992 方案）；新增可配置且经平台校验的 worker activities，保留 CPU/CUDA/XPU 默认值（吸收 #55751 的 activity 字段并补齐平台校验）；CUDA-only torch profile 无法记录时跳过 worker annotation 计算；统一三平台 worker 的 profiler 逻辑与生命周期，profiling RPC/API 签名不变，CPU profiler 开始支持 `profile_prefix`（+408/-110，9 文件）。**效果**：合并了 #45992/#55751 两个冲突 PR 的工作并互相致谢；122 个 GPU profiler 测试与 2 个引擎级测试通过，手动验证 CUDA-only 配置下 `start_profile` 多轮采集正常。",
+      "sig": "sig-core",
+      "sig_reason": "Profiler 属引擎核心基础设施，跨 GPU/CPU/XPU worker 的统一归 sig-core。",
+      "tags": ["feature", "medium-risk", "profiler", "torch-profiler", "platform-unification"],
+      "pr_number": 57460
+    },
+    {
+      "sha": "6dfd87f59658eba0af0354418ca725c64ef1ed7d",
+      "comment": "**背景**：DeepSeek-V4.1-Flash 的 Engram n-gram 表是最大的单一显存消费者——TP=4 时每 rank 占 47.2 GiB，约达权重的三分之一；CUDA 侧已通过 pinned host memory + UVA 读取（#56512），但两处 `is_cuda()` gate 在 ROCm 上将其关闭，`engram_config` 保持 `None`、`amd/model.py` 回退到基础 `Engram`，表只能留在加速器上。**方法**：offload 路径本身无平台特定代码——`get_accelerator_view_from_cpu_tensor()` 已按 `is_cuda_alike()` 分发、`hipHostRegister` 支持注册 pinned host memory——故直接放宽两处 gate 并从 `..nvidia.engram` 导入 `Engram`（与 `amd/model.py` 既有导入 `DeepseekV41ModelState` 的做法一致），无新增 AMD 代码；`tests/kernels/test_engram.py` 的 `cpu_offload` 测试同步放宽（+20/-10，5 文件）。**效果**：ROCm 上 Engram 表迁入 host pinned memory，TP=4 每 rank 释放 47.2 GiB 显存；随导入到来的 `DPSharedEngramStorage` 与 DP head 分片在 `data_parallel_size=1` 下保持惰性；此前被同一 gate 阻塞的 #56757 磁盘 offload 路径在 ROCm 上也随之扫清前提。",
+      "sig": "sig-core",
+      "sig_reason": "Engram 表加载与 host offload 属 DeepSeek 模型执行核心路径，沿既有 engram 类提交归 sig-core。",
+      "tags": ["feature", "medium-risk", "rocm", "engram", "deepseek-v4.1", "host-memory-offload", "uva"],
+      "pr_number": 57491
+    },
+    {
+      "sha": "3e67044972939772ef6cd06957bf3199a41b5139",
+      "comment": "**背景**：Kthena 集成指南未跟上 v1.0.0：数字开头的 `405b` role 名被 v1.0.0 webhook 的命名规则拒绝。**方法**：改名 `llama-405b` 并同步匹配的 gang policy 与 pod 名，更新安装版本、对齐 Ray 命令示例，补上缺失的 Service 创建与清理步骤。**效果**：两份 manifest 经 `kubectl apply --dry-run=server` 验证通过，4 个测试 pod 就绪、worker DNS 解析与 API 请求（HTTP 200）正常。",
+      "sig": "other",
+      "sig_reason": "纯第三方集成文档更新，无运行时 SIG 归属。",
+      "tags": ["docs", "low-risk", "kthena", "integration-guide", "deployment"],
+      "pr_number": 57314
+    },
+    {
+      "sha": "11852548518b13c9a00a4e73dadd19d44e221e2b",
+      "comment": "**背景**：引擎 sleep/pause 时 prefix-cache reset 的结果从未被检查——即便 reset 失败也会继续清理 MM/encoder 缓存并进入 sleep，错误被静默吞掉。**方法**：`vllm/v1/engine/core.py` 立即检查 reset 结果并在失败时先行抛出，顺序上先于清 MM/encoder 缓存与 sleep；deferred pause 的 Future 改为在 finalization 失败时以异常完成、正常结束时以成功完成（+9/-4）。**效果**：失败的 reset 不再触发 executor sleep，暂停失败也不再用错误污染 idle 回调之外的路径；3 个 scheduler/connector 单测通过，5 项 mock 生命周期内联探针（同步/延迟 sleep 的成功与失败路径）全部通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV connector 的 cache reset 与分离式 sleep/pause 链路修复，属大规模服务范畴。",
+      "tags": ["bugfix", "low-risk", "kv-connector", "sleep-mode", "prefix-cache", "error-propagation"],
+      "pr_number": 54581
+    },
+    {
+      "sha": "7ddd461a284d2c318410f29110f1604028b961ee",
+      "comment": "**背景**：`disagg_encoder.md` 的 EPD（encoder-prefill-decode 分离）使用章节此前只描述 ExampleConnector，缺 Mooncake 方案的使用指引。**方法**：新增 ECMooncakeConnector 使用示例：链接既有全流程集成脚本、给出可运行的 1E + 1PD 命令，并说明默认模型、baseline 对比与 TCP/RDMA 选择（+22/-2）。**效果**：仅文档变更，已核对所引脚本存在且文档选项与脚本实现一致。",
+      "sig": "other",
+      "sig_reason": "纯文档补充，无运行时 SIG 归属。",
+      "tags": ["docs", "low-risk", "epd", "mooncake", "kv-connector", "disagg"],
+      "pr_number": 57742
+    },
+    {
+      "sha": "d2983f2f163249acbe3053c073cb9830290984a0",
+      "comment": "**背景**：Model Runner V2 speculative decoding 在 data parallelism 下存在 KV cache 污染：idle DP rank 的 dummy batch 会运行 drafter 的多步 decode，`_compute_slot_mappings_kernel` 通过 persistent per-slot block tables（`idx_mapping = arange(num_reqs)` 指向 stale 的真实请求槽位行）算出真实 slot mapping，将 drafter 层 K/V 写入最后占用该槽位的请求首块的 offset 1..k-1——这些块往往已注册进 prefix cache，此后命中它们的请求读到损坏的 drafter K/V（target 的 K/V 完好）。GLM-5.2（glm_moe_dsa、MTP k=5、DP=4 EP、prefix caching）实测为某段对话 MTP 接受率恒为 0（`p0=0.0000`、`acc_len=1.0`），`/reset_prefix_cache` 后消失，毒化行为 fp8 `0x7F`（NaN）；main 上该 stale 写入仍在每个 idle 步发生（值恰好有限才未爆雷）。#49757 只保护了读侧（dummy block tables 置零）与 target 侧（PAD slot mapping），未覆盖 kernel 直接读 persistent tables 的路径。**方法**：kernel 层修复——`idx_mapping < 0` 的行（dummy 或 CUDA-graph padding 请求）输出 `PAD_SLOT_ID` 且绝不解引用负的 block-table 行；守卫放在 kernel 而非 Python，因为融合多步路径会在捕获的 CUDA graph 内重跑 `compute_slot_mappings`；`AutoRegressiveSpeculator.propose(dummy_run=True)` 为所有 dummy 行标 `idx_mapping = -1`（沿用 speculator 对 padded 行的既有约定，`gumbel_sample` 本就忽略）（+56/-6，5 文件）。**效果**：idle 步不再产生 stale 写入，prefix cache 毒化根因消除，`tests/v1/worker` 同步补回归测试。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "speculative decoding drafter 多步 decode 的 dummy batch KV 写入修复，属 spec decode 范畴。",
+      "tags": ["bugfix", "medium-risk", "spec-decode", "mtp", "data-parallel", "kv-cache", "prefix-cache", "mrv2"],
+      "pr_number": 56734
+    },
+    {
+      "sha": "9b49f92344312c41ad61e05282c8e6a2d9bafb7f",
+      "comment": "**背景**：DeepSeek-V4.1 decoder 每个接缝需要生成 shifted mHC 系数，小 batch 下系数生成与 attention/FFN 计算串行执行，存在可重叠的空闲。**方法**：decoder 维持单一 post/pre 路径，由既有 mHC dispatcher 在 overlap 与 native 间选择，decoder 在消费系数前 join 系数流；能力判定 `supports_mhc_overlap` 泛化为通用条件——SM100/DeepGEMM、无 ubatching、hidden width 可被 64 整除、`hc_mult * (hc_mult + 2)` 为不超过 32 的正 8 倍数——并移除 H5120/hc4 精确特判与独立性能白名单，兼容的 TP/DP/PP/EP、attention 后端与 LoRA 配置共用同一 token cutoff；大 batch、draft layers、piecewise/breakable graphs 保持 native 执行，split-kernel warmup 同受 cutoff 约束；选择基于捕获的 token 形状而非实际 KV 长度（+357/-46，6 文件）。**效果**：cutoff 由 TP4 成对全前向实测（三次采样）定为 16 tokens：1 token 快 1.49%（4.763→4.692ms）、6 token 快 4.42%（6.204→5.929ms）、8 token 快 4.28%、16 token 快 1.12%，24 token 起无稳定收益故保持 native；79 个 GPU 测试通过，覆盖 `(hidden_size, hc_mult)` = (4096,2)/(5120,4) 的输出精确一致性与变输入 CUDA graph replay。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSv4.1 mHC kernel 重叠优化，沿既有 mHC 类提交归模型性能范畴。",
+      "tags": ["performance", "medium-risk", "mhc", "deepseek-v4.1", "kernel-overlap", "sm100", "small-batch"],
+      "pr_number": 57603
+    },
+    {
+      "sha": "17e50b9b761023d5f2499f062507df1ff49092a4",
+      "comment": "**背景**：当 DP 进程看不到 group 内全部设备时（如 external load-balancer DP 场景），`XpuCommunicator.reduce_scatterv` 走的非均匀 `reduce_scatter` 不受支持，`test_external_lb_dp.py` 出现流式与非流式输出不一致（`NCCL_CUMEM_HOST_ENABLE=0 TP_SIZE=1 DP_SIZE=2` 跑 PowerMoE-3b 复现：'PictureContinue...' != 'PictureıFallıdw'）。**方法**：`reduce_scatterv` 改为三分支——sizes 为 None 或均匀时直接 `reduce_scatter_tensor`；`torch.xpu.device_count() < world_size` 时先把各 rank 不均匀的 split pad 到 max_size 组成均匀张量，走 `reduce_scatter_tensor` 再截断回 chunk_size；其余情况维持原 `reduce_scatter`（+16/-4）。**效果**：external LB DP UT 的流式输出与非流式恢复一致。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "external LB DP 场景的分布式通信修复（data parallelism），属大规模服务范畴。",
+      "tags": ["bugfix", "medium-risk", "xpu", "data-parallel", "reduce-scatter", "distributed", "external-lb"],
+      "pr_number": 57779
+    },
+    {
+      "sha": "96791737887224c8bfec0a791517759f62e4d93b",
+      "comment": "**背景**：MoRIIO READ 模式 PD 分离此前只迁移 attention KV，hybrid attention + Mamba/KDA 模型的 recurrent conv 与 SSM 状态不随 KV 移动的话，decode 只能从空状态起步，分离部署对这类模型不可用。**方法**：三个 commit 分层落地（+2746/-184，11 文件）：①完成语义——等待属于一个请求的全部 transfer status；②内存注册——packed conv/SSM 状态作为独立 MoRIIO 区域注册寻址；③READ 数据路径——per-group state block IDs 贯穿调度并发出 KDA READ。关键约束：支持单个可传输 attention group；多个等价 Mamba group 在既有 block-ID payload 中分开保存、各 KDA 层自选 group（不拍平）；packed `[B,1,1,C]` 字节页按与 `MambaBase.bind_kv_cache` 相同的 squeeze→slice→view 契约解包，块在共享多层分配内跨 stride 时保持零拷贝；producer 停在 `h(N-1)`、decode 重算最后一个 prompt token 推导 `h(N)`，即使 attention 全本地命中也传输 recurrent 状态；KDA conv 与 SSM read 都在 forward 前完成；decode 分配前中止的 READ 释放 producer 块而不开 session、不发 RDMA；不支持的 WRITE、spec decode、异构 TP、不兼容 Mamba spec 与非法 packed 布局一律显式报错；router 协议不变。**效果**：MoRIIO READ 模式支持 hybrid attention + Mamba/KDA（同构 prefill/decode TP），MI355X 上 ROCm + mori 聚焦套件通过；hybrid WRITE 与异构 TP recurrent-state relayout 留作后续。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MoRIIO PD 分离 KV 传输扩展至 hybrid Mamba/KDA，属大规模服务范畴。",
+      "tags": ["feature", "high-risk", "mori-io", "kv-connector", "mamba", "kda", "hybrid-attention", "pd-disaggregation", "read-mode"],
+      "pr_number": 51052
+    },
+    {
+      "sha": "01f1f58f10c616850a5f5ade129a7b58d62075fb",
+      "comment": "**背景**：amdsmi 在 DPX `gpu-0` 上报告的是父 MI350 卡（~288 GiB）并计入 sibling partition 的 VRAM，`_wait_for_gpu_memory_release` 因此 false-fail；而 HIP 逻辑设备是 partition-scoped 的（NPS2 下 ~144 GiB）。**方法**：ROCm 上 GPU teardown/idle 内存改用 `torch.cuda.mem_get_info`（HIP 逻辑设备）测量，替代 amdsmi 物理索引；ROCm teardown headroom 提至 4 GiB 以匹配已知驱动/运行时驻留；不再在已使用 HIP 设备的路径上经 `get_physical_device_indices` 重映射 HfRunner 内存检查（+56/-53，4 文件）。**效果**：DPX 上 teardown 等待看到的是 partition 内存而非父卡内存；本 PR 是启用 MI355 DPX CI job 系列的第 1 个。",
+      "sig": "sig-ci",
+      "sig_reason": "ROCm CI teardown 内存测量修复，属 CI 测试基建范畴。",
+      "tags": ["ci", "low-risk", "rocm", "dpx", "mi355", "gpu-teardown", "hip"],
+      "pr_number": 57450
+    },
+    {
+      "sha": "4868312128172a424a7cf4c90f25c53b49186346",
+      "comment": "**背景**：csrc 下存在已无调用方的死 kernel 代码。**方法**：清理 cpu/sgl-kernels、`cuda_vec_utils.cuh`、moe、quantization、`sampler.cu`、w8a8 等 12 处共 559 行（+4/-559）。**效果**：纯删除、无行为变化。",
+      "sig": "sig-model-performance",
+      "sig_reason": "csrc kernel 死代码清理，属模型性能领域的 kernel 维护。",
+      "tags": ["refactor", "low-risk", "dead-code", "kernels", "cleanup"],
+      "pr_number": 57621
+    },
+    {
+      "sha": "49ee12d742b4a5524d2a3a3ee6c3fb77e4913073",
+      "comment": "**背景**：#53945 合入的 `--enable-mamba-fine-grained-prefix-cache` 命名不准确，维护者要求更名收尾。**方法**：flag 及内部字段整体更名为 `--enable-mamba-shared-prefix-checkpoint`（`enable_mamba_shared_prefix_checkpoint`），同步更新文档、5 个测试文件、`CacheConfig`、`arg_utils` 与 `v1/core` 的 kv_cache_manager/scheduler/single_type_kv_cache_manager（+38/-38，10 文件）。**效果**：纯机械更名、无行为变化；旧 flag 名移除，使用旧名的脚本需同步更新。",
+      "sig": "sig-core",
+      "sig_reason": "prefix cache 配置项更名，属核心 config/调度范畴。",
+      "tags": ["refactor", "low-risk", "prefix-cache", "mamba", "cli-flag", "rename", "breaking-change"],
+      "pr_number": 57382
+    }
+  ]
+}

@@ -2,11 +2,13 @@
   "date": "2026-09-20",
   "repo": "vllm-project/vllm",
   "generated_at": "2026-09-20T20:00:00+08:00",
-  "daily_summary": "周日轻量日，9 条提交全部为新增。主线一：Model Runner V2 补齐自定义 logits processors 能力（+1210/-505，32 文件），建立 V2 原生 LogitsProcessor 接口并从 V2 不支持 gate 移除该项，配置该能力不再静默回退 V1 runner。主线二为正确性双发：统一 SM90/SM100 的 `fp8_ds_mla` cache scale 契约（恒取 2 的幂，消除写入方与读取方 scale 转换不一致），以及 `sparse_attn_indexer` 对 ragged decode 批次的 reshape 崩溃修复（GB10 TP=2 实测）。性能侧 GLM-5 sparse indexer decode workspace 改按池化长度定尺寸，默认 1M 上下文节省 3072 MiB 显存。CI 侧 4 条测试修复集中于跨平台可移植性：两条 XPU UT 去 CUDA 硬编码、prefix-cache 命中率下限改为按解析块大小计算理论最优（消除平台取整伪影误报）、MoE reprocess 测试 mock 适配 #57405 内核重构。另有 recipes 一键部署脚本落地。后续关注 fp8 scale 契约统一对 SM90 存量输出数值的轻微扰动，以及 MRV2 大改的回归面。",
+  "daily_summary": "周日 28 条提交，规模远超常态轻量日。主线一为 GLM sparse-MLA 栈五连发：NVIDIA prefill tail-seed kernel 改按 padded indexer stride 寻址，修复把 K/gate 行写进他人 indexer block 的静默缓存损坏（表现为长寿命系统提示损坏）；kpool tail slot mapping 由 12 次 kernel 启动、约 250 us CPU enqueue 的 torch op 链融合为单 Triton kernel；kpool top-k 接入共享 SparseIndexerTopk 分发器；SimpleCPUOffload 跳过非 prefix-cacheable 组修复 GLM-5.3-Flash 引擎死亡；GLM-5 indexer decode workspace 按池化长度定尺寸省 3072 MiB。主线二为量化五条：Humming 大集成（+2038/-1084）补齐 Hadamard 在线量化、SM120/SM121 NVFP4/MXFP4/MXFP8 与统一 process_input 融合 kernel，checkpoint 输入量化设置开始生效（存量 WNA16 行为需显式配置保留）；Marlin/Humming workspace 收归 WorkspaceManager 共享，止住持久显存随层数增长；MiMo V2 mxfp4 MoE + bf16 router；ROCm DSV4 FP8 WO_A（TTFT -7.35%）；fp8_ds_mla cache scale 契约统一。MRV2 侧自定义 logits processors 落地（+1210/-505）并修复 capture 路径 intermediate_tensors 缺键；性能面另有 DSV4.1-Flash 视觉编码器 CUDA graph 化、CPU Arm paged attention 重构（最高 +25%）、DSv4.1 topk 跨层复用（decode GPU 时间约 -1.8%）与 diffusion prefill logit 行数修正。其余为 MM 展开后 prompt 上限、sparse_attn_indexer ragged decode 崩溃、DiffusionGemma dtype、XPU GDN 日志等正确性杂修，generate API 透出 spec decode 指标、EPD proxy 动态注册、Voyage embedding LoRA、4 条 CI 测试修复与 recipes 一键部署。后续关注 Humming 默认 schema 回退对存量 WNA16 部署的影响、fp8 scale 契约对 SM90 数值的轻微扰动，以及 GLM kpool 系列与 MRV2 大改的回归面。",
   "sig_summaries": {
-    "sig-core": "两条变更，一修一建。`sparse_attn_indexer` 修复 ragged decode 批次崩溃：`requires_padding` 对 mixed/warmup 批次可能算出 False，非 padded 路径的 `num_decode_tokens // batch` 均分 reshape 在不能整除时直接崩溃（SM120/GB10 TP=2 实测 6 请求 8 token），现追加不可整除即走 padded 路径的严格安全超集条件，均匀批次保持快速路径、无性能变化。Model Runner V2 原生支持自定义 logits processors：以持久槽索引的单 `add_request()` 生命周期、冻结窄结构 `LogitsProcRequestState` 与每步批布局 `LogitsContext` 适配 V2 行不等于请求的批模型，内置 logit bias/penalties/bad words 采样状态同步采纳新接口，V1 路径字节级不变。",
-    "sig-quantization": "一条变更：统一 `fp8_ds_mla` cache scale 契约。此前 FP32 scale 字段可取任意值，而两个读取方转换不同（SM90 转 BF16、SM100 转 E8M0），任意值会让写入方与读取方使用不同 scale 造成量化不一致；现恒取 `2 ** ceil(log2(max(amax/448, 1e-4)))`，幂次值在两种转换下都精确存活，`1e-4` 下界对齐 FlashMLA UE8M0 参考余量。规则应用到原生 CUDA、DeepSeek-V3.2 融合 Triton、Kimi K3 三个写入方，656 字节条目物理布局不变；测试强制三路输出位级一致并实跑原生 writer 到 sparse FlashMLA reader 真实路径，GB300 全量验证通过。",
-    "sig-model-performance": "一条变更：GLM-5 sparse indexer decode workspace 按池化长度定尺寸。workspace 此前按原始 `max_model_len` 分配，而 indexer 实际以 `index_kpool` 池化后的长度工作；现改为 `max_pool_len = max_model_len // index_kpool` 并将参数更名正名语义，模型行为不变。默认 `1,048,576` 上下文下 workspace 缩小 4x、节省 3072 MiB GPU 显存，精度由既有单测覆盖并经不同模型长度 sweep 验证。",
+    "sig-core": "九条变更，一建八修。MRV2 原生支持自定义 logits processors（+1210/-505）：持久槽索引的 `add_request()` 生命周期、冻结窄结构 `LogitsProcRequestState` 与每步批布局 `LogitsContext` 适配 V2 行不等于请求的批模型，从 V2 不支持 gate 移除该项、不再静默回退 V1；capture 路径再补插 `intermediate_tensors` 键对齐执行路径，消除声明该参数为必选的模型启动期 TypeError。GLM-5.3-Flash kpool 系列三条：NVIDIA prefill tail-seed kernel 改按 padded indexer stride 寻址，修复把 2048 B 原始 K/gate 行写进他人 indexer block 的静默缓存损坏（可命中块恰为启动后首批分配的长寿命系统提示块）；kpool top-k 接入共享 `SparseIndexerTopk` 分发器（gsm8k 0.9174）；`sparse_attn_indexer` ragged decode 批次崩溃修复保持。其余为 generate API 以同一 `metrics.speculative_decoding` 形状透出 per-request 投机解码指标（Rust+Python 前端、opt-in、流式随最终 usage chunk 返回）、DiffusionGemma self-conditioning 显式 cast 修复 eager 回退死亡、VoyageQwen3 embedding 模型启用 LoRA（与 sentence-transformers+PEFT 余弦 0.99998+）与 XPU GDN 日志修正。",
+    "sig-quantization": "五条变更。Humming 大集成（+2038/-1084，62 文件）：`hadamard_block_size` 启用在线量化 Hadamard 变换，SM120/SM121 支持 NVFP4/MXFP4/MXFP8，新增三种输入量化模式，checkpoint 输入量化设置生效并在设备不支持时自动回退高精度 schema（显式 schema 默认禁用回退，存量 WNA16 行为需显式配置保留），统一 `process_input` kernel 融合激活/Hadamard/量化覆盖 dense 与 MoE 多种 GEMM 布局。Marlin 与 Humming 的 permutation scratch/lock buffer 收归 `WorkspaceManager`（`get_persistent_resource` 通用 API、按 ubatch/lane/stream 隔离、执行期取锁），持久显存不再随层数叠加。`fp8_ds_mla` cache scale 契约统一为恒取 2 的幂，三路写入方位级一致。ROCm DSV4 `wo_a` 输出投影换 AITER `inverse_rope_group_quant`+`batched_gemm_a8w8_mxscale` FP8 路径，8×MI355X TTFT -7.35%、input throughput +7.93%，不支持时回退 BF16。MiMo V2 支持 mxfp4 MoE 与 bf16 router（附 DFlash 投机服务配置）。",
+    "sig-model-performance": "六条变更，横跨 GPU/ROCm/CPU/端侧。DSV4.1-Flash 视觉编码器经 `SupportsEncoderCudaGraph` 捕获/重放（varlen 打包、9 档预算图 64..16384 token、opt-in），把逐图 eager 编码（Python 循环、逐图 kernel 启动、RoPE/cu_seqlens host 计算）移出请求关键路径。GLM 系两条：kpool tail slot mapping 由 12 次启动、约 250 us CPU enqueue 的 torch op 链融合为单 Triton kernel（输出位级一致）；GLM-5 sparse indexer decode workspace 按池化长度定尺寸，默认 1M 上下文省 3072 MiB 显存。ROCm DSv4.1 decode topk ragged pack 跨层记忆化，每步 38→8 次重建、约 -1.8% decode GPU 时间。Diffusion 模型 prefill-only 批次改按 model state 取 logit 行数，DiffusionGemma prefill 免 262144 行词表整趟 pass（GB10 median 116.5→106.9 ms）。Arm CPU paged attention 重构（更快 GEMM/KV 打包/预打包 Q/打包格式 softmax 接口/NEON），最高 +25% 且净删百行。",
+    "sig-large-scale-serving": "两条变更。SimpleCPUOffloadScheduler 此前把所有 KV cache 组当可卸载：GLM-5.3-Flash 的 kpool-tail scratch 组（`prefix_cacheable=False`、`block_size=4`）在 `_select_eager_blocks_to_store` 以 hash_block_size=1152 对 block_size=4 触发整除断言（KV 事件开启时首个 prefill store 引擎死亡），`update_state_after_alloc` 又对其断言块对齐；现记录参与卸载的组并跳过其余，对齐核心 coordinator 与 MooncakeStore 的行为。EPD 示例 proxy 新增 launcher 动态实例注册：HTTP 注册 `encode`/`prefill`/`decode`/`prefill_decode` 角色、角色组合决定 E+PD/E+P+D 拓扑、管理 key 鉴权与幂等注册、Mooncake 场景透传 EC consumer 控制地址，静态 URL 模式保留且不改 vLLM EC connector 配置。",
+    "sig-omni": "一条变更：`truncate_prompt_tokens` 在多模态占位符展开前执行，Qwen3-ASR 请求 96 token 实得 147（`96 - 1 + 52`）。新增 `BaseRenderer._truncate_expanded_prompt` 在展开后重施上限并把 `tok_params` 贯穿 `process_for_engine`；多模态 span 永不被切断，无法全部存活的请求以 `VLLMValidationError` 拒绝，对齐 v1 input processor 的展开后语义。",
     "sig-ci": "四条测试修复，主题是跨平台可移植性与对重构的适应性。两条 XPU UT 去 CUDA 硬编码：`test_mnnvl_alltoall` 的设备与分布式后端选择改平台无关，`test_multiproc_executor` 改用 `device_control_env_var` 按平台限制可见设备；`test_prefix_cache_hit_rate` 的硬编码命中率下限（0.90/0.75 源自 GB200 544-token 块实测）在 XPU 576-token 块下理论最优仅 86.6% 而误报，改为从 `vllm:cache_config_info` 读解析块大小计算理论最优，消除取整伪影；`test_unquantized_flashinfer_trtllm_weights_can_be_reprocessed` 因 #57405 将 `process_weights_after_loading` 委托到 `moe_kernel.fused_experts` 而裸 `object()` 哨兵缺属性报错，换 `MagicMock` 吸收委托调用，恢复 H100/B200 两条红线。",
     "other": "一条变更：`tools/recipes` 新增 `serve_with_recipe.sh` 一键部署入口，按 `--model`/`--hardware` 生成 `config.yml` 与 `env.sh`、自动为 Xeon 6 启用硬件检测、加载生成环境并以生成配置拉起 `vllm serve`；recipe 相关资产存于 `/vllm-workspace` 时从该目录启动，生成物保留在调用方工作目录。从 #56340 拆出、独立于 staged sweep 工作流，本地实测通过。"
   },
@@ -82,6 +84,158 @@
       "sig_reason": "MRV2 自定义 logits processors 接口与采样管线接入，属核心 model runner/sampler 范畴。",
       "tags": ["feature", "high-risk", "mrv2", "logits-processors", "sampler", "sampling", "plugin-loader"],
       "pr_number": 56497
+    },
+    {
+      "sha": "7d99c2c4fd61cdeebd29cc7b60584bad10d1ef99",
+      "comment": "**背景**：Humming 量化后端需要扩展在线量化能力、覆盖 SM120/SM121 平台并统一输入处理 kernel。**方法**：五部分集成（+2038/-1084，62 文件）：`VLLM_HUMMING_INPUT_QUANT_CONFIG` 经 `hadamard_block_size` 启用在线量化的 Hadamard 变换；SM120/SM121 支持 NVFP4/MXFP4/MXFP8（含非公开 `float4e0m3`/`float8e3m4` dtype，依赖上游 humming#41）；新增 `static_per_tensor`、`static_tensor_dynamic_group`、`dynamic_group_tensor` 输入量化模式（后两者主要服务 NVFP4）；尊重 checkpoint 输入量化设置，设备不支持所配激活量化类型时自动回退更高精度输入 schema——显式指定的 schema 默认禁用回退（除非显式 `allow_fallback: true`），保留原 WNA16 行为需把 `VLLM_HUMMING_INPUT_QUANT_CONFIG` 的 `dtype` 设为 `bfloat16`；统一 `process_input` kernel 融合可选激活函数、Hadamard 变换与输入量化，覆盖 dense/indexed/grouped_contiguous/grouped_mask 布局（自定义激活支持 `unary`/`binary_split`/`binary_interleaved` 的 CUDA C++ 表达式实现），grouped_contiguous 在 EP 下跳过无效 padding token。**效果**：Humming 在线量化、低精度输入与新平台支持成型，配套 lm_eval/gsm8k、kernels/moe、kernels/core 测试与 requirements 更新落地。",
+      "sig": "sig-quantization",
+      "sig_reason": "Humming 量化能力大扩展（在线量化、新数据类型、输入量化模式与融合 kernel），属量化范畴。",
+      "tags": ["feature", "high-risk", "humming", "quantization", "hadamard", "sm120", "nvfp4", "mxfp4", "moe", "input-quant"],
+      "pr_number": 56685
+    },
+    {
+      "sha": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+      "comment": "**背景**：DeepSeek-V4.1-Flash 的视觉编码器（ViT + aligner）以 eager 逐图执行，Python 循环、逐图 kernel 启动与 RoPE/cu_seqlens host 计算都在请求关键路径上（+599/-63，6 文件）。**方法**：经 `SupportsEncoderCudaGraph` 协议为编码器启用 CUDA graph 捕获/重放：捕获图把一批图像打包为单次 varlen 运行（ViT 块经 `cu_seqlens` 按图注意力、aligner 空间 merge 变为对预计算索引的 gather+mask），经 `--compilation-config` 的 `cudagraph_mm_encoder` 开启。**效果**：开启后捕获 9 档预算图（64..16384 token）；4×GB200（SM100）TP=4、`FLASHMLA_SPARSE_DSV41` 后端、DeepSeek-V4.1-Flash（FP8+FP4 experts）上以 VisionArena-Chat（256 请求、并发 32、32 输出 token）做仅切换该 flag 的同服务器同客户端 A/B，逐图 eager 编码开销移出关键路径（PR 附完整对照表；另记录 SM100 默认 `FLASHMLA_MEGA_ATTN_DSV41` 对该 checkpoint 存在 `wq_b` permute 与 MXFP8 finalize 转置顺序冲突的上游问题，与本变更无关）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSV4.1 视觉编码器 CUDA graph 化移除请求关键路径 eager 开销，属模型性能范畴。",
+      "tags": ["feature", "medium-risk", "deepseek-v4.1", "vision-encoder", "cuda-graph", "vit", "aligner", "multimodal"],
+      "pr_number": 56625
+    },
+    {
+      "sha": "9b2f34cad446f73b1699e8236ec0b611a65f48af",
+      "comment": "**背景**：MiMo V2 系列需要 mxfp4 MoE、bf16 router 与 DFlash 投机解码组合支持。**方法**：为 MiMo V2 模型实现（+21/-6，3 文件）mxfp4 MoE 与 bf16 MoE router（经 `--hf-overrides` 设 `moe_router_dtype` 为 `bfloat16`），并支持 DFlash 投机解码。**效果**：附 MiMo-V2.5-Pro-DFlash（TP8/EP）与 MiMo-V2.5-DFlash（TP4/EP）经 marlin MoE 后端 + DFlash（7 speculative token、`FULL_DECODE_ONLY` cudagraph）的完整 `vllm serve` 配置。",
+      "sig": "sig-quantization",
+      "sig_reason": "MiMo V2 的 mxfp4 MoE 与 bf16 router 量化支持，属量化范畴。",
+      "tags": ["feature", "low-risk", "mimo-v2", "mxfp4", "moe", "bf16-router", "dflash", "spec-decode"],
+      "pr_number": 57784
+    },
+    {
+      "sha": "10e6a7f21094b76c65efb029b39b3f2227516418",
+      "comment": "**背景**：#48915 已为 OpenAI 兼容端点建立 opt-in 的按请求投机解码指标管线，token-in-token-out 的 generate API 尚未暴露同一 `metrics.speculative_decoding` 响应形状。**方法**：把既有指标透出到 generate API（+516/-9，12 文件，Rust engine-core-client/llm/server 与 vllm entrypoints/renderers）：完整响应为单序列请求携带指标；流式遵循 Chat/Completion 语义，`stream_options.include_usage=true` 时指标随最终 usage chunk（`choices=[]`）一次性返回、token chunk 不变；Chat/Completion derendering 保留指标对象；Python 对 `n>1` 抑制请求级指标、Rust 拒绝并行采样；需 `--per-request-spec-decode-metrics` 开启，采集默认关闭，不改模型执行与采样。**效果**：Python spec-metrics 6 项、流式 derender 指标透传、Rust vllm-server generate 62 项测试通过；GB200 上 Qwen3-0.6B + n-gram 投机 E2E 验证完整响应与最终流式 usage chunk 指标一致、token chunk 无指标。",
+      "sig": "sig-core",
+      "sig_reason": "generate API 透出既有 per-request 投机解码指标，属 Rust/Python 核心前端范畴。",
+      "tags": ["feature", "low-risk", "generate-api", "spec-decode-metrics", "rust-frontend", "streaming", "usage-chunk", "derenderer"],
+      "pr_number": 43310
+    },
+    {
+      "sha": "bf01fc4a313cc90863c470f37a26e41fd7b16fd1",
+      "comment": "**背景**：GLM-5.3-Flash 的 kpool indexer top-k 此前走模型自有路径，未接入共享的 `SparseIndexerTopk` 分发器。**方法**：把 kpool indexer top-k 路由到共享 `SparseIndexerTopk` dispatcher（`vllm/model_executor/layers` + `vllm/models/glm5next`，+94/-83，4 文件），扩展 `test_top_k_per_row.py` 与 glm5next 模型测试。**效果**：GLM-5.3-Flash TP4 + MTP（5 speculative token）服务下 lm_eval gsm8k 5-shot exact_match 0.9174（flexible-extract）/0.9166（strict-match）。",
+      "sig": "sig-core",
+      "sig_reason": "kpool indexer top-k 接入共享 SparseIndexerTopk 分发器，属核心 sparse indexer 层范畴。",
+      "tags": ["refactor", "medium-risk", "glm-5.3-flash", "kpool", "sparse-indexer", "top-k", "dispatcher"],
+      "pr_number": 57546
+    },
+    {
+      "sha": "f648eed23dc48fcc8ba64be0c4182f8e775b5bfa",
+      "comment": "**背景**：GLM-5.3-Flash 在 prefix-cacheable 组（MLA 1152、4× Mamba 1152，align 模式）旁携带 kpool-tail scratch 组（`KpoolTailSpec`，`prefix_cacheable=False`，`block_size=index_kpool=4`）；核心（`resolve_kv_cache_block_sizes`/`HybridKVCacheCoordinator`/`KVCacheManager`）与 MooncakeStore connector 都跳过此类组，`SimpleCPUOffloadScheduler` 却把每个 KV cache 组都视作可卸载：`_select_eager_blocks_to_store` 对 tail 组做 `resolve_block_hashes(hashes, hash_block_size=1152, block_size=4)` 触发整除断言（`--kv-events-config` 开启 KV 事件时首个 prefill store 即引擎死亡），`update_state_after_alloc` 又把外部（CPU 命中）token 映射到 scratch 组并断言块对齐。**方法**：记录参与卸载的组（`prefix_cacheable`），在 eager store 选择与 load 配对中跳过其余组（+267/-2，3 文件）；scratch block 本不携带 hash，行为与 coordinator 留空的 per-group hit 元组一致。**效果**：新增针对真实崩溃触发器（`enable_kv_cache_events=true`、`BlockStored` 仅对 cacheable 组发出）的回归测试与 GLM-5.3-Flash 端到端 store/load + 精度校验；与同路径的 #55033/#56404 明确分工（本 PR 限 GLM-5.3-Flash kpool-tail 布局）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "SimpleCPUOffload 跳过非 prefix-cacheable 组的卸载修复，属 KV offload/大规模服务范畴。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "simple-cpu-offload", "glm-5.3-flash", "kpool-tail", "prefix-cacheable", "kv-events"],
+      "pr_number": 56810
+    },
+    {
+      "sha": "1b9fa3eaa8ff23d1a583f2f77dd2b33c9f896ee8",
+      "comment": "**背景**：GLM-5.3-Flash sparse-MLA 每请求维护一块的 kpool 循环 tail cache；每个 decode 步（MTP 下两倍——target 与 drafter 各一次）`KpoolTailMetadataBuilder.build()` 以一串小 torch op（`arange`+`searchsorted`+`clamp`+`index_select`+`remainder`+`copy_`）做 token 到请求 tail 环的映射，12 次 kernel 启动、每次 build 约 250 us CPU enqueue。**方法**：替换为单个由 `query_start_loc` 直接驱动的 Triton kernel（含 CUDA graph padding 行），CPU 张量路径保留 torch 实现、输出与其位级一致（+120/-2，2 文件）；与 #57317（generic slot-mapping kernel 不再覆盖 `KpoolTailSpec`）和 #57477（seed kernel stride 修复）正交组合——本 PR 只产出逻辑 slot id（`block * kpool + pos % kpool`）、经真实 `stride(0)` 读 block table，物理寻址不变。**效果**：tail slot mapping 单一 kernel 化；`test_kpool_tail_slot_mapping.py` 等单测通过，4×GB300 TP4 GLM-5.3-Flash（FP8、flashinfer_trtllm MoE、`FLASHINFER_MLA_SPARSE`、69632 上下文）E2E 验证。",
+      "sig": "sig-model-performance",
+      "sig_reason": "kpool tail slot mapping 的 Triton 单 kernel 融合优化，属模型性能范畴。",
+      "tags": ["performance", "medium-risk", "glm-5.3-flash", "kpool-tail", "slot-mapping", "triton", "cpu-overhead", "cuda-graph"],
+      "pr_number": 57534
+    },
+    {
+      "sha": "db1bfdd4fb0dd7b8226402ee00abc7a987561b7c",
+      "comment": "**背景**：GLM-5.3-Flash 在 NVIDIA 上存在静默 indexer-cache 损坏：kpool prefill tail-seed kernel 以稠密步长寻址 tail block，而 tail cache 按 indexer 的 padded block stride 存储——`KpoolTailSpec` page 填充到 indexer page（默认 `block_size=1152` 时 38016 B = 288 pool 行 × 132 B），tail block `b` 是 indexer block `b` 的前 2048 B（`[2, kpool=4, 128]` bf16），`tail_kv_cache.stride(0)` 为 19008 元素而非稠密 1024；`_kpool_tail_seed_kernel` 的稠密寻址使每次 prefill 既漏 seed 自己的 tail block，又把 2048 B 原始 K/gate 行写进该层 indexer 区域（他人 block 的 fp8 key 行或 fp32 scale 区）。仅 id 低于 `num_blocks * 2048 / 38016`（约 5%）的 indexer block 可被命中——恰为启动后最先分配、承载首个 prefix-cache 提示（通常长寿命系统提示）的 block，表现为『缓存系统提示损坏』；decode kernel 与 AMD seed kernel 本就按 stride 寻址，唯一针对该布局的回归测试却 `skipif(not is_rocm)`。**方法**：NVIDIA seed kernel 改按 padded indexer stride 寻址 tail block（+23/-5，2 文件）并补 batched 测试。**效果**：静默缓存损坏消除，回归覆盖不再仅限 ROCm。",
+      "sig": "sig-core",
+      "sig_reason": "kpool prefill tail-seed kernel stride 寻址的正确性修复，属核心模型 kernel 范畴。",
+      "tags": ["bugfix", "medium-risk", "glm-5.3-flash", "kpool-tail", "seed-kernel", "stride", "cache-corruption", "nvidia"],
+      "pr_number": 57477
+    },
+    {
+      "sha": "0748d3bd57cb5c4303e58c8465e21f069629480d",
+      "comment": "**背景**：文档已将 `VoyageQwen3BidirectionalEmbedModel`（`voyageai/voyage-4-nano`）列为支持 LoRA，但 `--enable-lora` 启动即报 `ValueError: ... does not support LoRA yet.`；该 pooling 模型骨干为 `Qwen3Model`。**方法**：添加 `SupportsLoRA` 与 `Qwen3ForCausalLM` 相同的 `packed_modules_mapping`（+7/-1）。**效果**：经 `/v1/load_lora_adapter` 加载 PEFT adapter 后与 sentence-transformers + PEFT 的 embedding 余弦相似度 base 0.99999、q/k/v/o 0.99999、q/k/v/o+gate/up/down 0.99998、仅 gate/up/down 0.99997，第二个 adapter 热加载 0.99997-0.99999 且首个不受影响、unload 正常；`test_voyage.py` MTEB 测试通过。",
+      "sig": "sig-core",
+      "sig_reason": "VoyageQwen3 embedding 模型的 LoRA 能力开启，属核心模型/LoRA 支持范畴。",
+      "tags": ["feature", "low-risk", "lora", "voyage", "qwen3", "pooling", "embedding"],
+      "pr_number": 57708
+    },
+    {
+      "sha": "e5fce7b56b07cdf992febd0862bfd599d6dca3fd",
+      "comment": "**背景**：Humming grouped MoE 的 permutation scratch 由每层各自持有，持久显存随层数增长（#56759）；Marlin lock buffer 也归属单层或 kernel，生命周期绑定权重准备与 reload。**方法**：为两类资源建立 `WorkspaceManager` 共享所有权（+598/-211，21 文件）：新增 `get_persistent_resource(key, factory)`（稳定存储对象）与 `get_persistent(...)`（定形张量）通用资源 API，按 `(ubatch, lane)` 分别缓存、须在 workspace locking 前存在；容量/路由维度/设备/hidden size/dtype 兼容的 Humming `MoEPermuteScratch` 在顺序层间共享；Marlin lock 改执行期获取，并发 CUDA stream、ubatch 与 lane 各持独立 buffer，一次零初始化、成功调用把计数器归零；dense Marlin workspace 查找移入 runtime custom op 避免 `torch.compile` 追踪执行上下文选择；无 manager 时保留独立分配并支持显式 Marlin workspace。**效果**：整合 #50626 与 #56764 的方向为后端无关资源 API，Marlin/Humming 持久显存不再随层数叠加。",
+      "sig": "sig-quantization",
+      "sig_reason": "Marlin/Humming workspace 收归 WorkspaceManager 共享管理，属量化后端 kernel 基础设施范畴。",
+      "tags": ["performance", "medium-risk", "marlin", "humming", "workspace-manager", "persistent-memory", "moe", "scratch"],
+      "pr_number": 57421
+    },
+    {
+      "sha": "0e110f696db450f5645ce1daf9945241212d6ef3",
+      "comment": "**背景**：ROCm gfx950 上 DeepSeek V4 的 `wo_a` 输出投影走 BF16 grouped einsum，未利用 checkpoint 原生 FP8 `wo_a` 权重。**方法**：以 AITER `inverse_rope_group_quant`（融合 inverse RoPE 与 per-token E8M0 group 量化）+ `batched_gemm_a8w8_mxscale`（消费量化激活与原生 FP8 权重）替换该路径（+217/-11，2 文件）：复用既有 `VLLM_ROCM_USE_AITER_FP8BMM` gate 并限定 gfx950；接受原生 `float8e8m0fnu`/`uint8` scale 或无损转换正 2 的幂 FP32 scale；启用前校验 group-128 权重与 scale 布局；BF16 cosine/sine cache 视图加载后缓存一次；不支持的权重/scale/设备与旧 AITER 安装回退既有 BF16 路径。**效果**：8×MI355X、TP1/PP8、单请求 100K token prefill（8K chunk、关 prefix cache、三次运行）中位 TTFT 2459.0→2278.4 ms（-7.35%）、input throughput 40667→43891 tok/s（+7.93%）；依赖 AITER >= 0.1.20（#52826），main 无该 op 时能力探测打一次日志并回退。",
+      "sig": "sig-quantization",
+      "sig_reason": "ROCm DSV4 输出投影的 FP8 量化路径启用，属量化范畴。",
+      "tags": ["performance", "medium-risk", "rocm", "aiter", "deepseek-v4", "fp8", "wo-a", "gfx950"],
+      "pr_number": 54894
+    },
+    {
+      "sha": "27b7757f6364be5b0b714793ccdc3e3931443bca",
+      "comment": "**背景**：`truncate_prompt_tokens` 在多模态占位符展开之前执行，展开后 prompt 可超请求上限——Qwen3-ASR 请求 96 token 实得 147：截断保留 96 个未展开 token，一个音频占位符展开为 52，得 `96 - 1 + 52`；`tokenize_prompts` 的后置校验作用于未展开 token，`process_for_engine` 展开占位符时拿不到 `tok_params`，两步之间无上限复检（修复 #57038）。**方法**：新增 `BaseRenderer._truncate_expanded_prompt` 在占位符展开后重施上限，`tok_params` 作为可选关键字参数贯穿 `process_for_engine`/`_process_singleton`；唯一外部调用方（pooling scoring io_processor）不受影响，encoder-decoder prompt 保持现状；多模态 span 永不被切断——span 无法在截断后全部存活的请求以 `VLLMValidationError` 拒绝，对齐 `vllm/v1/engine/input_processor.py` 的既有展开后拒绝语义（+285/-35，3 文件）。**效果**：展开后 prompt 受请求上限约束，配套 `test_truncate_after_mm_expansion.py` 测试。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态占位符展开后的 prompt 截断上限修复，属多模态前端范畴。",
+      "tags": ["bugfix", "medium-risk", "multimodal", "prompt-truncation", "renderers", "placeholder-expansion", "qwen3-asr"],
+      "pr_number": 57076
+    },
+    {
+      "sha": "e378275a8f20eac9e92212e4a1fee84ec5a31dc7",
+      "comment": "**背景**：V2 执行路径总是把 `intermediate_tensors` 放入 model_inputs，capture 路径却只在非首个 pipeline rank 添加；PP=1 时该键缺失，捕获以 `model(**model_inputs)` 缺参调用——声明 `intermediate_tensors` 为必选位置参数的模型引擎启动即 TypeError，开始服务后却正常。当前 registry 所有顶层模型都默认该参数为 None 故未爆发，但捕获与执行路径不一致，下一个省略默认值的模型会再踩中。**方法**：在 `prepare_dummy_inputs()` 之前插入该键，使非首 rank 分支仍可覆写，对齐执行路径与 V1 runner（+1/-0）。**效果**：capture 与执行路径的 model_inputs 一致，必选 `intermediate_tensors` 的模型捕获期可正常启动。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 capture 路径 intermediate_tensors 缺键修复，属核心 model runner 范畴。",
+      "tags": ["bugfix", "low-risk", "mrv2", "cuda-graph", "intermediate-tensors", "pipeline-parallel", "capture"],
+      "pr_number": 57745
+    },
+    {
+      "sha": "d05da62e9ccdf8e342b15bf6785d83224cc165af",
+      "comment": "**背景**：XPU 平台上 GDN kernel 的日志输出有误。**方法**：修正该日志（`vllm/model_executor/layers`，+4/-0）。**效果**：XPU 路径日志信息正确。",
+      "sig": "sig-core",
+      "sig_reason": "XPU GDN kernel 日志修正，属核心模型层琐碎修复。",
+      "tags": ["bugfix", "low-risk", "xpu", "gdn", "logging"],
+      "pr_number": 54871
+    },
+    {
+      "sha": "601e1c7c51a10d6fd884d39f079f38bb942e436f",
+      "comment": "**背景**：diffusion 模型（无 draft token 调度）的 prefill-only 批次无论 model state 每步采样多少都只给每请求一行 logit 行；DiffusionGemma 的 prefill 步从不读取它们，却仍对 262144 行词表矩阵做整趟 logits 计算，GB10 上每个 prefill 约 8.8 ms（自 #57250 拆出）。**方法**：prefill-only 批次改用 model state 的 logit 行数（+8/-6，单文件），自回归模型维持每请求一行的同一分支不变。**效果**：prefill 步不再有 logits pass、decode 步不变；1×DGX Spark 上 `nvidia/diffusiongemma-26B-A4B-it-NVFP4`（canvas 32、prefix caching、async scheduling）median 116.5→106.9 ms，32 路并发 sweep 含 logprobs 通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "diffusion 模型 prefill-only 批次 logit 行数优化，属模型性能范畴。",
+      "tags": ["performance", "low-risk", "diffusion", "diffusiongemma", "logits", "prefill", "model-runner"],
+      "pr_number": 57416
+    },
+    {
+      "sha": "0c90804c0b8b139c252a86c79a3af26d181e11a0",
+      "comment": "**背景**：DiffusionGemma 的 self-conditioning soft embed 以 embedding 权重 dtype 计算后写入 fp32 `self_conditioning_embeds` buffer；dynamo 越过 recompile 上限回退 eager（多个 canvas 宽度请求先后到达时发生）后，index put 因 dtype 不匹配抛错、引擎死亡。**方法**：显式 cast 到 buffer dtype，使 eager 与编译路径一致（+1/-1）。**效果**：`TORCHDYNAMO_DISABLE=1`（首步即 eager）下 `google/diffusiongemma-26B-A4B-it` 于 DGX Spark 稳定运行，dtype 崩溃消除。",
+      "sig": "sig-core",
+      "sig_reason": "DiffusionGemma self-conditioning dtype 崩溃修复，属核心模型执行范畴。",
+      "tags": ["bugfix", "low-risk", "diffusiongemma", "dtype", "self-conditioning", "eager-fallback"],
+      "pr_number": 57462
+    },
+    {
+      "sha": "92b40f5a144763c8b2ef6ebe848793de634ada05",
+      "comment": "**背景**：Arm CPU 上的 paged attention 实现留有性能空间。**方法**：重构（+401/-506，4 文件，`cpu_attn_impl.hpp`/`cpu_attn_neon.hpp`/`cpu_attn_neon_bfmmla.hpp` 与 v1 attention）：更快的 GEMM kernel 与 KV cache 打包、copy 期间预打包 Q、新增允许 attention 实现直接以打包格式写 softmax 概率的接口、`block_size % 16` 时启用 NEON ISA。**效果**：paged attention 最高提速 25%，整体净删约 100 行；CI 验证。",
+      "sig": "sig-model-performance",
+      "sig_reason": "Arm CPU paged attention 重构提速，属模型性能范畴。",
+      "tags": ["performance", "medium-risk", "cpu", "arm", "paged-attention", "neon", "gemm"],
+      "pr_number": 56045
+    },
+    {
+      "sha": "70fc7bd695e6c9161ec7f3ba67b73e243189d571",
+      "comment": "**背景**：EPD（encode-prefill-decode）分离部署的既有示例 proxy 只支持静态 URL 配置，外部 launcher 无法在实例就绪后动态注册。**方法**：为示例 proxy 增加 launcher 管理的动态实例注册（+1169/-73，8 文件，限 examples、launch 脚本、文档与测试，不改 vLLM 的 EC connector 配置）：launcher 经 HTTP 把就绪实例注册为 `encode`/`prefill`/`decode`/`prefill_decode` 角色，角色组合决定拓扑（E+PD 或 E+P+D）；拒绝混合 PD 实例与独立 P/D 实例，独立 decode 实例仅在健康 prefill 实例可用时可路由；`POST/DELETE /instances` 需 `X-API-Key` 管理 key、GET 可查 registry、注册幂等、proxy 重启后须重新注册；Mooncake EC 场景 launcher 额外提供 consumer TP-rank-0 控制地址与 DP size。**效果**：动态拓扑 EPD 部署可由外部编排驱动，静态 URL 模式行为保留，配套 ec_connector 测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EPD 示例 proxy 的动态实例注册，属分离部署/大规模服务范畴。",
+      "tags": ["feature", "medium-risk", "epd", "disaggregated-serving", "proxy", "dynamic-registration", "launcher", "ec-connector"],
+      "pr_number": 54176
+    },
+    {
+      "sha": "1596fa5f8825d1b949463d51f3ed03650b0f539a",
+      "comment": "**背景**：DeepSeek-V4.1-Flash 的 `_forward_decode` 在每个压缩层重建 topk indices 的 ragged 形式，而该 pack 是共享 `topk_indices_buffer`（仅 `index_source_layer_ids` 写入）与每步元数据的纯函数，逐层唯一项是整除 block size 的 `compress_ratio`——38 个压缩 cache 层对应 8 个 index source，每 decode 步 38 次重建仅产出 8 个不同结果（4.8x 冗余）；MI355X TP4 十步 trace 实测 `_pack_global_topk_ragged_kernel` 与 `_compute_topk_lens_kernel` 各 380 次调用（38 层 × 10 步），合计约 322 us 与 76 次启动每步、占全部 kernel 时间 2.2%。**方法**：index source 层记忆化 pack、下层经 `static_forward_context` 在 `__init__` 解析一次源后按 compress ratio 读取（+66/-13）；失效为结构式（source 运行时自清条目且总是先于消费层执行），PP 切分落在 index-sharing 组内时抛与既有语义相同的 `NotImplementedError`，prefill 不变。**效果**：每步重建 38→8 次，移除约 255 us 与 60 次启动的 GPU 工作（约占该模型 decode GPU 时间 1.8%）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "DSv4.1 decode topk ragged 元数据跨层复用，属模型性能范畴。",
+      "tags": ["performance", "low-risk", "rocm", "deepseek-v4.1", "topk", "ragged-metadata", "memoization", "decode"],
+      "pr_number": 57434
     }
   ]
 }
