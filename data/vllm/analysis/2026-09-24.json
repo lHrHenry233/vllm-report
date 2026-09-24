@@ -1,0 +1,191 @@
+{
+  "date": "2026-09-24",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-24T10:52:00+08:00",
+  "daily_summary": "22 条提交主线有三：其一是 ROCm/AMD 平台继续密集推进——QK-norm/RoPE/KV-cache 融合扩展到 Qwen3-VL 3D MRoPE（每层少 3 次 GPU launch，+1314，#50212）、TileLang mHC fused RMSNorm 在 64-wide wavefront 上的归约错位修复（27 用例转绿，#58419）、AITER MLA FP8 prefill workspace 过松上界致启动 OOM 的收紧（#57923），以及 Kimi-K3 MI355 单测组与 Mooncake/NIXL PD 精度门禁等 AMD CI 扩容。其二是分布式与分离式服务：PCP 支持叠加 DP（含 EP MoE 与 MTP，#57075）、NIXL push 成功完成上报回归修复（#58188）、KV block size 跨全部 attention 后端协商（修混合 sparse-MLA/indexer 后端启动崩，#49845）。其三是调度与 CI 稳定性：`--long-prefill-token-threshold` 自适应放大（#58459）、batch-invariant 模式默认走 breakable CUDA graph 让调优 matmul 看到 runtime M（#57586）、以及一批 JIT warmup 整改（VllmRunner 默认关 warmup #58452、MRV2 sampler warmup 限 ROCm #58465、Proton CUPTI 冲突跳过 #58455、BF16 baseline 共享 #58469）。风险与后续关注：#58092 引入的 sampler warmup 曾使 NVIDIA 每构建 +430 job-min、7 步 45 次 timeout，本批已回退到 ROCm-only（#58465）需持续观察；#58215 DSA 非法内存访问、#49845 混合后端 block size、#57075 PCP+DP 与 #50212 MRoPE 融合属高影响变更（PCP 的 ROCm 与性能对齐、Scheduler #58459 的测试结果均未验证或留白）。",
+  "sig_summaries": {
+    "sig-core": "六项以引擎与平台正确性为主。调度与配置：#58459 让 `--long-prefill-token-threshold` 随 batch 预算动态放大（8192/2048 两请求场景由各 2048 提到各 4096），#49845 把 KV block size 选择从『只看第一个非 SSM 后端』改为返回全部去重后端并取每个都接受的最小尺寸（且每个候选用 `supports_block_size()` 验证而非推断 LCM，修 GLM-DSA/V3.2 型 sparse-MLA+indexer 后端 `No common block size for 32` 崩）。kernel/worker 修复：#58215 把 DSA `_sparse_topk_remap_kernel` 中 `[0,width)` 外的列（DeepSelect 对 NaN 行写的 `0x3f3f3f3f` sentinel）视同 `-1`，修 TP4 上约越界 500 MiB 的 CUDA 非法内存访问；#58419 修 TileLang mHC fused RMSNorm 的 HIP AllReduce shuffle 忽略 reduction group 线程偏移致 layer_input 偏大 sqrt(2)；#58462 对齐 MRV2 dummy `idx_mapping` dtype（int64→int32 遗漏）消除 runtime JIT；#58465 把 MRV2 sampler JIT warmup 注册收回 ROCm-only，回退 #58092 在 CUDA 上每次启动重编约 110s 造成的大面积 CI 超时。",
+    "sig-model-performance": "三项以 ROCm 融合与 attention 后端运行为主。#50212（+1314）把 `QkNormRopeKvCacheFusionPass` 扩展到 Qwen3-VL 3D MRoPE，用一个 AITER attention-prologue kernel 替掉两次 Q/K RMSNorm+MRoPE+unified FP8 KV 更新（每层少 3 次 launch、模型无关的 O2/O3 pass 集成、仅 ROCm AITER unified decoder attention opt-in）；#57586 让 `VLLM_BATCH_INVARIANT=1` 默认走 breakable CUDA graph（无 torch.compile），使 persistent Triton matmul 的 tile config 查表在 capture 期看到各 capture size 的真实 M（免冻结在最大 bucket、RTX PRO 6000 上 3-6x）；#57923 按『总 query token 受 token 预算约束』收紧 AITER ASM MLA FP8 prefill 的 workspace 上界（8192：64.03 GiB→2.56 GiB），修 Kimi K2.5 启动 OOM。",
+    "sig-large-scale-serving": "两项。#57075 让 prefill context parallelism（PCP）与 data parallelism（DP）共存，覆盖 expert-parallel MoE 与 MTP 解码、复用既有通信组不新建 process group、加 sequence-parallel GLM MoE、修 PCP draft 执行的 DP padding 与 idle-rank；GLM-4.7-Flash GSM8K 带 EP（TP2×PCP2×DP2）52/64、不带 EP 54/64，ROCm 与性能对齐未测。#58188 修 #56104 后成功 NIXL push WRITE 因经 `_recving_metadata`（无 producer 条目）过滤而不报 `finished_sending`、源 KV block 持到 lease 过期的回归——改为每个 WRITE handle 释放时上报、跨 poll 跟踪提交/轮询失败、忽略已 retire 请求的迟到 completion。",
+    "sig-ci": "九项以 AMD 门禁扩容与 JIT warmup 相关 CI 提速/稳定为主。#58012 加 Kimi-K3 MI355 单测 mirror（242 passed，101 测试无其他归宿）、#58095 加两 Mooncake HIP+六 NIXL/AITER PD 精度用例（复用 1,319 GSM8K 与 AITER unified attention/Mooncake HIP transport）、#58093 给 FusedMoE MoRI 路径补 graph replay 与输出生命周期覆盖、#58369 加 MI355 Fusion E2E TP2 Quick mirror 并带 AITER MLA 越界读回落修复。提速/稳定：#58452 VllmRunner 默认关 JIT warmup、#58455 recording run 下 Proton CUPTI 冲突测试跳过、#58469 共享量化对比的 BF16 baseline（10→8 boot、省 177s）、#55612 batch-invariance 套件补 chunked prefill ragged 用例、#58351 H200 initialized snapshot E2E 步 pin 单 GPU。",
+    "other": "两项纯文档：#55936 更正三处 docstring 拼写（`output_dytpe`→`output_dtype`、`kwrags`→`kwargs`、`Abbrivations`→`Abbreviations`）；#46466 把已注册的 `DiffusionGemmaForBlockDiffusion` 补进 supported_models 表（跟进 #45163）。"
+  },
+  "commits": [
+    {
+      "sha": "e6dc16cebd57cabc55c1b3503ce16faaf6717d21",
+      "comment": "**背景**：prefill context parallelism（PCP）此前不能与 data parallelism（DP）同时使用。**方法**：启用 PCP+DP（含 expert-parallel MoE 与 MTP 解码），复用既有通信组不新建 process group，新增 sequence-parallel GLM MoE 支持，并修 PCP draft 执行里的 DP padding 与 idle-rank 处理；延续 #54131（保留原作者）、取代 #49246 的早期方案。**效果**：`tests/test_pcp_dp.py` 16 passed（更广聚焦套件 170 passed、10 GPU-only skip）、pre-commit 通过；GLM-4.7-Flash、MTP3、全 decode CUDA graph 下 GSM8K 带 EP（TP2×PCP2×DP2）52/64、不带 EP（TP1×PCP2×DP2）54/64，九个 uneven-load/idle-rank 压力请求全通过（一次非 EP run 有个不可解析答案未复现）。ROCm 与性能对齐仍未测，这些 GSM8K 是 smoke 评估。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "prefill context parallelism 与 data/expert parallelism 协同，属大规模并行服务主旨。",
+      "tags": ["feature", "high-risk", "pcp", "context-parallel", "data-parallel", "expert-parallel", "mtp", "glm"],
+      "pr_number": 57075
+    },
+    {
+      "sha": "6697a7dd30ceebbe69a9d37e4012d11d40f79685",
+      "comment": "**背景**：`--long-prefill-token-threshold` 是全有或全无——如 `--max-num-batched-tokens 8192` 配 `--long-prefill-token-threshold 2048` 时，两个请求各占 2048 token 只填满半个 batch。**方法**：让该阈值随 batch 预算动态放大（`vllm/config/scheduler.py`、`vllm/engine/arg_utils.py`、`vllm/v1/core`）。**效果**：上述情形现每请求调度 4096 token 以提高 batch 利用率（PR 的 Test Plan/Test Result 留白，详见原文）。",
+      "sig": "sig-core",
+      "sig_reason": "调度器长 prefill 阈值自适应调整，属核心 scheduler。",
+      "tags": ["performance", "medium-risk", "scheduler", "config", "long-prefill", "batching"],
+      "pr_number": 58459
+    },
+    {
+      "sha": "e9f167129c09d5330805c2042c16329e9b218c5a",
+      "comment": "**背景/方法**：新增一个 AMD CI 组镜像 `(H100) Fusion E2E TP2 Quick`（从 #50519 拆出独立评审验证），只保留两个 AITER 后端支持的 payload；`test_tp2_ar_rms_fp8_fusions` 原为 CUDA-only 且只有三个 NVIDIA 后端，现按平台参数化 models/backends 并加 `ROCM_AITER_MLA` 后端用例。该组第三条命令曾崩 worker：DeepSeek-Coder-V2-Lite TP2 每 rank 8 heads 在 gfx950 上选中 AITER Gluon MLA decode，KV cache 每层超 2 GiB 时该 kernel 把 masked `buffer_load` 换成 unmasked `global_load` 越界读（`Memory access fault by GPU node-4`，上游 ROCm/aiter#4490 无 reproducer）。修复让 AITER MLA 在每层 cache 过 2 GiB 时拒绝 Gluon decode、回落 padded persistent-scheduling ASM decode（边界镜像 kernel 自身 `within_2gb` 计算，恰在 unmasked 路径接管处触发）；builder 现推导每层 cache 尺寸。**效果**：+220/-16, 7 文件（ROCm 上该组改查 `aiter_ar_rms_fusion` 而非原生 fusions，详见原文）。",
+      "sig": "sig-ci",
+      "sig_reason": "以新增 AMD CI 测试组为主旨，附带其所需的 AITER MLA 运行期修复。",
+      "tags": ["ci", "medium-risk", "rocm", "buildkite", "aiter", "mla", "fusion-e2e"],
+      "pr_number": 58369
+    },
+    {
+      "sha": "bcdacfc1ffeef001ee2bbabdf4c8b8ceb896ae66",
+      "comment": "**背景**：`tests/v1/determinism/` 守护 batch invariance 但 #32561 留 TODO 承认未覆盖 chunked prefill——现有 prompt 都短（整个 32-prompt 批 356 token vs 默认 2048 预算从不分块），无法检查长 prompt 被拆成多 scheduler step 后输出是否一致。**方法**：新增 `test_logprobs_bitwise_batch_invariance_ragged_chunked_prefill`——ragged 短/中/长 prompt 批、token 预算设到最长 prompt 之下，断言 bs=1 与 bs=N 的 logprobs 逐位一致且采样 token 相同；预算由 tokenize 后的 prompt 推导而非硬编码（防 `VLLM_TEST_MODEL` 换 tokenizer 后悄悄不 chunk），`LLM_with_max_seqs` 加可选 `max_num_batched_tokens`（默认 `None`），不改非测试代码。**效果**：RTX 3060（12 GiB, sm_86）/ 默认模型 Qwen3-1.7B 下 3 passed（详见原文）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 determinism 套件补 chunked prefill 覆盖，纯测试。",
+      "tags": ["test", "low-risk", "determinism", "chunked-prefill", "batch-invariance", "logprobs"],
+      "pr_number": 55612
+    },
+    {
+      "sha": "9ef37771beac1c1ce6a8b7ceae1f7ebeb6f51800",
+      "comment": "**背景**：DSV4.1 启动可在 `_sparse_topk_remap_kernel` 触发 CUDA 非法内存访问。dummy run 按设计喂 NaN indexer logits（`deep_select_topk` 为此关掉 NaN trap）；当某行 NaN 落在有效前缀内且 `end > topk`，DeepSelect 往输出行 slot 0 写内部 sentinel `0x3f3f3f3f` 后即返回，其余 slot 保留上次 `col_indices` scratch 的列，而 remap 只拒绝负列，于是 slot 0 索引 `sparse_indices[row, 0x3f3f3f3f // SBK]`（约越界 500 MiB）——TP4 上崩、其他布局静默写垃圾位置。**方法**：把 `[0, width)` 外的列视同 `-1`（NaN 行 slot 0 变 `-1`，其余 slot 重映射到的陈旧 in-bounds 列对产 NaN 的 dummy run 无害），有限 logits 不受影响（DeepSelect 只返回 `< end <= width` 的列）。**效果**：GB200 上 8 passed/7 skip（需独立 `deep_gemm`），新测试 main 上 fail、本改动 pass；单 GPU 生产 shape（width 16384/topk 512/SBK 8/128 NaN 行/expandable_segments）main 抛非法内存访问、本改动全 `-1`；pre-commit 通过；无模型评估（有限 logits 输出不变，详见原文）。",
+      "sig": "sig-core",
+      "sig_reason": "DSA sparse top-k remap kernel 的越界正确性修复，属核心引擎正确性。",
+      "tags": ["bugfix", "high-risk", "dsa", "sparse-attention", "mla", "cuda", "illegal-memory-access"],
+      "pr_number": 58215
+    },
+    {
+      "sha": "e0f03eb4f48ed6c0e193573e5cf1811a06a23e58",
+      "comment": "**背景**：`test_fp8_per_channel.py` 与 `test_mxfp8.py` 各起两次引擎（一次无量化产 BF16 参考、一次量化对比），二者参考输入完全相同（同模型、prompts、`max_model_len`、`max_tokens`、`num_logprobs`），第二个重做第一个已完成的工作。**方法**：在新 `tests/models/quantization/conftest.py` 加 session-scoped `quant_baseline_logprobs` fixture，按配置算一次并缓存输出（仅缓存输出，每个引擎仍走 `VllmRunner.__exit__` 保测试隔离）。**效果**：MI300X 上两文件引擎启动 10→8、墙钟 425.1s→247.9s（省 177s、1.71x，去重的是 `[moe]` OLMoE-1B-7B 基线，其 load 与内存 profiling 主导该组）。与 #56870（拆 job 到多 runner）无文件重叠、可叠加。",
+      "sig": "sig-ci",
+      "sig_reason": "共享量化对比测试的 BF16 baseline 缓存以省时，属测试基建。",
+      "tags": ["ci", "low-risk", "test-optimization", "quantization", "fp8", "mxfp8"],
+      "pr_number": 58469
+    },
+    {
+      "sha": "7ef0d69ea0b0bd6c765335592c0583fc792007ad",
+      "comment": "**背景/方法**：CI 的 recording run（daily/nightly 全量）通过 `CUDA_INJECTION64_PATH` 向每个 CUDA 进程加载 CUPTI kernel-launch recorder；一个进程只有一个 CUPTI subscriber、Proton 也自订阅，致 `test_proton_cuda_graph_replay_attribution_on_gpu` 在 recording run 全 parametrization 报 `cuptiSubscribe error 39`，把 `v1-executor-worker` 从 recorder 落地起变红（daily 90513、fork run 90641）。该测试仅在 `CUDA_INJECTION64_PATH` 设时 skip（ci-selector 系列第 5/12 部分，余为 ci-infra PR），其余照常记录、mock profiler 的 Proton 测试不受影响。**效果**：带 recorder 下 `v1-executor-worker` 817 passed/5 skipped（四个 Proton parametrization 即这 5 个 skip），此前同 step 是 4 failed/806 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "recording run 下 CUPTI subscriber 冲突的测试跳过，纯 CI。",
+      "tags": ["ci", "low-risk", "test-skip", "cupti", "proton", "profiler"],
+      "pr_number": 58455
+    },
+    {
+      "sha": "310f15d3548aef7c80d3a43ffd7899ea076006ea",
+      "comment": "**背景**：#57980 把某 runtime tensor dtype 从 int64 改为 int32，却漏改对应的 dummy batch tensor，触发 `amd-mi355-mrv2-sampler-jit-warmup` CI 失败。**方法**：对齐 MRV2 dummy `idx_mapping` 的 dtype（`vllm/v1/worker`, +1/-1）。**效果**：消除 runtime JIT、修复该 CI 失败。",
+      "sig": "sig-core",
+      "sig_reason": "MRV2 dummy batch dtype 对齐避免 runtime JIT，属核心 model runner。",
+      "tags": ["bugfix", "low-risk", "mrv2", "dtype", "jit", "worker"],
+      "pr_number": 58462
+    },
+    {
+      "sha": "89d9fd83e2888405bea16ac36bea0045e352a074",
+      "comment": "**背景/方法**：离线测试 fixture `VllmRunner` 默认关 JIT kernel warmup（`tests/conftest.py`, +4/-0），测试可显式传 `kernel_config={\"enable_jit_warmup\": True}` 保留生产行为，server helper 与 vLLM 产品默认不变。动因：(H200 MIG 35GB) Quantized Models build 90696 中 13 个非 eager 引擎启动在 3245.48s 作业里花 933.31s 做 JIT kernel warmup，而多数测试只用 121 个已编译 sampler key 的小子集。与 #58197/#55146 不同——那两者把 eager 模式与 MRV2 接到既有 warmup flag，本 PR 只改离线测试 fixture 的默认。**效果**：mock `VllmRunner` 构造校验默认 off、显式 True 保留，Ruff 与 `git diff --check` 通过（无模型评估）。",
+      "sig": "sig-ci",
+      "sig_reason": "测试 fixture 默认关 JIT warmup 提速 CI，属测试基建。",
+      "tags": ["ci", "low-risk", "test", "jit-warmup", "startup"],
+      "pr_number": 58452
+    },
+    {
+      "sha": "21ee743f474a35a056e8d5ade2c9aa744e726e6e",
+      "comment": "**背景**：#58092（注册 MRV2 sampler JIT warmup）在**所有**平台（非仅 ROCm）的 MRV2 `GPUModelRunner` 调 `register_top_k_top_p_warmups()`；CUDA 上这些 Triton sampler warmup 每次引擎启动重编（约 110s，之前是 `finished in 0.00s`），NVIDIA CI 大幅变慢、多作业超时。**方法**：保留 ROCm（#58092 的目标）注册、把 CUDA 放回 #58092 之前。**影响**：`96e203b08e` 前后 ~26 main build 对比——NVIDIA 185 步中 46 步慢 ≥15% 且 ≥3min（另 4 步现只 timeout）、约每 main build +430 job-min、7 步 45 次前所未有的 timeout（如 Language Models Hybrid Shard 2 ×15、Basic Correctness ×11；Basic Correctness 42→68+ min、PyTorch Compilation 25→49、H100 Fusion E2E Quick 7→15）；main build 90618（42min）→90619（63min）干净断点。CUDA 的 `No Runtime JITs E2E` 步此前无该注册也过，故 CUDA 留空不应带回 runtime JIT。**效果**：也令 open 的 timeout bump（#58376/#58386/#58320）不再需要（详见原文）。",
+      "sig": "sig-core",
+      "sig_reason": "修正 MRV2 worker 里 sampler warmup 注册的平台门控（产品代码），属核心 worker。",
+      "tags": ["bugfix", "medium-risk", "rocm", "jit-warmup", "ci-perf", "sampler", "mrv2"],
+      "pr_number": 58465
+    },
+    {
+      "sha": "5fcc6e7c7380c67ab1e1305ed2197b127f0535e5",
+      "comment": "**背景**：#50519 加的 `(MI355) Miscellaneous Kernels` 里 `tests/kernels/test_mhc_kernels.py` 27 用例在启用 fused RMSNorm 时 fail。fused-norm mHC pre kernel 把 96 线程分组：mix 阶段跑线程 0-31、collapse+RMSNorm 跑 32-95；TileLang 的 HIP AllReduce shuffle 阶段忽略 reduction group 的线程偏移，64-wide wavefront 上 RMSNorm 归约只求和一半值，layer_input 偏大 sqrt(2)。CUDA 32-wide warp 保持组对齐故不受影响。**方法**：ROCm 上把 mix 阶段挪到最后 32 线程，使 RMSNorm 归约用满一整条 0-63 wavefront；CUDA 生成 kernel 不变。**效果**：MI355X（gfx950）从 27 failed/154 passed/150 skipped 变 181 passed/150 skipped。",
+      "sig": "sig-core",
+      "sig_reason": "TileLang mHC fused RMSNorm kernel 数值归约错位修复，属模型执行器核心正确性。",
+      "tags": ["bugfix", "medium-risk", "rocm", "tilelang", "rmsnorm", "mhc", "kernel"],
+      "pr_number": 58419
+    },
+    {
+      "sha": "8b660ce96bc2e7ef164e7c9c26b969495a88f82c",
+      "comment": "**背景/方法**：FusedMoE 层套件的 MoRI 路径此前无 graph replay 覆盖。新增三个 BF16 同节点 DP2/TP1/EP2 用例（真实 MoRI dispatch/combine + AITER experts、各 rank 不同输入与显式 backend witness）；改变 activations/routing 后 replay、与全权重参考和新 eager 输出比较，并用拒绝全零输出的相对误差界检查较早 eager 输出的生命周期；在 H100 Fault Tolerance E2E mirror 下加 MI355 healthy EP 基线（含故障注入/检测/恢复的 inline TODO），把三个 graph 用例与可选 healthy EP2 子用例移入该基线避免重复执行。该 mirror 仅验健康 graph replay 与输出生命周期，故障相关仍需 MoRI 后端支持、不构成容错 parity。**效果**：pytest collection 校验保全选集、四 native+四 legacy pipeline render 通过、pre-commit 通过（YAML-only 移动无需新 GPU run；此前实现在 MI355 已过三 graph 用例+一 healthy BF16 EP2 子用例）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 FusedMoE/MoRI 路径补 graph replay 测试与 CI 调度，属测试/CI。",
+      "tags": ["test", "low-risk", "rocm", "moe", "mori", "graph-replay", "ci"],
+      "pr_number": 58093
+    },
+    {
+      "sha": "97b1b121176d405bcec861960dc605e9e41227e2",
+      "comment": "**背景/方法**：三处 docstring 拼写更正——`fp8_utils.py` 的 `w8a8_triton_block_scaled_mm` 文档 `output_dytpe`→`output_dtype`；`ovis.py`/`ovis2_5.py` 的 `kwrags`→`kwargs`（从 Qwen2VL processor 文档抄来的乱码）；`kv_cache_manager.py` 的 `Abbrivations`→`Abbreviations`。纯文档/注释，无行为变化（+3/-3, 3 文件）。",
+      "sig": "other",
+      "sig_reason": "跨多文件的 docstring 拼写更正，无行为变化。",
+      "tags": ["docs", "low-risk", "typo"],
+      "pr_number": 55936
+    },
+    {
+      "sha": "e26547adfb4970f3e3958695256a84566683a683",
+      "comment": "**背景**：`Platform.update_block_size_for_backend()` 只从**第一个**非 SSM attention backend 选 KV cache block size，混合 block-size 支持不相交后端的模型就崩——GLM-DSA / DeepSeek-V3.2 型把 sparse-MLA 主后端（`FLASHINFER_MLA_SPARSE`，支持 `[32, 64]` 偏好 32）与 `DeepseekV32IndexerBackend`（只支持 `[64]`）配对，自动选的 32 在很后面的 `select_common_block_size()` 报 `ValueError: No common block size for 32.`，唯一 workaround 是未文档化的 `--block-size 64`（修 #48286）。**方法**：`_find_non_ssm_backend()`→`_find_non_ssm_backends()` 按层序返回全部去重非 SSM 后端（更新 `interface.py`/`cpu.py` 两调用点）；新增 `_preferred_block_size_for_backends()` 取每个后端都接受的最小 block size——单后端沿用 `get_preferred_block_size()`，全接受默认则用默认，否则以各后端一个支持尺寸构成的最小公倍数升序试、**每个候选都用 `supports_block_size()` 确认**，无公共值则 `ValueError` 列出各后端与支持尺寸；候选是验证而非推断（CPU_MLA 接受 16 但不接受其倍数）。PR 拆两段，本段只做后端收集与 block-size 选择（+131/-21），phase 2/3 对齐后续单独 PR。**效果**：修复 #48286 的自动 block size 崩。",
+      "sig": "sig-core",
+      "sig_reason": "平台层 KV block size 跨后端协商选择，属核心 KV cache/平台配置。",
+      "tags": ["bugfix", "high-risk", "kv-cache", "attention-backend", "block-size", "platform", "deepseek-v32"],
+      "pr_number": 49845
+    },
+    {
+      "sha": "34b069080d9f1622321333c6849fc50c08664d36",
+      "comment": "**背景**：`:nvidia: (H200) Initialized Snapshot E2E`（#51360 加）在 `H200` queue 报 `the runner must expose exactly one selected GPU`——该步 `no_plugin: true` 脚本在宿主上从 `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES`/单个 `nvidia.com/gpu=<id>` CDI 设备选 GPU，而 H200 queue 一 agent 占整机、这些均未点名单 GPU，CDI hook 解析成 `nvidia.com/gpu=all` 被脚本正确拒绝。**方法**：step env pin `NVIDIA_VISIBLE_DEVICES: \"0\"`（脚本再解析 index 0→UUID、校验是整块非-MIG H200、只 `--gpus device=<uuid>` 传容器；step 作用域故其他向多 GPU 容器传播环境的 H200 步不受影响）。**效果**：+1/-0 单文件（scoped Buildkite build 验证，Test Result 待补）。",
+      "sig": "sig-ci",
+      "sig_reason": "Buildkite H200 步 GPU 选择环境变量修正，纯 CI。",
+      "tags": ["ci", "low-risk", "buildkite", "nvidia", "gpu-selection", "mig"],
+      "pr_number": 58351
+    },
+    {
+      "sha": "711fc55c10a2bbbefcb12456c43ba5eca01be3f6",
+      "comment": "**背景**：`VLLM_BATCH_INVARIANT=1` 把每个 linear 层路由到 batch-invariant persistent Triton matmul，tile config 从按 `(N, K)`+**M bucket** 键的每架构表取（#53247/#53649/#57456）；默认 `torch.compile` 路径下该查表（`_get_matmul_config`）在 Dynamo 用编译期 dummy M trace 时执行、选中的 `BLOCK_M/BLOCK_N/num_warps/num_stages` 被冻进 graph，于是每个 decode step 都用最大 bucket 配置（#54243，RTX PRO 6000 上比表为之调优的 `M <= 8` 慢 3-6x），几乎全部 batch-invariance 剩余开销在此。**方法**：无 `torch.compile` 时查表在 CUDA graph capture 期用各 capture size 真实 M 执行、表按预期工作；本 PR 让 batch-invariant 模式经既有 breakable CUDA graph 机制（#42304 `VLLM_USE_BREAKABLE_CUDAGRAPH=1`）默认走该路径，`_maybe_enable_breakable_cudagraph` 在平台是 CUDA、模型 bf16 未量化、`enforce_eager` 关、未显式启用 sequence parallelism/async TP（它们是 torch.compile pass）、且编译 forward 里线性层至少一个 per-rank `(N, K)` 是该设备调优表 key 时自动启用；无需改 matmul 或表。**效果**：调优 matmul 配置能看到 runtime M（详见原文，与把模型移出 torch.compile 的 #54503 方向一致）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "batch-invariant 模式经 breakable CUDA graph 让 matmul 调优表生效的性能优化，属模型性能。",
+      "tags": ["performance", "medium-risk", "batch-invariance", "cuda-graph", "torch-compile", "triton", "matmul"],
+      "pr_number": 57586
+    },
+    {
+      "sha": "f9ad9dd6b495f7492fa975e0ac48164b090d99ad",
+      "comment": "**背景/方法**：把 `DiffusionGemmaForBlockDiffusion` 加进 `docs/models/supported_models.md` 支持模型表——该模型已在 model registry 注册、`google/diffusiongemma-26B-A4B-it` 已有 test registry 条目，跟进 #45163 的模型支持。+1/-0 文档。",
+      "sig": "other",
+      "sig_reason": "补 supported models 文档表格，无代码变化。",
+      "tags": ["docs", "low-risk", "diffusion", "supported-models"],
+      "pr_number": 46466
+    },
+    {
+      "sha": "b5ea0c71078bdbb0f1f9afd934d55156273fe5f8",
+      "comment": "**背景**：AITER bump 到 v0.1.22post1 带入 ROCm/aiter#3606 略改了 workspace sizing 逻辑，Kimi K2.5（或类似）用 AITER ASM MLA prefill kernel 时启动 OOM——causal FP8 MLA 的 AITER persistent kernel 需 buffer 存各 work group 待办 work item，MLA metadata scheduler 现发很松的界（假设每请求都能用 max_qlen query token，实上界是 query token 总和 = `max_num_batched_tokens`），据此定 logits/attn_lse partial buffer 会得到巨大 KV 预留（max_num_batched_tokens 8192：旧 1.88 GiB→新 64.03 GiB→本 PR 2.56 GiB；16384：3.75→128.03→2.62 GiB）。**方法**：短期按『总 query token 受 token 预算约束』定尺寸（长期应由 AITER 给 budget-aware 上界，aiter#5729）。**效果**：DSv3 FP8 KV 于 MI350（TP8、EP、`max-num-batched-tokens` 16k、`max-model-len` 160k）启动不再 OOM（`vllm/v1/attention`, +10/-1）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "AITER MLA FP8 prefill 后端 workspace 尺寸修复，属 attention 后端运行。",
+      "tags": ["bugfix", "medium-risk", "rocm", "fp8", "mla", "attention-backend", "oom", "workspace"],
+      "pr_number": 57923
+    },
+    {
+      "sha": "c4f6ce48749a092b02525af16947350305650573",
+      "comment": "**背景**：#56104 后成功的 NIXL push WRITE 被经 `_recving_metadata`（跟踪 incoming 请求）过滤，普通 producer 请求在该表无条目，WRITE 完成后从不报 `finished_sending`、源 KV block 一直持到 lease 过期；既有测试注入的 consumer ack 是 push 实现并不发的。**方法**：每个 WRITE handle 都释放时上报成功的 outgoing 请求；跨 poll 跟踪 outbound 提交与轮询失败使后到的成功 sibling 不掩盖较早失败；忽略已被 lease 过期 retire 请求的迟到 completion 以免重复上报 scheduler。回归覆盖交错成功 WRITE（含 PP/HMA）、sibling 失败、提交/释放失败、过期后完成（lease 过期且 DMA 仍活跃的既有行为不在本改动）。**效果**：恢复成功 push 完成上报（+111/-20, 2 文件，跟进已合并的 #56104，与 #50754/#55470 不重叠）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL KV connector 分离式传输完成上报修复，属 PD disaggregation。",
+      "tags": ["bugfix", "high-risk", "nixl", "kv-connector", "pd-disaggregation", "kv-transfer"],
+      "pr_number": 58188
+    },
+    {
+      "sha": "c4cfd7007bad6f1125ef938feb656707b3ccab76",
+      "comment": "**背景**：Kimi-K3 单测今天只在 B200 job 跑，`tests/models/kimi_k3/` 里 AMD-only 测试（`test_amd_kda_chunk.py` 66、`test_amd_latent_moe_runner.py` 14、`test_amd_kda_decode.py` 12、`test_amd_attn_res.py` 9）在 NVIDIA 全 skip。**方法**：给现有 job 加 `amd` mirror 到 MI355（选 MI355 因 fused KDA chunk/decode kernel 门控 gfx950，gfx942 上那 66 个仍 skip）；mirror 覆写 `commands` 去掉两个 CUDA-only 的 kernels/ 文件（传递 import `cuda.bindings.driver`、ROCm 报错），`source_file_dependencies` 继承父步（已覆盖 kimi_k3 相关目录）。**效果**：MI355X（gfx950）`pytest models/kimi_k3` 242 passed/45 skipped/0 failed（451s），B200 跑 180 skip 111 故非重复覆盖（101 测试无其他归宿）；`test_amd_latent_moe_runner.py` 三个 `@multi_gpu_test(4|8)` 在 mi355_1 skip（+102/-0, 4 文件，含 `vllm/platforms/rocm.py`）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 AMD 硬件镜像 Kimi-K3 单测作业扩容门禁，属 CI 基建。",
+      "tags": ["ci", "low-risk", "rocm", "buildkite", "kimi-k3", "test-mirror"],
+      "pr_number": 58012
+    },
+    {
+      "sha": "8033bd08c1d3626d499de040279d7476b6cd2a4a",
+      "comment": "**背景/方法**：为 AMD 加两个 Mooncake HIP 与六个 NIXL/AITER 分离式精度用例，保留上游 model/TP 组合、全部 1,319 GSM8K 题、100 并发与原精度界；pin model/tokenizer revision、要求 evaluation-only 的正 external-KV delta（NIXL 还要求 transferred bytes）、显式 cache 边界与 owned-process 清理；加 MI355 native mirror 与匹配 optional legacy 作业，保留既有 NVIDIA 与 generic Triton NIXL 选集。既有 AMD generic NIXL sweep 已用 Triton attention 覆盖这些 model/TP，缺的上游对应项用第二种 attention 后端与 Mooncake 传输，故这些用 AITER unified attention + 原生 Mooncake HIP transport、复用原精度函数保留全 workload 与验收界。**效果**：+409/-0, 7 文件（`.buildkite/test-amd.yaml` 与 disaggregated 相关 area）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 AMD 分离式 PD 精度加 CI 测试用例，属测试/CI。",
+      "tags": ["ci", "low-risk", "rocm", "pd-disaggregation", "mooncake", "nixl", "accuracy"],
+      "pr_number": 58095
+    },
+    {
+      "sha": "b715699df45f091325b307c0f5ac874010fbb23e",
+      "comment": "**背景/方法**：把既有 `QkNormRopeKvCacheFusionPass` 扩展到 Qwen3-VL 3D MRoPE——合格 decode range 用一个 AITER attention-prologue kernel 替掉两次 Q/K RMSNorm launch、MRoPE 与 unified FP8 KV-cache 更新（**每层少三次 GPU launch**）。模型无关的 compile-pass 集成（去掉早前 Qwen3-specific flag/wrapper，用既有 O2/O3 pass 控制），不支持配置留未融合路径。`matcher_utils.py`/`qk_norm_rope_kvcache_fusion.py` 匹配 3D MRoPE 产融合替换；`_aiter_ops.py`/`attention/backend.py`/`rocm_aiter_unified_attn.py` 能力门控与 backend-owned kernel dispatch/cache；`rotary_embedding/mrope.py` 仅 HIP 暴露 MRoPE 为可匹配 custom op；`attention.py` 除非显式开 per-head 否则保持 scalar Quark query scale per-tensor（修一 rank 一个 KV head 的 TP4/TP8）。安全：仅 ROCm AITER unified decoder attention opt-in、CUDA/XPU MRoPE 不变，可观测 rotated K/不支持尺寸布局/不支持 AITER build/超 256-token 上限均拒绝融合，覆盖 full/partial rotary、NeoX/GPT-J 配对、interleaved/non-interleaved MRoPE 与 LBHNC/LBNHC/LHBNC 布局；需含 AITER #4531 strided KV-cache 修复的 build。**效果**：+1314/-118, 11 文件，Qwen3-VL 3D MRoPE decode 融合到单 AITER kernel。",
+      "sig": "sig-model-performance",
+      "sig_reason": "ROCm AITER QK-norm/RoPE/KV-cache 编译融合扩展到 MRoPE，属模型性能/编译融合。",
+      "tags": ["performance", "high-risk", "rocm", "compile-fusion", "mrope", "rmsnorm", "rope", "kv-cache", "qwen3-vl"],
+      "pr_number": 50212
+    }
+  ]
+}
