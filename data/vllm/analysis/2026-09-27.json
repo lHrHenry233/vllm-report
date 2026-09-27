@@ -1,0 +1,111 @@
+{
+  "date": "2026-09-27",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-27T13:24:59+08:00",
+  "daily_summary": "12 条提交有三条主线。其一是 DeepSeek-V4.1 与 GLM 的解码内核融合/精度攻坚：#58634 用 `FusedWoAKernel`（CuTe-DSL）把 SM100/SM103 上 O-projection 的 inverse RoPE + 逐 32 元素 FP8 量化 + `wo_a` + MXFP8 量化四 kernel 里的前三个合成一个，让 `wo_b` 直接吃预量化激活；#58586 把 FlashInfer 的 MoE finalize 与 shared-expert 加法折进 TP all-reduce + mHC 边界，并 vendor CuTe-DSL LL 内核、删掉旧的 `all_reduce_mhc.cu`；#58846 只 bump 一行 FlashKDA pin，把 KDA recurrent state 从 bf16 升回 fp32，修 GLM-5.3-Flash 长 prefill 的静默工具调用污染。其二是 KV 传输与可观测性：#50047 让 NIXL 在同址换 engine ID 时无需等 TTL 就释放死 peer 状态，#49300 给 mooncake 接 NVLINK/BAREX 自定义内存池，#57251 把 `SimpleCPUOffloadConnector` 的调度侧逻辑块计数经 `KVConnectorStats` 暴露成 Prometheus 指标。其三是若干正确性/契约修复：#43931 修 `InputBatch.condense()` 漏清 `allowed_token_ids` 掩码致无限制请求沿用旧白名单、#56377 在 batch invariance 下强制关掉 SP/async TP、#57105 预留最坏 logits workspace 避免 QSA indexer 显存碎片、#58832 过滤大写内存地址。风险与关注点：#58634/#58586/#56723 三条内核融合 PR 的 PR 描述均在测试/收尾处截断（性能数字与验证细节见原文）；#56723 明说精度未对齐（GSM8K 100/128 vs 目标 104/128）、FlashInfer 在该混合布局下禁用全图；#58201 移除了旧 `..._SITUV2_A8W4` 别名（现无效果）。",
+  "sig_summaries": {
+    "sig-core": "四项，均为正确性/契约与显存修复。#43931 修 `InputBatch.condense()` 把被搬走请求的 `allowed_token_ids_mask_cpu_tensor` 行复制到空位后不清源行，`add_request` 只在设了 `allowed_token_ids` 时才写该行，于是后来复用该索引的无限制请求会保留上一个请求的白名单并按陈旧掩码采样，改成像 `remove_request` 那样 `fill_(False)` 清空。#56377 发现 `VLLM_BATCH_INVARIANT=1` 并不阻止 `enable_sp`/`fuse_gemm_comms`，而 SP 的 reduce-scatter 走普通 PyNccl、归约顺序随 batch 组成变（4×RTX PRO 6000、Qwen3-1.7B：bs1 与 bs64 有 1522/1536 个 logprobs 不一致），改为在既有守卫旁强制二者为 False 并加 TP=4 回归测试与文档。#57105 让 QSA indexer 每次都预留最坏 logits workspace，后续调用不再触发新分配。#58832 在三行改动里过滤掉大写内存地址以加固消息净化。",
+    "sig-large-scale-serving": "三项，围绕 KV 传输生命周期与指标。#50047 处理 pull-mode prefiller 以新 engine ID 在同 host:port 重启后 decoder 仍握着旧 peer NIXL 资源直到 TTL：握手成功后检测替换、把旧 peer 标记待清，等在用请求与挂起握手结束再释放，避免误删仍在用资源、也无需重启 decoder 或等 TTL 驱逐。#49300 给 MooncakeStoreConnector 接入 `custom_mem_pool`（NVLINK/BAREX），配置时按对应 Mooncake allocator 建 `torch.cuda.MemPool` 供 KV cache 走 NVLink/BAR 暴露显存以支撑 RDMA 传输，未配置则沿用 CuMem/default，并拒绝与 CuMem、sleep-mode 的冲突组合。#57251 把 SimpleCPUOffload 的调度侧五个 `vllm:simple_kv_offload_*` 序列经既有 `KVConnectorStats` 每步排空，顺带让 `reset()` 把上次排空后的 outcome 窗口结转进新计数避免跨 cache-reset 丢窗口。",
+    "sig-model-performance": "三项，皆以内核融合/数值精度降延迟或修污染为主。#58634（+759/-55，`vllm/models/deepseek_v41`）在 SM100/SM103 上加 `FusedWoAKernel`，把解码批下三个 latency-bound kernel（Triton inverse RoPE+FP8 量化、DeepGEMM `wo_a`、FlashInfer MXFP8 量化）合一，权重 PDL 下预取、inverse RoPE+量化直写 swizzled SMEM、`tcgen05` 分块标度 MMA 流水、DSMEM split-K 归约后交给 `wo_b`（GB200 DSv4.1-Flash TP4 前三 kernel 原耗 11-12 µs，收益数字见原文）。#58586（+1807/-309，8 文件）把 FlashInfer MoE finalize 与 shared-expert 加折进 DSv4.1 解码的 TP all-reduce + mHC 边界，vendor CuTe-DSL LL 内核并把 routed-experts 以 `defer_moe_finalize` 保持未 finalize，删掉无其他用户的 `csrc/libtorch_stable/all_reduce_mhc.cu`（DSV4.1-Flash 上 37/40 层走该边界，细节见原文）。#58846 只把 FlashKDA pin 从 `b59532f` bump 到 `17a037d`，KDA recurrent state 在 tile 间改回 fp32，修 GLM-5.3-Flash 长 prefill 逐 16-token tile 累积舍入导致的长上下文工具调用污染，并补 TMA store wait 与 sm_10x 寄存器压力。",
+    "sig-quantization": "一项 #58201：Kimi-K3 的 SiTU MXFP4 MoE 有三族只差激活精度的 FlyDSL 内核，旧 `VLLM_ROCM_USE_AITER_MOE_SITUV2` 是布尔（开=a4w4、关=a16w4）选不到 a8w4；改为吃 dtype 名（`a16w4`/`a8w4`/`a4w4`，默认 a4w4），按值导出对应 AITER 环境与 tuned CSV、未知值在 env 读取处抛 `ValueError`，同一 server 配置下即可 A/B 三种激活精度（旧 `..._SITUV2_A8W4` 别名不再被读）。",
+    "sig-spec-decode": "一项 #56723：让 DSpark/DFlash 这类 dense draft 以 DCP=1 跑在带 DCP 的 target 旁边，draft 后端无须支持 DCP。靠 `KVCacheSpec.dcp_sharded` 把 draft 的分配、slot mapping、prefix caching 与 offload 同 target 分片解耦，MLA/dense 混合缓存用 block-outer 打包、FlashInfer 从 attention metadata 取实际布局。作者自陈精度未对齐（GSM8K GLM-5.3+GLM-5.2 DSpark TP4/DCP2 得 100/128 对 target-only 104/128，mean acceptance 3.81），FlashInfer 在该混合布局禁用全图、PCP+DCP 仅覆盖配置/分配。"
+  },
+  "commits": [
+    {
+      "sha": "a9eafde59cbd55182dc2265cc398b7186f0a0eaa",
+      "comment": "**背景**：SM100/SM103 上 DSv4.1 的 O-projection 每层跑四个 kernel，解码批大小下前三个是 latency-bound，在 GB200（DSv4.1-Flash, TP=4）上合计 11-12 µs——[Triton] inverse RoPE + 逐 32 FP8 量化、[DeepGEMM] `fp8_einsum wo_a`、[FlashInfer] MXFP8 量化，再交给 [FlashInfer CuTe-DSL] `wo_b`。**方法**：新增 `FusedWoAKernel`（CuTe-DSL）替掉前三个并把预量化的 `QuantizedActivation` 交给 `wo_b`（使其跳过自带 quantize）。每 cluster 占 128 个 `wo_a` 输出行、每 CTA 一个 K head（按 head split-K），TP=4 下每 token tile 以 8-CTA cluster 起 128 CTA：① PDL 下 `griddepcontrol.wait` 前 TMA 预取 64 KiB FP8 权重切片与打包 scale，MMA warp 在使用前把 scale 转成 `tcgen05.cp` 布局、TMEM 在 wait 后才分配；② 读该 head 的 BF16 attention 输出、对末 64 维做 inverse RoPE、逐 32 元素以 UE8M0 scale 量化直写 swizzled SMEM MMA 操作数（不经 global 往返）；③ 以权重为 128 行操作数、token 为 N 做 `tcgen05` MXFP8 分块标度 MMA，每个 128 宽 K stage 各有 mbarrier，末 stage 触发 `griddepcontrol.launch_dependents`；④ 经 DSMEM 做 split-K 归约、像未融合的 `z` 一样舍入到 BF16 再按 FlashInfer F8_128x4 scale 布局量化（收尾细节见原文截断处）。**效果**：6 文件 +759/-55，主战场 `vllm/models/deepseek_v41/nvidia/ops/fused_wo_a.py`（+599）与 `o_proj.py`，含 `tests/kernels/test_fused_inv_rope_fp8_quant.py`；具体吞吐/延迟收益数字在原文截断处。",
+      "sig": "sig-model-performance",
+      "sig_reason": "以 CuTe-DSL 内核融合降 DSv4.1 解码 O-projection 延迟为主旨，属内核性能。",
+      "tags": ["perf", "medium-risk", "deepseek-v4.1", "kernel-fusion", "cute-dsl", "mxfp8", "sm100", "attention"],
+      "pr_number": 58634
+    },
+    {
+      "sha": "fba47397f304993741d2b76d73fb42e5be3e8eac",
+      "comment": "**背景**：`InputBatch.condense()` 把被搬走请求那一行的 `allowed_token_ids_mask_cpu_tensor` 复制进空出的索引，却从不清理源行；`add_request` 只在新请求设了 `allowed_token_ids` 时才写该行，于是后来复用该索引的无限制请求会保留上一个请求的白名单、按陈旧掩码采样（修 #43894）。**方法**：像 `remove_request` 那样用 `fill_(False)` 清空被腾空的行（+57/-0，`vllm/v1/worker` 及其测试）。**效果**：`tests/v1/worker/test_gpu_input_batch.py::test_condense_clears_stale_allowed_token_ids_mask` 通过；与 #48419（`swap_states()` 行视图别名塌行）是不同 bug。",
+      "sig": "sig-core",
+      "sig_reason": "V1 InputBatch 的 allowed_token_ids 掩码搬运正确性，属核心 worker。",
+      "tags": ["bugfix", "high-risk", "input-batch", "allowed-token-ids", "structured-output", "silent-corruption", "v1"],
+      "pr_number": 43931
+    },
+    {
+      "sha": "fff03267dae61d03615225c2f48a06082d842e2d",
+      "comment": "**背景**：pull-mode prefiller 以新 engine ID 在同一 host:port 重启时，decoder 可能一直保留上一个 peer 的 NIXL 资源与缓存 metadata 直到 TTL 清理。**方法**：握手成功后检测该替换、把旧 peer 标记待清；等在旧 peer 上的请求与挂起握手结束后再释放旧状态，从而既不误删仍在用的资源、又能无需重启 decoder 或等 TTL 驱逐就完成清理（5 文件 +237/-3，`vllm/distributed/kv_transfer`）。**效果**：`pytest tests/v1/kv_connector/unit/test_nixl_connector.py` 143 passed；另在 2×RTX PRO 4500（一 P 一 D，Qwen3-0.6B）上把 P 正常重启两次、强制关机后再启一次，D 保持运行，每次 P 都以新 engine ID 回到同址、D 清掉旧 peer 状态，重启后新请求成功且与原 P/D 输出一致（被强关打断的请求失败且不续传）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "NIXL KV connector 在 PD 分离下的死 peer 资源回收，属多级 KV 传输。",
+      "tags": ["bugfix", "medium-risk", "nixl", "kv-connector", "disaggregated-serving", "resource-cleanup"],
+      "pr_number": 50047
+    },
+    {
+      "sha": "3137ff07739f0cd19e06119506c6432a4a7e77ad",
+      "comment": "**背景**：Kimi-K3 的 SiTU MXFP4 MoE 有三族只差激活精度的 FlyDSL 内核，而 vLLM 的这个 flag 原本是布尔（开=a4w4、关=a16w4），完全选不到 a8w4。**方法**：把 `VLLM_ROCM_USE_AITER_MOE_SITUV2` 改成吃 dtype 名以便同一 server 配置下 A/B——`a16w4`（也接受 `0`，两 env 都不设，走 `flydsl_moe1_abf16_wfp4_*`）/ `a8w4`（导出 `AITER_SITUV2_A8W4=1`，`flydsl_moe1_afp8_wfp4_*`）/ `a4w4`（默认，unset/`auto`/`1`，导出 `AITER_SITUV2_A4W4=1`，`flydsl_moe1_afp4_wfp4_*`），各对应一份 aiter tuned CSV；未知值在 env 读取处抛 `ValueError`；旧的 `VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4` 别名不再被读（现无效果）（5 文件 +103/-88，`vllm/_aiter_ops.py`、`vllm/envs.py`、`vllm/model_executor/layers`）。**效果**：8×MI350X（gfx950）TP8 下只需改这一个 env 即可在三档激活精度间切换（niah_single_2 A/B 表在原文截断处）。",
+      "sig": "sig-quantization",
+      "sig_reason": "以激活量化精度（a4w4/a8w4/a16w4）选择为核心的 MoE scheme 开关，推翻 sig-model-performance 提示归量化。",
+      "tags": ["feature", "low-risk", "rocm", "kimi-k3", "moe", "quantization", "mxfp4", "env-var", "aiter"],
+      "pr_number": 58201
+    },
+    {
+      "sha": "0c87a197b856a25670cc711456533e5ef9f94d9f",
+      "comment": "**背景**：`VLLM_BATCH_INVARIANT=1` 并未阻止 `pass_config.enable_sp`/`fuse_gemm_comms` 被启用。`SequenceParallelismPass` 会把 `all_reduce + rms_norm` 改写成 `reduce_scatter + rms_norm + all_gather`（编译范围超过 `sp_min_token_num` 时），而 reduce-scatter 走普通 PyNccl，其归约顺序取决于哪个 rank 拥有某 token 的分片、即随 batch 组成变化。4×RTX PRO 6000、Qwen3-1.7B 上实测：SP 开启时 bs=1 与 bs=64 有 1522/1536 个采样 token 的 logprobs 不一致、greedy 输出改变；SP 关闭时 1536 全一致（修 #56370）。**方法**：在 `vllm/config/vllm.py` 既有 batch-invariance 守卫旁，`VLLM_BATCH_INVARIANT=1` 时强制 `enable_sp = fuse_gemm_comms = False` 并 `warning_once`；在 `tests/v1/determinism/` 加多 GPU 回归测试（TP=4、prompt 跨 `sp_min_token_num` 两侧），无守卫即失败；在 `docs/features/batch_invariance.md` 记录该限制。**效果**：2 文件 +21/-1。让 SP 的 reduce-scatter 本身变得 batch-invariant（owner 无关的归约顺序，如 MoE combine 的 `reduce_scatterv`）留作后续，以便日后重新启用。注意设置 `enable_sp` 时 `VllmConfig` 目前会回落到 V1 model runner（MRV2 尚不支持 SP）。",
+      "sig": "sig-core",
+      "sig_reason": "VllmConfig 的 batch-invariance 守卫与编译 pass 开关，属核心配置确定性。",
+      "tags": ["bugfix", "medium-risk", "batch-invariance", "sequence-parallel", "async-tp", "determinism", "config"],
+      "pr_number": 56377
+    },
+    {
+      "sha": "7a877ae34dcf4a7d46de08eb16db4699e1e0047c",
+      "comment": "**背景/方法**：Qwen3.8-Flash-Next 的 QSA indexer 每次调用按当次尺寸申请 logits workspace，反复的变尺寸分配导致显存碎片（修 #56457）；改为始终预留最坏情况的 logits workspace，使后续调用不再撞到新分配（+13/-2，`vllm/models/qwen4_exp`）。**效果**：消除该路径的动态分配抖动（PR 的 Test Plan/Test Result 留白，详见原文）。",
+      "sig": "sig-core",
+      "sig_reason": "模型层 workspace 的显存预留/碎片修复，属核心显存管理。",
+      "tags": ["bugfix", "medium-risk", "qwen", "qsa-indexer", "memory-fragmentation", "workspace"],
+      "pr_number": 57105
+    },
+    {
+      "sha": "eb0f2ca37f65e496e8c67a7497e818c8a92bae46",
+      "comment": "**背景**：某些 MooncakeStoreConnector 部署为了 RDMA 的 KV-cache 传输，需要 KV cache 使用 NVLink 或 BAR 暴露的显存而非默认 CUDA 分配器。**方法**：当 `kv_connector_extra_config` 里配了 `custom_mem_pool` 时，用对应的 Mooncake allocator（NVLinkAllocator / BarexAllocator）创建 `torch.cuda.MemPool`，未配置则沿用既有 CuMem/default 行为；自定义池与 CuMem 分配、sleep-mode 不兼容，在 connector 初始化时拒绝冲突组合（7 文件 +193/-4）。改动分四处：`mooncake/store/worker.py` 校验 custom_mem_pool、创建并保有池、检测 CuMem/sleep 冲突、给不支持的 Mooncake 版本给出可操作错误；`connector.py` 把自定义池上下文暴露给 GPU worker；`multi_connector.py` 从子 connector 转发自定义池并拒绝多个子都提供池的配置；`vllm/v1/worker/gpu_worker.py` 在 KV-cache 分配时使用 connector 提供的池、保留原回落。**效果**：新增 `test_multi_connector.py` 覆盖无池、单池转发、多池冲突三种情形。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Mooncake KV connector 的显存池与 RDMA KV 传输配置，属多级 KV 存储。",
+      "tags": ["feature", "medium-risk", "mooncake", "kv-connector", "custom-mem-pool", "nvlink", "rdma", "disaggregated-serving"],
+      "pr_number": 49300
+    },
+    {
+      "sha": "cd1daf58a98aad8c7241377edbe91a19aa38f71a",
+      "comment": "**背景**：`SimpleCPUOffloadConnector` 的遥测未对外暴露，而 offloading connector、NIXL、mooncake 都走 `KVConnectorStats` 这一契约；manager 本就已经追踪了每一个量。**方法**：仅在调度侧（不碰传输路径）通过既有 `KVConnectorStats` pipeline 暴露五个 `vllm:simple_kv_offload_*` 序列、每 engine step 排空一次：`save_outcomes_total{outcome}`（`stored` 或 `dropped_cpu_full`/`dropped_request_gone`/`dropped_null_block`/`dropped_not_hashed`/`skipped_already_cached`/`skipped_in_flight`）、`load_blocks_total`（从 offload 池恢复到 GPU 的块 + 借 offload 命中省下的 prefill）、`used_blocks`（被在途传输或缓存命中钉住的池块，warm 但可驱逐的不计）、`pending_store_blocks`（排队/已发起/废弃的 store，只增不减即说明传输卡住）、`info{backend,page_cache,lazy_offload,capacity_blocks}`（恒为 1 的配置指纹）。因走 `KVConnectorStats`，每步 CLI 日志经 `reduce()` 也一并拿到（常量 info gauge 在那里被跳过）。一处行为变更：`reset()` 现在把上次排空后计到的 outcome 结转进新建的 `BoundaryStoreStats`，使跨 cache reset（如中途 LoRA 卸载）的窗口不被丢；`get_boundary_store_stats()` 仅诊断用，控制流不读。**效果**：6 文件 +903/-6（含 `docs/usage/metrics.md`、`tests/v1/kv_connector`、`vllm/v1/simple_kv_offload`）；与 #41790（worker 侧 DMA 拷贝路径的字节/计时/直方图）不重复——本 PR 是调度侧逻辑块计数。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "CPU KV offload connector 的可观测性指标，属多级 KV 卸载。",
+      "tags": ["feature", "low-risk", "kv-offload", "prometheus", "metrics", "observability", "simple-cpu-offload"],
+      "pr_number": 57251
+    },
+    {
+      "sha": "4be061c5afab75d8f36f83db48097776eb936a34",
+      "comment": "**背景**：FlashKDA 的 K2 kernel 把 KDA recurrent state 存成 bf16、每 16-token tile 舍入一次，GLM-5.3-Flash 长 prefill 上误差跨 tile、跨 chunked-prefill 边界累积，表现为长上下文工具调用输出损坏。**方法**：把 FlashKDA pin 从 `b59532f` bump 到 `17a037d`（vllm-project/FlashKDA#13 合入 dev），让状态在 tile 间保持 fp32、补上缺失的 TMA store wait、修 sm_10x 寄存器压力回归；唯一改动是 `cmake/external_projects/flashkda.cmake` 的 `GIT_TAG`（+1/-1），两侧 op schema、`flash_kda.h`、源文件列表与 cutlass 子模块一致。**效果**：RedHatAI/GLM-5.3-Flash-NVFP4 TP2 上 B200/H200 验证——`test_fwd_full` 在 B200 580/580；4k~128k 的终态相对误差 0.37-0.39%（原 0.85-1.24%）；42k 探针 B200 正确率 87.5%（原 67.6%）、H200 31/32（原 21/32）；kernel 时间几何均值快 4.6%；端到端吞吐与旧 pin 相差 ±1.3% 以内（末尾结论在原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "GLM-5.3-Flash 的 KDA 内核精度与性能 pin bump，属内核层。",
+      "tags": ["bugfix", "low-risk", "flashkda", "glm-5.3-flash", "kda", "fp32", "long-context", "pin-bump"],
+      "pr_number": 58846
+    },
+    {
+      "sha": "927c87b3472a39da79a95a8df12d0a2b21e2d32e",
+      "comment": "**背景**：让 DSpark/DFlash 这类 dense draft 以 DCP=1 跑在带 DCP 的 target 旁边，draft 后端就不必自己支持 DCP。**方法**：`KVCacheSpec.dcp_sharded` 把 draft 的分配、slot mapping、prefix caching 与 offload 同 target 分片解耦；MLA/dense 混合缓存用 block-outer 打包，FlashInfer 从 attention metadata 拿解析后的布局；既有 MLA-draft 的 PCP 限制不变（32 文件 +606/-201，覆盖 `tests/v1/attention`、`core`、`e2e`、`kv_connector`、`simple_kv_offload`、`spec_decode` 等）。**效果**：CPU 回归 456 passed/1 skipped，draft 输入/metadata/block-table GPU 回归 19 passed，ruff/mypy（Py3.10–3.13）通过；GSM8K（GLM-5.3 + GLM-5.2 DSpark，TP4/DCP2，FlashInfer eager）得 100/128 对 target-only 104/128、mean acceptance length 3.81，greedy token 零失配但精度未对齐；FlashAttention 4 全图捕获/重放 12/16、1,661 token 零 greedy 失配，FlashInfer 在该混合布局禁用全图，PCP+DCP 仅有配置/分配覆盖。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "主旨是让 DSpark/DFlash 投机 draft 与 DCP target 混跑，属投机解码基础设施。",
+      "tags": ["feature", "medium-risk", "spec-decode", "dspark", "dflash", "dcp", "pcp", "kv-cache", "attention-layout"],
+      "pr_number": 56723
+    },
+    {
+      "sha": "77871126f9b69cff9feffff390d1171a60dbd7e2",
+      "comment": "**背景**：DSV4.1 解码（TP4、`0 < M <= 16`、FULL CUDA graphs）每个子层都以 fused TP all-reduce + mHC kernel 收尾；MoE 之后该边界前面还单独跑着 FlashInfer 的 MoE finalize（top-k 加权和）与一次 shared-expert 加法。**方法**：把 finalize 与 shared add 折进边界：① vendor FlashInfer CuTe-DSL 低延迟 MNNVL all-reduce（`vllm/models/deepseek_v41/nvidia/ops/cute_dsl/`，取自 flashinfer@139af6f6 的 H5120 presets），`_SharedOnlyPublishDeviceKernel`/`_group_leader_block_sum` 与上游字节相同，`_QuadFinalizePublishDeviceKernel` 加了 `fp32_weights` 选项（DSV4.1 router 出的是折入 routed scaling 的 FP32 top-k 权重，FlashInfer 原本读 BF16），`_LamportMHCDeviceKernel` 把残差加与拷贝换成 hc 流的 mHC post-mix（存为新残差）与其 pre-mix 折叠、由未改的 RMSNorm 归一，替掉 `torch.ops._C_custom_ar.all_reduce_mhc`（#57643）在 overlap 路径上的用途；因该 CUDA kernel 再无其他用户，删掉 `csrc/libtorch_stable/all_reduce_mhc.cu` 与其 CMake 条目，保留并复用 #57643 的边界接线（`reduce_results`/`fuse_mhc_all_reduce`/`supports_mhc_all_reduce`）；② MoE 经 #58635 保持未 finalize——TRTLLM MXFP4 expert 层在建模型时以 `defer_moe_finalize(MHC_OVERLAP_MAX_TOKENS)` 请求延迟，每次调用由 `should_defer_moe_finalize(M)` 选路、experts 返回单个 `UnfinalizedMoEOutput`（本 PR 不碰 fused-MoE 代码）；③ DSV4.1 仅在模型文件接线、无新 runner，后继层以 fused 边界开场的层才延迟（DSV4.1-Flash 上 37/40 层），末层与 engram 层前照常 finalize（细节在原文截断处）。**效果**：8 文件 +1807/-309（`cute_dsl/all_reduce_mhc.py` +1134、删 `all_reduce_mhc.cu` -212），含 `tests/distributed/test_custom_all_reduce.py` 更新。",
+      "sig": "sig-model-performance",
+      "sig_reason": "以 CuTe-DSL 内核融合降 DSV4.1 解码边界开销为主旨，属内核性能。",
+      "tags": ["perf", "high-risk", "deepseek-v4.1", "kernel-fusion", "cute-dsl", "all-reduce", "mhc", "moe", "tensor-parallel"],
+      "pr_number": 58586
+    },
+    {
+      "sha": "379e9a1ea8a5995464d9bf775bcd36bb03a0995f",
+      "comment": "**背景/方法**：消息净化未过滤大写形式的内存地址；补上对大写内存地址的过滤以加固 sanitization（+5/-1，`vllm/entrypoints/serve`，含对应测试）。**效果**：更多形态的内存地址在入口被剥离（PR 的 Test Plan/Test Result 留白，详见原文）。",
+      "sig": "sig-core",
+      "sig_reason": "serving 入口消息净化逻辑，属核心前端。",
+      "tags": ["security", "low-risk", "sanitization", "frontend", "entrypoints"],
+      "pr_number": 58832
+    }
+  ]
+}
