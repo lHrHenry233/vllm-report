@@ -1,0 +1,314 @@
+{
+  "date": "2026-10-03",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-08T12:22:00+08:00",
+  "daily_summary": "37 条提交，五路并进：大规模服务/KV 传输的韧性、内核与量化的正确性/性能、前端生成协议与工具调用、冷启动快照(CRIU/Fast Start)、以及持续的 CI/依赖治理。其一，KV 传输与专家并行成串加固——MoRIIO 把 discovery 心跳挪进独立子进程以在 worker 持 GIL 与 router 抖动下保活(#59441)、Mooncake 抑制空 pull 的完成信号以免触发 scheduler 断言(#59347)、精确豁免异步 KV load 写入的 block 以免 allocator zeroing 竞争(#59504)、EPLB 加 contention-aware 迁移分批少占 NIC 带宽(#52641)、FlashInfer one-sided MoE all2all 转发 fp8 combine flag(#57995)。其二，内核/量化性能密集落地——RDNA3 W4A16 GPTQ 重设计 split-K epilogue 修精度与确定性(#54706)、FlashInfer CuteDSL MegaMoE backend 集成(#54049)、GLM-5.3 sparse MLA 跨层复用 index 转换 3.5~3.9x(#59464)、MoE weighted-sum launch 调参(#59731)、Qwen4Exp SM121 TP=1 skinny-GEMM(c1 ITL −9.5%)(#59753)、per-token FP8 改 `amax` value-only reduction(#59800)、MiniMax-M3 indexer 保留原生 FP8 MMA(#59481)、gfx942 Kimi-K3 MXFP4→int4 opt-in(#51274)。其三，前端协议与投机解码——`/inference/v1/generate` 加 `output_mode`(RFC #56851 Phase 1、token-in-token-out)(#58588)、GLM-4.7 非严格工具调用套 shallow structural tag(#56403)、逐行 prefill 候选 id 打分(M2 of #56860、on-policy 蒸馏)(#56984)、空 streaming-input 不再误发真实请求(#59015)；GLM-5.3 融合多步 draft decode(c1 吞吐 +13.3%)(#57443)、watermark draft prompt 长度在 FULL CUDA graph 下修正(#59779)。其四，冷启动快照两连修——清理前上报 CRIU 失败细节(#59661)、TP1 snapshot 默认 `NCCL_IB_DISABLE=1` 规避遗留 InfiniBand 描述符致 CRIU 拒绝(#59699)。风险与关注点：大量性能/修复 PR 的验收数字在测试段被截断（收益详见原文）；#59504/#59347 触及核心 KV 分配与 scheduler 所有权、#54706 改量化内核 epilogue 契约、#56984/#58588 改前端采样/生成协议，均需留意回归面；其余为 CI 覆盖扩展(#56679)、padding 测试(#59333/#59332)、依赖 bump(#59796/#59396)、Rubin 公开 base 镜像(#59288)、agent 文件 pre-commit 治理(#59657)、多模态 M-RoPE 修复(#58890) 与 Nemotron Parse revert(#59805)、文档(#58476/#59459)。",
+  "sig_summaries": {
+    "sig-large-scale-serving": "五项，KV 传输/PD 与专家并行通信的正确性与带宽韧性。#59441 把 MoRIIO discovery 注册挪进独立 heartbeat 子进程，在 worker 持 GIL 与 router 短暂不可用时仍保活重试、并把子进程意外退出经 `get_finished()` 上报；#59347 让 Mooncake 仅当 pull 含本地目标 block 时才报接收完成，抑制「仅通知」型空 pull 误发完成而触发 scheduler 请求所有权断言；#59504 引入 `get_loaded_kv_cache_group_ids(request)` 精确豁免异步 KV load 写入的 block 免受 allocator zeroing 竞争（含 sliding-window 与 circular-buffer index 0）；#52641 为异步 EPLB 加 opt-in contention-aware 迁移分批 scheduler（每 batch 内一 rank 至多与一 peer 通信）；#57995 在 FlashInfer one-sided MoE all2all 转发 fp8 combine flag 以提升 EP 通信吞吐。",
+    "sig-core": "七项，前端生成协议/工具调用为头，叠加冷启动快照与配置维护。协议侧 #58588 给 `/inference/v1/generate` 加 `output_mode`(tokens/text union、RFC #56851 Phase 1、token-in-token-out)、#56403 为 GLM-4.7 非严格工具调用在 `structural_tag_registry` 注册 shallow structural tag 约束 post-reasoning 输出；采样/引擎接口 #56984 把 `prompt_logprob_token_ids` 改逐行候选 id（M2 of #56860、供 on-policy 蒸馏 teacher 打分、经 zero-copy int32 ndarray 与 Rust 前端）；#59015 修空 streaming-input 误把占位请求提交引擎、直接放 `STREAM_FINISHED`；#59661 在 snapshot 清理删日志前上报 CRIU 失败细节、#59699 在 donor 环境默认 `NCCL_IB_DISABLE=1` 规避 TP1 snapshot 遗留 InfiniBand 描述符被 CRIU 拒绝（均属 initialized-snapshot/Fast Start 冷启动）；#59781 删除 config/env 死字段（kv_transfer/ec_transfer/parallel/envs）。",
+    "sig-model-performance": "五项，量化 GEMM/MoE/注意力内核的正确性与性能。#54706 重设计 RDNA3 W4A16 GPTQ 内核的 split-K epilogue——改 FP32 partial 定序 reduction、去掉 CAS atomic，修 bf16/fp16 narrowing-before-accumulate 造成的每前向数值误差与不确定性；#54049 集成 FlashInfer CuteDSL MegaMoE 为 `flashinfer_moe_ep_cutedsl` backend 加速大 batch prefill；#59464 把 GLM-5.3 sparse MLA 的逻辑→物理 index 转换从每层改为每 group 复用（一次前向 78→21 次转换、3.5~3.9x）；#59731 调 `moe_fused_mul_sum` launch（`BLOCK_K` 封顶、按 SM 选 8/16 warps）几何均值提速最高 2.37x；#59753 给 Qwen4Exp SM121 TP=1 BF16 shape 补 skinny-GEMM plans（c1 decode ITL −9.5%）。多数收益数字在验收段被截断（详见原文）。",
+    "sig-quantization": "三项，FP8/低比特量化路径。#51274 为 gfx942 上 Kimi-K3 加 opt-in `int4_per_group_32`——把 MXFP4 专家权重加载时一次性 requantize 走 AITER packed-int4 路径（有损、需显式覆盖、默认 MXFP4 不变）；#59800 把原生 per-token FP8 的 `max(dim=-1)` 换成 `amax` value-only reduction、去掉 Inductor 生成的 `max_with_index`；#59481 修正 MiniMax-M3 Triton indexer scorer 把匹配 e4m3×e4m3 也误上转 bf16、恢复原生 FP8 MMA 以省长上下文 decode 的每 tile 转换。",
+    "sig-spec-decode": "两项，MTP/draft 路径的性能与正确性。#57443 为 GLM-5.3 启用融合多步 draft decode——首步 build metadata 一次、后续就地 update，并发 1 E2E 吞吐 +13.3%；#59779 修 draft 水印去重 mask 在 FULL CUDA graph 下从过期 UVA buffer 读 prompt 长度（影响 EAGLE3/MTP/DSpark），改异步拷贝到设备内存使 graph 与 eager 一致。",
+    "sig-omni": "两项，多模态位置编码与模型加载。#58890 修 `Qwen3OmniMoeThinker` 的 `get_mrope_input_positions` 误把 `PlaceholderRange.offset` 当 modality-start 索引、每媒体项多发一个 bos slot 致位置比 token span 长一格（媒体结尾 prompt 致命崩溃、尾随文本静默错位）；#59805 revert #53020 对 Nemotron Parse 的 `lm_head.weight` tying（2.0 checkpoint 的 tokenizer 在 CI 镜像里抛 `DuplicatePatternError`、该步自合入起一直红）。",
+    "sig-ci": "十一项，类型/依赖/构建/测试治理。ROCm/AMD 侧 #56679 扩 distributed/model/eval 的 Buildkite 覆盖（15 镜像 + 5 独立组）、#59333/#59332 分别补 AiterExperts 逻辑 padding 与 `VLLM_ROCM_MOE_PADDING` 内存-stride 透明性测试；#59850 去掉 B200 Kimi K3 job 里重复的 skinny GEMM 测试、#59568 停用 XPU 上缺失内核的 FusedMMInputNorm 测试、#59772 修权重传输测试对可选 ModelExpress backend 的处理、#59525 用 `vllm_runner` fixture 重构 fusions_e2e conftest 保证 GPU 清理；#59288 把 Rubin 镜像改在公开 `nvidia/cuda` base 上构建并清 Dockerfile workaround；#59796 升 `tokenizers` 到 0.23.2 修 `DuplicatePatternError`、#59396 升 tpu-inference 到 v0.30.0；#59657 加 pre-commit hook 校验 agent 指令文件/skills 并删嵌套 `CLAUDE.md`。",
+    "other": "两项纯文档：#58476 把 `baidu/ERNIE-4.5-0.3B-PT` 加入 batch-invariance 已验证模型列表；#59459 为 RFC #58253 的 Reviewer 角色新增 `docs/community/reviewers.md` 并更新贡献指南。"
+  },
+  "commits": [
+    {
+      "sha": "4ac0d0eac25eecc98ff519887f2aa3d659dc75f3",
+      "comment": "**背景**：RDNA3(gfx11) 的 W4A16 GPTQ 内核用 CAS atomic 累加 split-K partial，且 narrowing 发生在累加之前——低精度加法不满足结合律，于是哪个 split block 先赢得 CAS 会改变结果，这个数值误差存在于每一次受影响的前向、每种解码配置里；greedy 解码只是让它显形（temperature 0 下舍入抖动会在重复生成间翻转 `argmax`，见 #50603），采样(T=0.6)下同样的误差藏在采样噪声之下但仍在每个上报指标之下。**方法**：保留计算内核与 dispatch 不变、只换两条路径的 epilogue：`FP32 per-split partial → 固定升序 z 的 FP32 reduction → 一次最终 bf16/fp16 cast`；每条路径对每个输出元素恰好写一次，`k_split==1`(WMMA) 与 `z_count==1`(scalar) 直接存/放（无 scratch、无 reduce、无 atomic）；FP32 partial scratch 用 `at::empty` 且覆盖由构造保证（每个 reducer 可见的 `(z,m,n)` 槽在所有七个 WMMA 变体与标量内核里都恰有一个写者，不变式记录在 `alloc_wmma_partials`）故无零填充；scratch 每次调用经 caching allocator、按行 tiling 使上界与调用方 M 无关（+1524/-266, 5 文件, `csrc/rocm/q_gemm_rdna3*.cu`、`moe_q_gemm_rdna3.cu`）。**效果**：W7900/gfx1100 上以 FP32 dequant 参考、合成 uint4b8/group-128 权重 K=4096 测 max abs error，标量 bf16 从 0.24–0.37 降到 0.062（完整表见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修复 ROCm RDNA3 W4A16 GPTQ 量化 GEMM 内核的 split-K 累加精度与确定性，属内核正确性。",
+      "tags": ["bugfix", "medium-risk", "rocm", "rdna3", "w4a16", "gptq", "determinism"],
+      "pr_number": 54706
+    },
+    {
+      "sha": "f03026a548b18ba0a99ca0a632b9343f25a66bc9",
+      "comment": "**背景/方法**：让 MoRIIO discovery 注册在 worker 持有 GIL 期间仍保持存活、并在 router 短暂不可用时重试——由 rank-0 worker 起一个独立 heartbeat 子进程做不变的 MessagePack 注册，从而与主线程 GIL 解耦；临时发送超时→重试直到 worker 退出；子进程意外退出→ worker `get_finished()` 抛带其退出码的异常；worker 关闭/父管道 EOF→ 停止并回收子进程。这是从 #58968 抽出的独立修复、不依赖 K3 数据路径（+284/-71, 4 文件, `vllm/distributed/kv_transfer/.../moriio/`）。**效果**：之前 main 的实际线程化发送在 300ms GIL-hold 测试失败，评审 HEAD 上 router-outage 测试无法恢复注册、杀子进程或结束输入管道时 worker 完成轮询静默（3 failed）；修复后既有 proxy-routing 与 MoRIIO TP-ACK 套件 46 passed、0 skipped（用真实子进程 + loopback ZeroMQ 覆盖 GIL 独立性、初次注册、router 消失直到发送队列超时、router 回来后重注册、父进程死亡、重复关闭、信号与零码子进程退出的传播）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MoRIIO KV connector 的发现心跳子进程在 GIL 争用与 router 抖动下的韧性，属 KV 传输服务。",
+      "tags": ["bugfix", "medium-risk", "kv-connector", "moriio", "heartbeat", "disagg"],
+      "pr_number": 59441
+    },
+    {
+      "sha": "e319f86f15f3bf72d9016d5324500730a1f16e25",
+      "comment": "**背景**：#56860 的 M2（接 #54335）。把 `SamplingParams.prompt_logprob_token_ids` 从请求级改为逐行：每个被打分的因果 prompt 行携带一份候选列表，使 on-policy 蒸馏的 teacher 按 student 自己的 top-K 给每个响应位置打分。**方法**：输入整数数组 `[num_rows, num_ids]`（或嵌套 list）、`-1` 补齐短行，行数须等于 `prompt_len - 1 - prompt_logprob_start`；表在 `verify()`（processor deepcopy 之前）一次性归一为 C-contiguous `int32`、走 runner 其他 token-id buffer 一样的既有 zero-copy ndarray 路径（相对全 `list[list[int]]` 原型：4000×64 仅 +5ms vs +105ms，4000×1024 +9ms vs +1.6s）；JSON 用 `Annotated[np.ndarray, GetPydanticSchema(... list[list[StrictInt]])]` 且 `PydanticMsgspecMixin` 现保留 `Annotated` 元数据（`include_extras=True`）；`verify()` 校验 shape、宽度(`--max-logprobs`)、`max_model_len` 行界再词表，admission 再对 prompt 校精确行数；worker 按绝对 prompt 行对每个 prefill chunk 切片、gather 时 clamp `-1`、emit 时 mask 成 `-inf`、分数发出后释放状态；Rust 前端 `/inference/v1/generate` 解析 `Vec<Vec<i32>>`、以同序施加同样校验并发 int32 ndarray（大时走 aux frame），因 engine-core 不复校验（+365/-161, 17 文件）。**效果**：输出形状不变 `[num_rows, num_ids]` float32、padding 项为 `-inf`；GB200 + nightly 镜像验证（明细见原文截断处）。",
+      "sig": "sig-core",
+      "sig_reason": "扩展 SamplingParams/engine 侧 prefill 逐行打分接口（含 Rust 前端），属核心采样与引擎接口。",
+      "tags": ["feature", "medium-risk", "sampling", "prefill-scoring", "logprobs", "rust-frontend"],
+      "pr_number": 56984
+    },
+    {
+      "sha": "bc21cba9673cfc2256a2726b4bc32f062237cd35",
+      "comment": "**背景/方法**：RFC #56851 的 Phase 1——generate 请求可设 `output_mode:\"text\"` 让响应在 token id 旁边带 detokenize 文本、不再需要单独 `/derender`；默认仍 `\"tokens\"`，旧客户端只多一个 `output_mode` 字段。`GenerateResponse`/`GenerateStreamResponse` 变为 tokens 类与 text 类的 union、由 `output_mode` 选择，无该字段的 body 仍按 tokens 解析故 `/derender` 对旧响应继续可用；`/derender` 现对 text 响应返回 400（text 已裁 stop string、再解码 `token_ids` 会把它加回）；text 下 logprobs 带解码 token 与 `bytes`、`--return-tokens-as-token-ids` 保留 `token_id:N` 占位；text 流在有新文本或 finish reason 但无新 token id 时也发 chunk（覆盖为 stop string 扣留的文本与 abort 后的末 chunk）；`output_mode=\"text\"` 在无 tokenizer 的服务器或 `sampling_params.detokenize` 为 false 时返回 400；`/inference/v1/abort_requests` 在 serve generate 处注册且设 `--api-key` 时要求 API key（无鉴权的 `/abort_requests` 仍 `--tokens-only`）；新增 `docs/serving/online_serving/token_in_token_out.md`（+1356/-169, 18 文件）。**效果**：新测试覆盖协议解析与校验（含 `/derender` 拒绝 text 响应）、text 响应与流 chunk（仅 finish reason 或仅文本）、abort 后的末 chunk、带 API key 的 abort 路径（详见原文截断处）。",
+      "sig": "sig-core",
+      "sig_reason": "前端 `/inference/v1/generate` 增加 output_mode 协议与 abort 端点，属核心 API frontend。",
+      "tags": ["feature", "medium-risk", "frontend", "token-in-token-out", "protocol"],
+      "pr_number": 58588
+    },
+    {
+      "sha": "5f30fc7031cae49bf51073fc953d419b08f8887c",
+      "comment": "**背景**：Mooncake 会发一个没有本地目标 block 的 pull、只为通知 Prefill 端其 producer block 可释放，此时 Decode 请求并不等远端 KV；但 `MooncakeConnectorWorker.process_pulling_result` 把每个成功 pull 在 worker task 排空后都报成 `finished_recving`——对空 pull 会给一个不在 `WAITING_FOR_REMOTE_KVS` 的请求发完成信号、可触发 scheduler 的请求所有权/状态断言。空 pull 在早期 abort 清理、以及远端前缀命中缩减到无可传本地块时都可达。**方法**：仅当 pull 至少含一个本地目标 block 时才报成功接收完成（`if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids): finished_recving_reqs.add(...)`），producer 通知与 pull-task 计数不变，也与既有失败接收路径（无本地 block 时已跳过 scheduler 通知）一致；在 worker 完成汇聚点施加检查，同时覆盖仅通知与全前缀空 pull、而对每个有真实本地目标的 pull 保留完成（+37/-1, 2 文件）。**效果**：新增 `test_pull_completion_requires_local_blocks` 与 `test_kv_consumuer` 验证（CPU pytest 命令见原文）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "Mooncake KV connector 空 pull 完成信号抑制以免触发 scheduler 断言，属 PD 分离 KV 传输。",
+      "tags": ["bugfix", "low-risk", "kv-connector", "mooncake", "disagg", "scheduler"],
+      "pr_number": 59347
+    },
+    {
+      "sha": "b0e21b308352587a6fd02f72722a2e815bfd62f0",
+      "comment": "**背景**：gfx942 不支持原生 MXFP4 路径用的 scaled FP4 转换指令。**方法**：为 gfx942 上 Kimi-K3 增加显式 `int4_per_group_32` MoE 权重覆盖——选中时把 MXFP4 专家权重在加载时一次性 requantize、之后经 AITER 替换版 BF16×packed-int4 FlyDSL 路径服务：注册 `int4_per_group_32` 为 MoE 权重量化键、要求显式 `--quantization-config.moe.weight int4_per_group_32`、要求 A16W4/int4 AITER 入口且除非支持 SiTUv2 否则 fail closed、每次转 8 个专家并在转下一个前释放源张量以界定加载期瞬时显存、记录有损警告、把 `int4_per_group_32` 留在在线 MoE 表之外好让 `Mxfp4MoEMethod` 在加载时转换；默认 MXFP4 路径不变、转换有损且绝不按架构自动发生（+346/-2, 5 文件）。**效果**：单测 `tests/quantization/test_quantization_config_args.py`、`tests/models/kimi_k3/test_gfx942_int4.py` 通过；生产 EP shape(model_dim=3584、intermediate=3072、local_experts=112、topk=15、SiTUv2) 上严格 AITER 对照 torch 参考通过，8x MI325X TP8+EP+AITER fused MoE+全/分段图捕获验证（因 FlyDSL 0.3.2 `gemm2` 在 gfx942 无法选 `BUFFER_ATOMIC_FADD` of `v2bf16`，那些跑用 `moe_2stage_a1...`，明细见原文截断处）。",
+      "sig": "sig-quantization",
+      "sig_reason": "为 gfx942 增加 MXFP4→int4 的 MoE 权重量化转换路径，属量化。",
+      "tags": ["feature", "medium-risk", "rocm", "quantization", "mxfp4", "int4", "moe", "kimi-k3"],
+      "pr_number": 51274
+    },
+    {
+      "sha": "ca0df1f1227cdd993835a4d2a62861dd3bd2e893",
+      "comment": "**背景**：allocator zeroing 会与 async KV load 竞争，包括本地前缀命中之下的 sliding-window block 与 index 0 的 circular-buffer block。**方法**：引入 `get_loaded_kv_cache_group_ids(request)`（从 #59197 移来、#59197 也用它做 replay 决策）——默认前缀可缓存 group、NIXL/Mooncake P/D 的所有传输 group、MultiConnector 按请求选择委托；据此精确豁免 connector 声明的那些新分配外部 block 的 zeroing，同步 load 仍在 load 前 zero，对选中 connector 不 load 的 group 保留 zeroing（+162/-72, 17 文件, 含 `vllm/v1/core`、`vllm/distributed/kv_transfer`、`vllm/v1/kv_offload`）。**效果**：最终单测 649 passed、4 个 GPU/integration 用例被排除命令挡掉（两个 GPU setup 用例先遇并发内存 profiling 失败、单独在另一 GPU 顺序跑通，async 失败 fixture 现声明其 loaded group）；覆盖 store/P/D group 选择、async/sync zeroing、KpoolTail 分配、MultiConnector 路由、replay 与故障恢复；pre-commit 与 Python 3.12 mypy 通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "精确豁免异步 KV load 写入的 block 以免 allocator zeroing 竞争，属多级 KV/PD 传输正确性。",
+      "tags": ["bugfix", "medium-risk", "kv-cache", "kv-connector", "allocator", "zeroing"],
+      "pr_number": 59504
+    },
+    {
+      "sha": "1a001d584244bd21829a5e5bd4a376ea141c0ce3",
+      "comment": "**背景/方法**：`tests/kernels/test_bf16_skinny_gemm.py` 在每个触发 Kimi K3 job 的构建里于 B200 上跑两次——`:nvidia: (B200) Kimi K3`(`models_basic.yaml`, #50089 在 B200 还没有根级 kernels job 时加) 与 `:nvidia: (B200) Miscellaneous Kernels`(`kernels.yaml` catch-all，未 `--ignore` 该文件，main build 92730 已确认在那里跑过)；catch-all 的源依赖(`vllm/`、`csrc/`、`tests/kernels/`)是 Kimi K3 job 的超集，故从 Kimi K3 job 去掉不丢覆盖，`test_kimi_k3_mla_fused_epilogue.py` 因另一归属 L4 attention job 跑不了 SM100 而留在 Kimi K3 job；顺带更新引用「两个 CUDA-only kernel 文件」的 AMD 镜像注释。**效果**：仅 CI 配置改动、无模型输出影响（+3/-4, 1 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "去掉 B200 Kimi K3 job 中重复的 skinny GEMM 测试文件，属 CI 覆盖去重。",
+      "tags": ["chore", "low-risk", "ci", "buildkite", "test-dedup"],
+      "pr_number": 59850
+    },
+    {
+      "sha": "c28834df0093dbb7578f1978764dca92988832a8",
+      "comment": "**背景/方法**：在 `.buildkite/test_areas/` 下新增 15 个 AMD 镜像与 5 个独立 AMD 测试组（独立组跑那些在这些文件里缺 AMD 等价覆盖的命令），跨机型铺开：`mi250_1` PyTorch Fullgraph CUDAGraph 兼容；`mi300_2` Distributed Comm/Compile/Torchrun+Shutdown、GPQA Eval(GPT-OSS)；`mi300_8` LM Eval Large Models ROCm Harness(TP8, optional)；`mi355_1` Spec Decode draft/EAGLE/speculators+MTP nightly；`mi355_2` MoE Refactor BF16 (DP) Integration、Fusion E2E TP2 AR-RMS(Inductor/Dynamo Partition)；`mi355_4` Distributed/Compile+Comm/DP Extended、RayExecutorV2、Qwen3-Next-80B MTP Async EPLB 精度；`mi355_8` LM Eval Harness(TP4)；`mi355_dpx` GPQA Eval(GPT-OSS TP1)；另把一个既有 LoRA 测试里的 async mock 类型收窄以修上游 mypy 失败。**效果**：纯 CI 覆盖扩展（+449/-0, 6 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "扩展 AMD/ROCm 在 distributed/model/eval 等测试区的 Buildkite 覆盖，属 CI。",
+      "tags": ["chore", "low-risk", "ci", "buildkite", "rocm", "amd-coverage"],
+      "pr_number": 56679
+    },
+    {
+      "sha": "28556f8600ade89863b6e25adbe4726666c0fb0e",
+      "comment": "**背景**：nightly build 92230 里 `criu dump` 失败后诊断被 snapshot 清理删除而缺失（#59487 修好 image labels 之后才走到 `criu dump`）。**方法**：在 snapshot 清理移除日志之前报告 CRIU 失败细节——失败的 dump/restore 命令与子进程超时报告会捕获的有界输出与对应 CRIU log 末尾（通过既有 privilege helper 读 `dump.log`/`restore.log` 最后 8192 字节）；原异常仍传播、创建仍删除未完成工件、成功的 capture/restore 走既有路径（`_run` 已捕获子进程输出，但旧 CRIU 路径失败时不报告该输出或 CRIU log，创建随后又删掉未发布工件，等 CI exit trap 再取文件已太晚）（+152/-1, 2 文件, `vllm/snapshot/runtime.py`）。**效果**：`test_launch_cli.py` 相关 6 例在 Mac/Linux CPU 通过，5 个新回归用例对未改 runtime 会失败；Linux 用真实失败子进程替换 CRIU 调 `create_snapshot`，验证 stdout/stderr/dump-log 标记出现在控制台、原 exit-23 异常传播、未完成工件被移除，无需 GPU。",
+      "sig": "sig-core",
+      "sig_reason": "改善 CRIU initialized-snapshot(Fast Start/冷启动) 失败前的诊断可观测性，属核心快照运行时。",
+      "tags": ["bugfix", "low-risk", "snapshot", "criu", "cold-start", "observability"],
+      "pr_number": 59661
+    },
+    {
+      "sha": "9fdb174678c91d5d5aa9249b1aa05e8a8e627653",
+      "comment": "**背景**：#59487 的 torch-nightly job 暴露 TP1 snapshot 捕获失败——受影响 H200 上 NCCL 即便单 rank 进程组也打开 InfiniBand 设备，这些映射在 donor 的 sleep/reload 准备后仍存活、CRIU 拒绝（延续 #51360）。**方法**：仅在 snapshot donor 环境默认 `NCCL_IB_DISABLE=1`（保留显式调用者值、restore 兼容性检查用同一有效默认）；在 CRIU 前拒绝仍打开的 InfiniBand 描述符，错误里给出进程、设备与纠正动作（这不新增分布式/RDMA snapshot 支持）；另修三个相关审计发现——不可读的共享内存清单、畸形的 saved-remap 名、容器启动尝试前的假 CI 残留告警（+227/-9, 4 文件, 含 `vllm/snapshot/runtime.py`、`.buildkite/scripts/initialized-snapshot-e2e.sh`）。**效果**：在失败 worker `mithril-h200-4`(单 H200、`593df82f33` torch-nightly、Qwen3-0.6B FP16) 复现——原 runtime 两次复现捕获失败、verbose 运行定位到 `/dev/infiniband/uverbs7`；fresh-process NCCL probe 显示单 rank 组创建开 24 映射/8 描述符、设 `NCCL_IB_DISABLE=1` 消除且本地 all-reduce 与编译 CUDA 输出仍正确；仅该环境覆盖下原完整 E2E 通过捕获+两次 restore；打补丁 runtime 无外部 NCCL 覆盖也过同一 E2E、两响应返回 token 12095 ` Paris` logprob -0.42218855023384094 匹配 canary（+8 fail/12 pass 回归明细见原文截断处）。",
+      "sig": "sig-core",
+      "sig_reason": "修 TP1 initialized-snapshot 捕获时 NCCL 遗留 InfiniBand 状态致 CRIU 失败，属核心快照/冷启动运行时。",
+      "tags": ["bugfix", "medium-risk", "snapshot", "criu", "nccl", "cold-start"],
+      "pr_number": 59699
+    },
+    {
+      "sha": "faa9860dbda89f8d00f8c9a42fdee0f847363c61",
+      "comment": "**背景/方法**：覆盖 #54966「Test padding(4b)」里逻辑 `hidden_dim_unpadded`/`intermediate_size_per_partition_unpadded` 部分——这两个 `FusedMoEConfig` 字段驱动 `AiterExperts` 的 `hidden_pad`/`intermediate_pad`，让 AITER CK/FlyDSL 内核内部剥掉 padded 区；此前除 MXFP4 自覆盖外无测试迫使它们与 padded size 分叉。给模块化内核测试 harness(`tests/kernels/moe/modular_kernel_tools/common.py`) 加可选 `Config.hidden_dim_unpadded`/`intermediate_size_per_partition_unpadded`(默认 None，其余行为不变)、新增 `test_aiter_moe_padding_matrix` 参数化跨 {无 padding, 仅 hidden, 仅 intermediate, both} × {未量化, fp8_channel_token, fp8_tensor_tensor, fp8_tensor_token, fp8_block_token}，断言 `AiterExperts.apply()` 向 `rocm_aiter_ops.fused_moe` 转发预期 `hidden_pad`/`intermediate_pad`、输出缓冲仍是 raw(padded) 宽、再把该缓冲切到真实 `hidden_dim_unpadded` 区与按真实 unpadded size 跑的 `reference_moe_impl` 比对；加一个待 MI350/gfx950 的 MXFP4 skipped stub。**效果**：20 例中 2 例(block-quant FP8 × {无 padding, 仅 intermediate}) 运行期 skip——AITER block CK GEMM 在该硬件拒绝 raw unpadded hidden_dim shape，故该量化方案只跑 forcing hidden_pad 的模式（+311/-1, 2 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 AiterExperts hidden/intermediate padding 正确性补参数化测试覆盖，属测试。",
+      "tags": ["test", "low-risk", "ci", "rocm", "moe", "padding"],
+      "pr_number": 59333
+    },
+    {
+      "sha": "44198f577fe5cfb4b02297bf6ff7235eb31d742b",
+      "comment": "**背景**：`Qwen3OmniMoeThinkerForConditionalGeneration.get_mrope_input_positions` 误把 `PlaceholderRange.offset` 当作 modality-start token(`<|fim_prefix|>`/`<vision>`) 的索引，但 prompt 替换机制只替换 pad token，故 `offset` 指向第一个 pad token、start token 已被前一段文本覆盖；每个媒体项多发一个 bos slot 使拼装出的位置比 token span 长一格——以媒体结尾的 prompt(如自定义/转写式 chat template) 必触发 `RuntimeError: Position ids length mismatch with input ids length`(对 EngineCore 致命)，带尾随文本的 prompt(标准 chat template) 不崩但从第一个 pad token 起每个 M-RoPE 位置被静默错位一格(所有多模态请求的正确性 bug)。**方法**：去掉多余 bos slot、修每个媒体分支(image/audio/video/audio-in-video) 的 `st` 推进，使发出的位置数恒等于 seq_len（+202/-8, 2 文件）。**效果**：新增单测覆盖每种模态的「媒体在 prompt 末尾」与「媒体后接文本」的精确位置。",
+      "sig": "sig-omni",
+      "sig_reason": "修 Qwen3-Omni M-RoPE 输入位置逐媒体偏移重复计数，属多模态位置编码正确性。",
+      "tags": ["bugfix", "medium-risk", "omni", "mrope", "qwen3-omni", "position-ids"],
+      "pr_number": 58890
+    },
+    {
+      "sha": "8c3b720a4dae3379ba30727ed476b456becb50df",
+      "comment": "**背景/方法**：#59195 覆写了 `FusedMMInputNorm.enabled()`、现在恒返回 True，于是在不存在的 float-based XPU 内核上强制测 `FusedMMInputNorm`；本 PR 停用这些测试、保留可用的 uint8 路径。**效果**：仅改 `.buildkite/intel_jobs/` 下两个 yaml 关掉缺失内核的测试（+11/-3, 2 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "停用 XPU 上针对不存在内核的 FusedMMInputNorm 测试，属 CI 测试维护。",
+      "tags": ["test", "low-risk", "ci", "xpu", "disable-test"],
+      "pr_number": 59568
+    },
+    {
+      "sha": "7dfe3338d5f15dd3ccb233326aa65fde46e427ad",
+      "comment": "**背景**：异步 EPLB 期间多个专家权重可同时经同一 rank 和同一 NIC 传输，这些流量突发与推理争带宽、可抬高服务时延（部分回应 #31671）。**方法**：加一个 opt-in scheduler，按源/目标 rank 分组迁移再切成 batch——每 batch 内一个 rank 至多与一个 peer 通信、独立 rank 对仍并发传输；专家权重仍逐层搬运，但所有 MoE 层的 schedule 每个 rebalance 周期只准备一次以降 Python 开销；`enable_migration_batching` 默认 `false`、设 `true` 时仅在 `use_async=true` 才启用新路径（同步 EPLB 总走旧路径，因推理已暂停、串行 batch 会拉长暂停），每 batch 前恢复 NIXL transfer context 因 `execute()` 会 drain 它（+588/-8, 6 文件, `vllm/distributed/eplb/migration_scheduler.py` 等）。**效果**：新单测 `test_eplb_migration_scheduler.py` 12 passed；四节点(每节点 1x Quadro RTX 6000、Ray 2.56.1、NIXL 1.3.2 over 10GbE 无 RDMA、Qwen3-30B-A3B TP4、32 并发) 500/500 请求端到端服务基准对比（数字见原文截断处）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "EPLB 异步专家迁移的 contention-aware 分批以少占 NIC 带宽，属专家并行/大规模服务。",
+      "tags": ["feature", "medium-risk", "eplb", "expert-parallel", "migration", "nixl"],
+      "pr_number": 52641
+    },
+    {
+      "sha": "8e443871f0783110404838512d1244e83475e142",
+      "comment": "**背景/方法**：让 Rubin(CUDA 13.4) 镜像改用常规公开的 `nvidia/cuda:13.4.1-base-ubuntu24.04` final 镜像而非 `nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04`，并删掉只为 NGC/内部预发布 base 镜像与 wheel 存在的 Dockerfile workaround：文档与 release pipeline 里 `FINAL_BASE_IMAGE` 换公开 base、去掉「需要 devel final 镜像」的旧注（cu134 PyTorch nightly 现以 pip 依赖拉 `cuda-toolkit[...]`、Dockerfile 已装 `cuda-nvcc`/`cuda-nvrtc-dev`/`libcublas-dev` 等 JIT 工具链）；用 `NCCL_VERSION=2.32.3`（首个支持 Rubin SM107 的 NCCL）经 `nvidia-nccl-cu13==2.32.3` 走既有 `UV_OVERRIDE`（NGC 自带 NCCL、bare CUDA 不带）；删 `ENV CUDA_VERSION` 归一、`/usr/lib/libnccl.so.2` symlink、GDRCopy skip、DeepEP 的 `EP_NCCL_ROOT_DIR=/usr` 覆盖、`libcurand.so.11 -> .so.10` 别名与 `/opt/venv/lib`/`nvpl/lib` 的 `ld.so.conf` 条目（服务内部预发布 PyTorch wheel）。**效果**：纯构建/镜像清理（+24/-131, 5 文件, docker/Dockerfile、release-pipeline、requirements）。",
+      "sig": "sig-ci",
+      "sig_reason": "把 Rubin 镜像改在公开 nvidia/cuda base 上构建并清理 Dockerfile workaround，属构建/发布工程。",
+      "tags": ["chore", "low-risk", "ci", "docker", "nvidia", "rubin", "build"],
+      "pr_number": 59288
+    },
+    {
+      "sha": "8bdd8d847dcbdafd80e666ad7fb797a18da62975",
+      "comment": "**背景/方法**：为 GLM-5.3 启用融合多步 draft decode（MTP 投机解码）。以 K=5 为例，旧路径 draft prefill 生成 token#0 后每步 decode 都 rebuild metadata；改为 step1 build metadata 一次、step2 起就地 update metadata，省去逐步重建（+149/-0, 7 文件, `vllm/v1/attention`、`vllm/v1/spec_decode`、`vllm/v1/worker`）。**效果**：精度由单测覆盖；`vllm serve zai-org/GLM-5.3 -tp 8` + MTP(`num_speculative_tokens:5`, greedy draft, standard rejection) 下并发 1 E2E 吞吐 +13.3%、平均延迟 6.68s→5.90s(−11.8%)（并发 1/4/16 的 latency/throughput/TTFT 明细见原文截断处）。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "优化 MTP 多步 draft decode 的 metadata 构建以提升投机解码吞吐，属 spec decode。",
+      "tags": ["perf", "medium-risk", "spec-decode", "mtp", "glm-5.3", "multi-step-decode"],
+      "pr_number": 57443
+    },
+    {
+      "sha": "6e517b15c1833cf72a7f557ee32524d98682e617",
+      "comment": "**背景/方法**：按 #27433 的模型验证请求，把 `baidu/ERNIE-4.5-0.3B-PT`(`Ernie4_5ForCausalLM`) 加入 batch invariance 已测模型列表。**效果**：A10(SM8.6) TP1、vLLM 0.30.1rc1 下 `tests/v1/determinism/test_batch_invariance.py` 19 passed（跨 batch 的 greedy 确定性、logprobs 位级 bs1-vs-bsN 不变、简单生成、负控制、decode/prefill logprobs 一致）；仅文档一行（+1/-0）。",
+      "sig": "other",
+      "sig_reason": "把 ERNIE 4.5 加入 batch-invariance 已验证模型文档列表，属文档。",
+      "tags": ["docs", "low-risk", "batch-invariance", "determinism", "ernie"],
+      "pr_number": 58476
+    },
+    {
+      "sha": "84593955fa44d70a129dd3a51738a9a732a91120",
+      "comment": "**背景/方法**：在 FlashInfer one-sided MoE all2all 里转发一个 fp8 combine flag，在 combine 支持低精度时提升 MoE 专家并行通信性能（新 env `VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE`，改动落在 `vllm/distributed/device_communicators`）（+164/-1, 3 文件）。**效果**：GB300 上以 DeepSeek-R1-0528 NVFP4、8k 入/1k 出 A/B——microbench(DEP8) 每 dispatch+combine 约 2–8us(1–2%) 小增、DEP4 有正有负；nsys 下 combine 内核 decode 尺寸快约 17%、大 prefill 尺寸反而慢（fp8 内核用 191 regs/thread vs bf16 的 96、可能 spilling）；无 profiler 的 DEP8(2 节点) 服务 fp8 给 +4.0% 输出吞吐、中位 ITL 低 2.7%（bf16/fp8 各跑 3 次平衡顺序），一次 fp8 run 在停 profiler 后短暂挂起、无 profiler 的运行未挂。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "为 FlashInfer one-sided MoE all2all 通信增 fp8 combine 以提 EP 吞吐，属设备通信/大规模服务。",
+      "tags": ["perf", "low-risk", "moe", "all2all", "flashinfer", "fp8", "device-communicator"],
+      "pr_number": 57995
+    },
+    {
+      "sha": "111f71a6dbf1fe517f6164e1059a2837bb0a8b4e",
+      "comment": "**背景/方法**：把 FlashInfer 新加的 CuteDSL MegaMoE 内核用于加速大 batch(主要 prefill)推理，是 #49636 从 DeepSeekV4 向更多模型的泛化——新增 `flashinfer_moe_ep_cutedsl` MoE backend（基线 `flashinfer_cutedsl`）（+1654/-1027, 33 文件, 含 `docs/design/moe_kernel_features.md`、`docs/serving/expert_parallel_deployment.md`）。**效果**：4xGB200(DeepSeekV4 Pro 用 8xB200) 上以 GSM8K 精度对照基线、`vllm bench serve` 模拟 prefill(OSL=1) 测性能，选多模型跑尽量多代码路径（服务/bench 命令与结果明细见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "集成 FlashInfer CuteDSL MegaMoE 内核加速大 batch MoE 推理，属 MoE 内核性能。",
+      "tags": ["feature", "medium-risk", "moe", "flashinfer", "cutedsl", "kernel"],
+      "pr_number": 54049
+    },
+    {
+      "sha": "c4973d94fed25a3bf32d601873755a9bcd951886",
+      "comment": "**背景**：streaming-input 生成器未产出任何 chunk 就结束时，vLLM 在建流时创建的占位请求此前会作为真实生成请求提交给引擎。**方法**：跟踪是否提交过任一输入 chunk——提交过则最终请求行为不变；正常结束但无任何 chunk 则直接把 `STREAM_FINISHED` 放到输出队列；输入流抛错则保留既有 `InputStreamError`。从 #53861 按评审意见拆出、与 #58941/#58942(collector 边界与 abort/session 竞争) 不重叠（+41/-8, 3 文件, `vllm/v1/engine/async_llm.py`）。**效果**：新增回归测试 `test_empty_input_stream_finishes_without_engine_request` 验证空输入流返回 `STREAM_FINISHED` 且不提交占位请求；CPU-only macOS 3 passed，无需模型评测。",
+      "sig": "sig-core",
+      "sig_reason": "修前端 async_llm 对空 streaming-input 误发真实生成请求，属核心 engine frontend。",
+      "tags": ["bugfix", "low-risk", "frontend", "streaming-input", "async-llm"],
+      "pr_number": 59015
+    },
+    {
+      "sha": "10f6ab01a931cee9cc3ec4a141d47be7ee7f111c",
+      "comment": "**背景/方法**：原生 per-token FP8 量化路径把 `max(dim=-1)`(带被丢弃的 index) 换成 `amax`——Inductor 会把丢弃-index 形式降到 `max_with_index`、而 `amax` 请求纯值 reduction。与 #59564(改 group quant) 相关但此处改 per-token 分支、任一先合均可；#41427(open) 也为 NaN 处理编辑此行、改动可复合（+1/-1, 1 文件）。**效果**：生成内核里 `max_with_index` 调用文本从 24→0；独立编译算子在 H800 PCIe 上 21 shape(hidden 4096/7168/14336、tokens 1..8192) 延迟降 7.7–39.8%（非最新 main、非模型级/TPOT 断言）；测得的有限输入(含零、-0.0、ties) 输出与 scale 位级一致、NaN/±Inf 行为在检查内保留（非整模型等价断言）；8 个选定 native per-token fusion 用例通过、4 上下文独立 A/B/A lowering 校验通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "原生 per-token FP8 量化改走 value-only reduction 以降内核开销，属量化融合性能。",
+      "tags": ["perf", "low-risk", "quantization", "fp8", "per-token", "inductor"],
+      "pr_number": 59800
+    },
+    {
+      "sha": "8882b83b34718ae8103a178ac1dfa84bb502cb29",
+      "comment": "**背景**：Nemotron Parse 2.0 多模态测试加载模型 HF `tokenizer.json` 时报 `DuplicatePatternError`——`tokenizers==0.23.1` 用的 `daachorse==1.0.1` 拒绝 NFKC 归一后碰撞的 token pattern，而 `0.23.2` 支持这些重复 pattern。**方法**：抬高最低 `tokenizers` 版本并把编译的 CUDA/CPU/ROCm/XPU 测试 requirements 更到 `0.23.2`。**效果**：所有 `pip-compile` hook 通过、用 `tokenizers==0.23.2` 成功加载官方 Nemotron Parse 2.0 tokenizer（+5/-5, 5 个 requirements 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "为重复 pattern 支持把 tokenizers 依赖升到 0.23.2，属依赖/CI。",
+      "tags": ["bugfix", "low-risk", "ci", "dependencies", "tokenizers"],
+      "pr_number": 59796
+    },
+    {
+      "sha": "202d497aa897edef87fc291b7f428d7dd473aa06",
+      "comment": "**背景**：CUDA graph 下 draft 水印去重 mask 读到过期 prompt 长度（bug 随 #56807 引入，review #59554 时发现、也会把 DFlash 暴露于此）。**方法/根因**：`dual_key_gumbel` + 默认 `deduplicate_contexts=\"single_turn\"` 下，FULL CUDA graph(默认 `FULL_AND_PIECEWISE`) 的 draft 采样在新请求到达后仍从过期 UVA buffer 读 prompt 长度，影响 EAGLE3、MTP 与 DSpark(EAGLE 共享自回归路径)——一些 draft 本应带 key A 却没带、一些重复上下文未被去重；修复每次 propose 加一次 `max_num_reqs` 个 int32 的异步拷贝，被捕获的去重内核改读设备内存而非 pinned host 内存（+50/-3, 2 文件, `vllm/v1/watermarking`）。**效果**：graph 与 eager 模式达成一致，无 host sync、端到端无可与运行间噪声区分的改变；引擎 harness(Qwen3-4B 目标、MTP 用 Qwen3.5-0.8B) 下 EAGLE3 crafted 从 576/1905 mask 行错误(536 accepted draft 缺 key A)→0、online Poisson(λ=0.2) 从 43/23178→0，MTP/DSpark 的 32.6%/39.5% 误跳过亦归零（完整表见原文截断处）。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "修 draft 水印去重 mask 在 FULL CUDA graph 下读过期 prompt 长度，影响 EAGLE3/MTP/DSpark 草稿。",
+      "tags": ["bugfix", "medium-risk", "watermarking", "spec-decode", "cuda-graph"],
+      "pr_number": 59779
+    },
+    {
+      "sha": "d1a974c14031014c18253e201b3f11ea3f565f37",
+      "comment": "**背景**：`VLLM_ENFORCE_STRICT_TOOL_CALLING=0` 且无工具标 `strict: true` 时，glm47 parser 目下回落到无约束生成，`auto`/`required`/命名 tool choice 可能吐畸形 GLM 工具调用 XML 或不合所提供工具 schema 的参数。**方法**：为非严格 GLM 工具调用路径加一个 non-strict structural tag，在 `vllm/tool_parsers/structural_tag_registry.py` 里构建并注册(像 `kimi_k3`/`hy_v4` 用同一 XML pattern)、而非在 parser 文件手写语法规则；该 tag 约束 post-reasoning 助手输出而非只约束工具参数，覆盖正常助手文本(排除 GLM structural token)、一或多个 GLM `<tool_call>` 块、来自请求的工具名、从各工具 JSON schema 推的浅层参数类型；thinking 前缀仍由引擎侧 reasoning gate 拥有、与既有 strict structural-tag 路径契约一致；`Glm47MoeModelToolParser.adjust_request()` 在有工具、`tool_choice != \"none\"`、严格工具关闭、无工具标 `strict: true`、无已有 structured output/response-format 约束时挂该 tag（命名 tool choice 经 `normalize_tool_choice` 收窄到所选工具、`auto`/`required` 用可用请求工具，Chat Completions 与 Responses API 工具都支持）；strict-tool 行为不变、仍用 xgrammar `glm_4_7` 内置（+729/-2, 5 文件）。**效果**：新增 `test_structural_tag_registry.py` 等测试。",
+      "sig": "sig-core",
+      "sig_reason": "前端为 GLM-4.7 非严格工具调用添加 structural tag 语法约束，属核心工具调用/结构化输出。",
+      "tags": ["feature", "medium-risk", "frontend", "tool-call", "structural-tag", "glm-4.7"],
+      "pr_number": 56403
+    },
+    {
+      "sha": "f700178f90d21f21fea2b495475e83b267290c01",
+      "comment": "**背景/方法**：删除已失效的 env 与 config（PR 描述仅“Remove dead env and config”）。据 diff，`vllm/config/ec_transfer.py` 删 `ec_rank`/`ec_parallel_size`、`vllm/config/kv_transfer.py` 删旧版 `kv_buffer_size`/`kv_rank`/`kv_parallel_size`/`kv_ip`(TorchDistributedConnector 遗留)、`vllm/config/parallel.py` 删 `sd_worker_cls`、`vllm/envs.py` 删 `VLLM_ENGINE_ITERATION_TIMEOUT_S` 与 `Q_SCALE_CONSTANT`/`K_SCALE_CONSTANT`/`V_SCALE_CONSTANT`，并同步清理 `.buildkite/performance-benchmarks/tests/*.json` 与 `tests/entrypoints/multimodal`、`tests/entrypoints/speech_to_text` 里对它们的引用（+6/-72, 16 文件）。**效果**：净删 66 行死配置/env；具体移除项以 diff 为准。",
+      "sig": "sig-core",
+      "sig_reason": "删除 config 系统里已无用的 env/字段(kv_transfer/ec_transfer/parallel/envs)，属核心配置系统维护。",
+      "tags": ["refactor", "low-risk", "config", "env", "dead-code"],
+      "pr_number": 59781
+    },
+    {
+      "sha": "4e4d75c4594b1072729ffe335c9bcea601749f71",
+      "comment": "**背景**：GLM-5.3 跨层组共享 top-k indices，但 FA3 sparse MLA 每层都把相同的逻辑 index 转成物理 KV slot。**方法**：把转换从“每层一次”改为“每个 group 一次”——共享 top-k → 每 group 一次转换 → 每层用共享物理 index 做 attention，把 GLM-5.3 主模型一次前向的转换数从 78 降到 21（+147/-9, 2 文件, `vllm/v1/attention`）。**效果**：内核性能 3.5~3.9x 提升（tokens 1..256、CONTEXT_LEN 8192、TOPK 2048 的 micro 基准脚本与扫点见原文截断处），精度由现有单测覆盖。",
+      "sig": "sig-model-performance",
+      "sig_reason": "跨层复用 sparse MLA 逻辑→物理 index 转换以降内核开销，属注意力内核性能。",
+      "tags": ["perf", "low-risk", "glm-5.3", "sparse-mla", "attention", "index-conversion"],
+      "pr_number": 59464
+    },
+    {
+      "sha": "7cfd233538805f4a34607263a144bfb0f3943f32",
+      "comment": "**背景/方法**：按 @DarkLight1337 请求 revert #53020——它给 `test_nemotron_parse.py` 加的 `nvidia/NVIDIA-Nemotron-Parse-2.0` 用例每次 CI 都红、自合入起该步在 main 一直失败（build 92561/92599 唯一失败均为 `test_models[5-bfloat16-nvidia/NVIDIA-Nemotron-Parse-2.0]`）；失败发生在 2.0 checkpoint 的 tokenizer 加载期、在任何模型代码运行前抛 `DuplicatePatternError`，故该测试用 CI 镜像里的 tokenizer 库根本跑不起来；revert 是 83cadd65d9(为 checkpoint 省略 lm_head 时 tie `lm_head.weight` 的模型改动) 的精确逆操作、无其他改动。**效果**：该步回到 pre-#53020(build 92354) 通过的测试；重新落地 `tie_weights()` 修复应连同可用的 tokenizer 加载方式一起、或不带 2.0 测试用例（+1/-19, 2 文件）。",
+      "sig": "sig-omni",
+      "sig_reason": "revert Nemotron Parse(多模态文档解析模型) 的 lm_head 权重 tying 改动，属多模态模型加载。",
+      "tags": ["revert", "low-risk", "omni", "nemotron-parse", "tie-weights", "ci-red"],
+      "pr_number": 59805
+    },
+    {
+      "sha": "f590eb2448a51028f6044c6f60104ce0ef3189e9",
+      "comment": "**背景/方法**：给 TP=1 BF16 shape 加 SM121 skinny-GEMM plans（此前回落 cuBLAS），补 #59632(SM121 TP=2 plans、源自 #59605) 只往同一机制加 TP=1 key（+136/-0, 2 文件, `vllm/models/qwen4_exp`、`tests/kernels/test_bf16_skinny_gemm.py`）。**效果**：单 DGX Spark(SM121, TP=1) 上 Qwen3.8-Flash-Next 并发 1 decode ITL −9.5%(25.30→22.91ms)、输出 tok/s +9.9%（LM head `(248320,2560)` 单独 −8.3%、其余行再 −1.3%）；c1 decode(MTP k=3) 里 LM head 跑 4 次、共约 25.7ms 占 77.6ms step 的约 33%，cuBLAS 在 M=1 约 175GB/s、skinny GEMM 达 253GB/s(M=1 1.45x、M=2–16 1.04–1.08x)；并发 8 持平(其 M=32 verify 步超出 skinny GEMM 范围、仍走 cuBLAS)；GSM8K 在运行间噪声内（GB10 FlashInfer CUPTI 内核表见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为 Qwen4Exp SM121 TP=1  skinny GEMM shape 补 kernel plans 以降 decode ITL，属内核性能。",
+      "tags": ["perf", "low-risk", "skinny-gemm", "sm121", "qwen4-exp", "dgx-spark"],
+      "pr_number": 59753
+    },
+    {
+      "sha": "9cf087fd14bf2219a24cfc1de728e5cebe5d59d4",
+      "comment": "**背景/方法**：调 CUDA FP16/BF16 `moe_fused_mul_sum` 的 launch 配置——`BLOCK_K` 封顶 4096、SM75 用 8 warps、更新 GPU 用 16 warps；FP32、小 hidden size、非 CUDA 平台保持现有设置。用只改 launch 配置减少串行 hidden-tile 迭代、保留内核与 one-CTA-per-token grid（+19/-8, 2 文件）。**效果**：30 shape 上几何均值相对旧配置加速——RTX 2080 Ti(SM75)FP16 冷 1.18x/热 1.27x、RTX 3090 1.17/1.28、RTX 4090 1.27/1.37、B300(SM103) 1.51/1.63、RTX PRO 6000(SM120) 1.69/2.37、GB10(SM121) 1.32/1.85；`test_moe_fused_mul_sum.py` SM121 上 114 passed（含 FP16/BF16/FP32、部分 tile、无效专家与 padding；更多分 GPU 表见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "调 MoE weighted-sum(`moe_fused_mul_sum`) 内核 launch 配置提性能，属内核性能。",
+      "tags": ["perf", "low-risk", "moe", "kernel", "triton", "launch-config"],
+      "pr_number": 59731
+    },
+    {
+      "sha": "8442117446e0e317662f02d63d0ab9e1592a8253",
+      "comment": "**背景/方法**：把 `requirements/tpu.txt` 里的 tpu-inference 升到最新稳定版 v0.30.0。**效果**：在 tpu-inference CI 验证成功（+1/-1, 1 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "升级 tpu-inference 依赖到 v0.30.0，属依赖/CI。",
+      "tags": ["chore", "low-risk", "ci", "dependencies", "tpu"],
+      "pr_number": 59396
+    },
+    {
+      "sha": "1ab18599ca683a18d7cac6e87ef900e5a85b62aa",
+      "comment": "**背景/方法**：加一个检查 agent 指令文件与 skills 的 pre-commit hook、并删掉它现在拒绝的嵌套 `CLAUDE.md`（#59638 里一个新 skill 没带 `.claude/skills` symlink 而无人报警的后续）。`tools/pre_commit/check_agent_files.py` 对以下失败：`.agents/skills` 里 skill 缺正确 `.claude/skills` symlink、或 `.claude/skills` 里有非该 link 的东西；`SKILL.md` frontmatter 解析失败、`name` 与目录不符、`description` 缺失或过长(限长来自 Agent Skills spec)；行数预算(根 `AGENTS.md` 200、嵌套 300、`SKILL.md` 500)；`AGENTS.md`/skills 里无法解析的相对链接与 heading 锚；任何被跟踪的 `CLAUDE.md`。description 从不说明何时使用只打印 advisory `note:`、不失败；移除嵌套 `CLAUDE.md` 是因为 Claude Code 仅在目录及上级无 `CLAUDE.md` 时才直读 `AGENTS.md`（在 `rust/` 内启动会跳过根 `AGENTS.md`）（+343/-9, 10 文件）。**效果**：`tests/tools/test_check_agent_files.py` 14 passed(每规则一例、接入 CPU Buildkite job)，pre-commit 在本分支通过、对当前 main 除这里删的五个 `CLAUDE.md` 外干净（对开放 PR 树能抓到 #57088/#57786/#50527）。",
+      "sig": "sig-ci",
+      "sig_reason": "新增 pre-commit hook + Buildkite 接线校验 agent 文件/skills 并删嵌套 CLAUDE.md，属仓库工具/CI 质量门。",
+      "tags": ["chore", "low-risk", "ci", "pre-commit", "agents", "skills"],
+      "pr_number": 59657
+    },
+    {
+      "sha": "e42d35d4f3b4782e4fa692939b638360f44c7ead",
+      "comment": "**背景**：#59081 在 MiniMax-M3 Triton indexer 启用 fp8(e4m3) index-K cache、并在加载 dtype 为 fp8 时把两个 scorer 操作数上转 bf16（意图避开 mixed-dtype fp8 dot），但条件测错了对象——对匹配的 e4m3×e4m3 也成立、而那里正想要原生 FP8 MMA；MiniMax-M3 按 cache 的 dtype 分配 indexer query，故 fp8 index cache 恒取降级路径、在内层循环用一个 BF16 dot + 每 tile 转换换掉原生 FP8 MMA(长上下文下主导的线性 decode 开销)。**方法**：把 guard 收窄为真正不匹配的操作数、按 dtype 比较(而非 `is_fp8()`)，flavour 不匹配(fp8e4nv vs fp8e4b8) 仍上转；匹配 fp8 保留原生 MMA、bf16/fp32 load 保持存储 dtype(保留 #59081 的 fp32 精度修复)、留显式 `out_dtype=tl.float32` 累加器；匹配路径无精度变化(两操作数都存 e4m3、bf16 精确表示 e4m3、都 fp32 累加)（+45/-9, 2 文件, `vllm/models/minimax_m3`）。**效果**：新增 `test_bf16_query_against_fp8_cache_decode_topk_matches_bf16` 钉住上转分支(旧两测试都 `query = q.to(cache.dtype)` 只跑匹配路径)；H100 上 3 passed（cc 明细见原文截断处）。",
+      "sig": "sig-quantization",
+      "sig_reason": "修正 MiniMax-M3 Triton indexer 中 fp8 index cache 错误上转 bf16、保留原生 FP8 MMA，属 FP8 量化路径。",
+      "tags": ["bugfix", "low-risk", "quantization", "fp8", "minimax-m3", "triton", "indexer"],
+      "pr_number": 59481
+    },
+    {
+      "sha": "167a81fa9cb39878dd04ca9fa756eb8be34f9fe1",
+      "comment": "**背景**：#58399 加了可选 ModelExpress 权重传输 backend 后，`tests/distributed/test_weight_transfer.py` 里 10 个测试在 (MI355) Distributed Features job 失败：`TestDeferredProcessingContract` 加载所有注册 backend、`modelexpress` 总注册但 ModelExpress 是 CI 不装的独立包、加载抛 `ImportError`；shim 测试按相对测试文件的路径找 `modelexpress_engine.py`、而 CI 镜像把源树移到 `src/` 故该路径不存在。**方法**：两处都在测试里修——未安装时 `TestDeferredProcessingContract` 跳过 `modelexpress`(仍查其余五个 backend、装了则查)、shim 测试改用 `importlib.util.find_spec` 解析已安装模块。**效果**：MI355X 上从 10 failed/88 passed/24 skipped 变 98 passed/24 skipped（+11/-9, 1 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "修权重传输测试对可选 ModelExpress backend 的处理以免 CI 失败，属 CI 测试修复。",
+      "tags": ["bugfix", "low-risk", "ci", "tests", "weight-transfer", "modelexpress"],
+      "pr_number": 59772
+    },
+    {
+      "sha": "6abadc2aa78ad00476583c594ecd442144795ec5",
+      "comment": "**背景/方法**：覆盖 #54966 “Test padding” 里 `VLLM_ROCM_MOE_PADDING` 部分——该 flag(`UnquantizedFusedMoEMethod._maybe_pad_weight`)是 ROCm 未量化 MoE 权重的内存-stride 技巧(避免每专家权重落到冲突 HBM bank)、非逻辑 shape 改动。新增 `tests/rocm/test_moe_padding.py` 验证 `_maybe_pad_weight` 仅在 tensor 倒数第二维 stride 512 字节对齐且 flag 开时增大存储(把 `stride(-2)` 加 `num_pad` 元素、该 stride 增量就是整个机制)、两种情况都不改 shape/值(覆盖无padding/仅hidden/仅intermediate/both，因 w13 与 w2 的 gate 分别取 `hidden_size`/`intermediate_size`、并含非 bf16 元素尺寸)；断言 `AiterExperts.apply()` 输出与独立 per-expert 参考(用 cosine 相似而非逐元素 `assert_close`、对近零 bf16 元素假阳性)匹配、无论 flag，并断言持久化的 `w13_weight`/`w2_weight` 存储不受 flag 影响(AITER weight-shuffle 重分配使 padding 的存储增长不残留)。**效果**：ROCm+AITER `pytestmark.skipif` 门控、CUDA/其他后端惰性；接入 `.buildkite/test-amd.yaml` MI300 Quantization job 使 `check-test-tethering` 通过（+430/-0, 3 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "为 ROCm MoE 内存-stride padding 透明性新增测试覆盖，属测试。",
+      "tags": ["test", "low-risk", "ci", "rocm", "moe", "padding"],
+      "pr_number": 59332
+    },
+    {
+      "sha": "2a537887de7a103baa49bbfdce93e99d48d19441",
+      "comment": "**背景/方法**：`tests/compile/fusions_e2e/conftest.py` 的 `run_model()` 直接构造 `LLM(...)`、参数化运行之间无显式 teardown，清理靠 GC + `VLLM_TEST_CLEAN_GPU_MEMORY` 内存轮询(只检查内存“看起来”稳定、无法强制残留 engine-core 子进程或 NCCL 进程组退出)，导致跨参数化 OOM/hang；改用 `vllm_runner` fixture(`VllmRunner` 上下文管理器，`__exit__` 显式关引擎核心、reset dynamo、拆分布式进程组)；把 `trust_remote_code`/`enable_chunked_prefill` 显式钉到 `LLM()` 自身默认(VllmRunner 否则为自身默认测试需求覆盖它们)以保持 fusion-match 行为不变。**效果**：共享 fixture、影响 `tests/compile/fusions_e2e/` 下全部 5 个测试文件，解决 Distributed Compile(Dynamo Partition) 测试失败；22 passed/0 failed/10 skipped/32 deselected、每次参数化运行间 GPU 显存干净回基线（+44/-29, 1 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "用 vllm_runner fixture 重构 fusions_e2e conftest 以保证 GPU 清理，属测试基础设施。",
+      "tags": ["test", "low-risk", "ci", "conftest", "gpu-cleanup"],
+      "pr_number": 59525
+    },
+    {
+      "sha": "7b6be2f1f41ec9ee69fbe3cd08c76a64a041706e",
+      "comment": "**背景/方法**：为 RFC #58253(Reviewer 角色) 补文档——新增 `docs/community/reviewers.md`(在 `/community/reviewers` 服务、即 RFC 引用的 URL) 列出活跃 reviewer、角色覆盖范围与如何提名(reviewer 会自填专长领域)；更新贡献指南的 “What to Expect for the Reviews”(正式 review 可来自 reviewer 或 committer、committer 执行最终 merge、贡献者可经列表或 `#pr-reviews` 找 reviewer)；把该文件加入 `typos` 排除列表(GitHub handle 会误触拼写检查、与 `docs/governance/process.md` 同样处理)；reviewer handbook 将另文跟上。**效果**：纯文档（+66/-3, 3 文件）。",
+      "sig": "other",
+      "sig_reason": "为 Reviewer 角色新增社区/贡献文档页，属仓库治理文档而非运行时功能。",
+      "tags": ["docs", "low-risk", "community", "governance"],
+      "pr_number": 59459
+    }
+  ]
+}

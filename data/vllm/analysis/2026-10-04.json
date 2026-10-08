@@ -1,0 +1,135 @@
+{
+  "date": "2026-10-04",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-08T12:17:00+08:00",
+  "daily_summary": "轻量的一天，15 条提交以正确性修复与 CI/依赖治理为主。前端 API 层集中修了三处：Responses API 的 harmony(gpt-oss) 流式在 `response.completed` 重建 output 时按消息复用已流式的 item `id`/`call_id`(#59859)、scale-out token 流式保留 abort 的 `finish_reason` 并修 `n>1` 时的 `IndexError`(#47933)、平台层 KV block size 对齐后逐 backend 校验 `supports_block_size()` 以提前报错(#58457)。注意力/内核侧：修 `ROCM_ATTN` 滑窗边界换算(#59550)、把 XPU 上 DeepSeek-V4 的 FP8 sparse-decode kernel 重写为 graph-capture 安全(#59159)、升级并启用 TokenSpeed MLA 的 block-interleaved DCP 分片(#59462)，并新增 opt-in 的 `sleep_mode_offload_cudagraph` 在 sleep 时释放 CUDA graph pool 显存(#59160)。多模态修了单声道音频未归一到 1D 导致 Whisper 失败(#56691)；KV offload 修了 reset 时未释放 CPU lookup pin(#59862)；分布式修了 FlashInfer all_reduce backend 选择(#56891)。其余为 CI/依赖治理：batch-invariance 测试改用 token-id 前缀修 soundness(#53692)、peft 升 0.21.1 与 transformers 升 5.18.0(#59932/#59621)、pooling 自动标签(#59913)、weight-sync metrics 测试放宽(#59521)。",
+  "sig_summaries": {
+    "sig-ci": "五项，测试基建与依赖治理为主。#53692 把 batch-invariance 的 decode/prefill 一致性测试改为直接用 token-id 构造前缀（旧文本重建因 BPE `encode(decode(ids))` 非无损会假失败，GLM 正因 `[13,8419]->89329` 的 merge 点在旧测试下误报），并把 GLM-4-9B/Phi-4 加入已验证模型；#59932 把 peft 升到 0.21.1 以满足 transformers 5.18 抬高的 `MIN_PEFT_VERSION`、#59621 把 transformers bump 到 5.18.0；#59913 给 pooling PR/issue 加自动 `pooling` 标签；#59521 放宽 weight-sync metrics 测试对两个共享监听 socket 的 API server 都要记录操作的断言（跨进程累加已由另一测试覆盖）。趋势是修测试健全性/稳定性并稳步推进依赖 pin。",
+    "sig-core": "三项，前端与平台正确性。#59859 让 harmony(gpt-oss) 流式在 `response.completed` 用 `harmony_to_response_output` 重建 output 时按消息（对象身份）复用已流式 item 的 `id`/`call_id`，并把 reasoning item 前缀从 `msg_` 统一为 `rs_`，避免严格客户端因 id 不匹配中断（按消息匹配可防内置 `python` 调用被重建为 `reasoning` 时错取下一条 id）；#47933 让凡有 `finish_reason` 的输出在两种模式都发出、修 scale-out token 流式 abort 无 `finish_reason` 与 `n>1` 时 token 计数器越界导致的 500；#58457 在 KV block size 对齐后逐 backend 调 `supports_block_size()` 校验、把 worker setup 阶段晦涩的 `select_common_block_size()` 失败提前为点名拒绝 backend 的明确报错（属加固，非修复已观测失败）。",
+    "sig-model-performance": "四项，注意力/内核与 CUDA graph 内存。#59550 修 `ROCM_ATTN` 把滑窗存为 `(W-1,0)`、却需向 `chunked_prefill_paged_decode`/prefix-prefill kernel 传含当前 token 的总窗长 `1+sliding_window[0]` 的边界错误（W=1 时旧值 0 会关掉窗口），使之与已如此处理的 `TRITON_ATTN` 一致；#59159 重写 XPU 上 DeepSeek-V4 的 `xpu_sparse_decode_fp8` 消除 `.item()` host sync、数据依赖形状与逐 token Python 循环以使其 graph-capture 可捕获；#59462 升级 tokenspeed MLA（连同新 cutlass）并启用 block-interleaved DCP 分片（异构 NIXL 分离式 KV 传输所需）；#59160 加 opt-in 的 `sleep_mode_offload_cudagraph`，把 CUDA graph 捕获进专用 cuMem pool 以便 sleep 释放其物理显存、wake 重映射同虚拟地址（graph 不重捕获，须在 #59228 的 free-while-asleep 修复之后合并）。",
+    "sig-large-scale-serving": "两项，KV offload 与分布式通信。#59862 让 `reset_prefix_cache(reset_connector=True)` 期间释放 SimpleCPUOffload 的 lookup-only CPU block pin 并失效其 saved lookup 状态（在传 DMA 引用仍受保护直到完成），修一个等待 GPU 分配的请求会阻塞 reset；#56891 修 FlashInfer all_reduce 自动 backend 选择——node-local all-reduce group 选 TRTLLM、仅对 multi-node Blackwell 自动尝试 MNNVL、对两者皆不支持的 multi-node Hopper 关闭自动 fusion、TRTLLM 资格改按 all-reduce group（而非全局分布式环境）校验。",
+    "sig-omni": "一项 #56691：`normalize_audio` 在输入通道数已等于目标时提前返回，会给 mono 留下 2D 数组，使 `(1,16000)` 波形走离线 audio tuple 路径时 Whisper 预处理抛 `ValueError: Failed to apply WhisperProcessor`、`AudioProcessorItems.get_audio_length()` 误报 1；改为目标 mono 时把唯一通道作为 1D 波形返回，并扩展 NumPy/Torch/parser 测试覆盖两种通道布局与单样本情形。"
+  },
+  "commits": [
+    {
+      "sha": "89439db7276cf165377c088496e20098c8137727",
+      "comment": "**背景**：`tests/v1/determinism/test_batch_invariance.py::test_decode_logprobs_match_prefill_logprobs` 用文本重建 prefill 前缀再重新编码，而 BPE tokenizer 的 `encode(decode(ids))` 非无损，导致 prefill 可能评估到与 decode 不同的 token 序列、报假 mismatch；本 PR 同时把 `zai-org/glm-4-9b-chat` 与 `microsoft/phi-4` 加入 batch-invariant 已验证模型列表。**方法**：前缀直接由 token id 构造（`prompt_token_ids + decode_token_ids[:i]`），并顺带去掉每解码一个 token 一次的 O(N²) `llm.generate`；GLM 原被移出本 PR 因官方套件报 decode/prefill 不一致，根因是它把 `'.'`+`'Here'` 输出为 `[13, 8419]`、重编码成单 token `89329('.Here')`、从第 11 位起文本前缀就分叉，改用 token-id 前缀后 GLM 全绿（承接自 stale 的 #43317，去掉其独立 tokenizer 回归测试）。+22/-32，2 文件。**效果**：修的是测试 soundness bug——任何贪心输出命中 BPE merge 点的模型在旧测试下都会假失败；`VLLM_BATCH_INVARIANT=1`、vLLM 0.28.0 下于 RTX 4090D(sm89) 与 H20(sm90) 验证（更多扫点见原文截断处）。",
+      "sig": "sig-ci",
+      "sig_reason": "batch-invariance 确定性测试的 soundness 修复与已验证模型列表扩充，属测试基建。",
+      "tags": ["test", "ci", "low-risk", "batch-invariance", "determinism"],
+      "pr_number": 53692
+    },
+    {
+      "sha": "bd42276e1e25f540f019381c65994120158aa2a1",
+      "comment": "**背景**：#49845 的 Phase 1 会挑一个所有 attention backend 都接受的 KV cache block size，但其后 hybrid/heterogeneous-KV 对齐步骤仍只按第一个 backend 的 kernel block 取整，可能落在兄弟 backend 拒绝的尺寸上；今天这问题很晚才暴露（worker setup 时报晦涩的 `select_common_block_size()` 错误）。**方法**：不改对齐取整方式，只验证结果——若对齐改变了 block size，则每个 backend 的 `supports_block_size()` 必须接受，否则立刻抛错并点名拒绝的 backend。`update_block_size_for_backend()` 记录对齐前尺寸并调用新增的 `_check_aligned_block_size()`；`CpuPlatform` 覆写基类直接对齐后走同一检查；`XPUPlatform` 在 `super()` 跑完检查后再为 GDN 把尺寸向上取整到 64 的倍数。不按每个 backend 取最小 kernel block 的 LCM 会回退有效配置（如 `[32,48]` backend 与精确 `[48]` backend 会误升到 96 被拒），故只做逐 backend 校验。+99/-0，4 文件。**效果**：属加固而非修复已观测失败（作者称不知有模型配置今天会命中），把 opaque 错误提前为明确报错。",
+      "sig": "sig-core",
+      "sig_reason": "平台层 KV block size 对齐后的 per-backend 校验加固，触及 config/platform 核心路径。",
+      "tags": ["hardening", "medium-risk", "platform", "kv-cache", "block-size"],
+      "pr_number": 58457
+    },
+    {
+      "sha": "bdd31c31defd0e47a2779eb46ac1a6d88198a41b",
+      "comment": "**背景/方法**：该测试断言两个 API server 都记录了 weight 操作；但两个 API server 共享一个监听 socket，内核可能把所有连接发给同一个 server——即使把 #59507 允许的 64 次 sync 全发给一个 server 仍会失败。跨进程累加 metrics 已由 `test_in_flight_is_summed_across_api_server_processes` 覆盖，故本 PR 去掉该检查、保留计数与 in-flight 检查并把 sync 数固定为 8。+3/-26，1 文件。**效果**：MI300X 本地 6/6 通过（含只有一次 API server 处理全部请求的运行）。",
+      "sig": "sig-ci",
+      "sig_reason": "放宽 weight-sync metrics 测试里对两个 API server 的断言，属测试稳定性基建。",
+      "tags": ["test", "ci", "low-risk", "weight-sync", "flaky"],
+      "pr_number": 59521
+    },
+    {
+      "sha": "f98d1fc49361cb50457f6109c3c01a5c77e415b4",
+      "comment": "**背景**：`ROCM_ATTN` 把 decoder window 存为 `(W - 1, 0)`（`W - 1` 是左侧跨度），但底层 `chunked_prefill_paged_decode` 与 prefix-prefill kernel 用 `query_position - key_position < SLIDING_WINDOW` 判窗，参数须是含当前 token 的总窗长 W；传 `W - 1` 会排除最旧的合法 token，W=1 时传 0 直接把窗口关掉。**方法**：向 `chunked_prefill_paged_decode` 传 `1 + self.sliding_window[0]`，与 KV-cache docstring 例子一致——`sliding_window=4`、七个已算 token 时位置 7 的下一 token 须 attend 到 4–7，旧参数 3 只 attend 5–7、修正后为 4–7。`TRITON_ATTN` 也存同样的 `(W-1,0)` 元组但已传 `1 + window_size[0]`，本改动使两个 backend 的因果窗口边界一致；no-window 哨兵映射为 0（helper 视为关闭），encoder attention 走单独路径。+61/-1，2 文件。**效果**：修 ROCM_ATTN 滑窗边界（含 W=1 退化），跑聚焦 backend 回归与既有 cached-KV 边界测试（详见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修 attention backend(ROCM_ATTN) 滑窗参数换算，属 attention 内核正确性。",
+      "tags": ["bugfix", "high-risk", "rocm", "attention", "sliding-window"],
+      "pr_number": 59550
+    },
+    {
+      "sha": "d64f6cd08a4eb390664ed5230e6b6ae48b73bfae",
+      "comment": "**背景/方法**：加自动 `pooling` 标签，方便 pooling reviewer 找到相关 PR 与 issue；改 `.github/mergify.yml` 并新增 `.github/workflows/issue_autolabel.yml`。PR 声明代码由 Codex(GPT-6) 起草并本地验证。+47/-0，2 文件。**效果**：纯自动化打标签，无运行时影响。",
+      "sig": "sig-ci",
+      "sig_reason": "GitHub Actions/Mergify 自动标签配置，属 CI 基建。",
+      "tags": ["ci", "low-risk", "github-actions", "autolabel"],
+      "pr_number": 59913
+    },
+    {
+      "sha": "d61081dc3d3f1740a5d8bf82608b62974393c2de",
+      "comment": "**背景**：#59621 把 pinned transformers 升到 5.18.0，使 `MIN_PEFT_VERSION` 从 0.19.1 抬到 0.20.0，但测试 lockfile 仍 pin `peft==0.19.1`，granite-speech 的 HF 参考路径报 `ValueError: The version of PEFT you are using is not compatible, please use a version >= 0.20.0`。**方法**：把 `requirements/test/{cuda,rocm}.in` 的 peft 下限提到 `>=0.20.0`，用仓库 pre-commit 的 pip-compile(-rocm/-cpu) 重新生成 `{cuda,rocm,cpu}.txt`，每处仅 `peft==0.19.1` → `peft==0.21.1`。+5/-5，5 文件。**效果**：granite-speech 与 phi-4-mm 测试未在本地跑，依赖 CI 验证。",
+      "sig": "sig-ci",
+      "sig_reason": "依赖 lockfile 版本对齐（peft 满足 transformers 下限），属 CI/构建。",
+      "tags": ["ci", "dependency", "low-risk", "peft", "requirements"],
+      "pr_number": 59932
+    },
+    {
+      "sha": "155d23cb008f793d4609d2bd5885cd9882ba38ee",
+      "comment": "**背景**：DeepSeek-V4-Flash 在 XPU 开 graph capture 时启动失败：`RuntimeError: Worker failed with error 'level_zero backend failed with error: 44 (UR_RESULT_ERROR_UNSUPPORTED_FEATURE)'`。根因是 `xpu_sparse_decode_fp8` 用了 `.item()` host sync、数据依赖的 tensor 形状和逐 token Python 循环，Level Zero 图捕获都不支持。**方法**：把 `xpu_sparse_decode_fp8` 重写为静态形状 + 向量化 index 构造、消除 host sync 使之 graph-capture 安全（topk 行排在 SWA 行前、按 shape 推导的 `width = max(16, ceil(K_total/16)*16)` 取代 `combined_lens.max().item()`，使 replay 无需 host sync）。仅 1 文件 `vllm/models/deepseek_v4/xpu/xpu_sparse_decode_fp8.py`，+36/-89。**效果**：修复前 server 无法启动、修复后正常起服，并在 EP4xDP2、TP4xPP2、TP8 三种并行配置下验证（详见原文截断处）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "重写 FP8 sparse-decode kernel 以去除 host sync、使其 graph 可捕获（XPU），属图捕获/内核而非量化本身。",
+      "tags": ["bugfix", "low-risk", "xpu", "cuda-graph", "deepseek-v4", "fp8-decode"],
+      "pr_number": 59159
+    },
+    {
+      "sha": "0872ddf4b96d57a0745893478deef595b1994f2e",
+      "comment": "**背景**：带显式通道维的单声道音频在 Whisper 预处理会失败——16kHz 下把 `(1, 16000)` 波形走离线 audio tuple 路径抛 `ValueError: Failed to apply WhisperProcessor`，而同样样本的 `(16000,)` 数组正常。`normalize_audio` 在输入通道数已等于目标时提前返回，给 mono 留下 2D 数组，还让 `AudioProcessorItems.get_audio_length()` 报 1 而非 16000。**方法**：目标为 mono 时把唯一通道作为 1D 波形返回；扩展既有 NumPy、Torch 与 parser 测试覆盖两种通道布局与单样本情形。该问题无需重采样即可复现，#47693/#56023/#51022 改了归一化与重采样顺序/多通道降混但都没触及此提前返回。+20/-14，2 文件。**效果**：聚焦回归从“8 失败/3 通过”变“11 通过”；audio+parser 选择 71 passed/1 skipped/8 deselected；`(16000,)`、`(1,16000)`、`(16000,1)` 三种布局经 Whisper 处理器结果一致（详见原文截断处）。",
+      "sig": "sig-omni",
+      "sig_reason": "修多模态音频归一化的单通道维处理，属 omni/音频。",
+      "tags": ["bugfix", "low-risk", "multimodal", "audio", "whisper"],
+      "pr_number": 56691
+    },
+    {
+      "sha": "18f8f96025b556071eb627076f94df560fbd3a22",
+      "comment": "**背景**：SimpleCPUOffload 的 lookup-only CPU block 引用在 cache reset 时未释放；一个等待 GPU 分配的请求即使 GPU block 与在传传输都已排空，仍会让 `reset_prefix_cache(reset_connector=True)` 失败。**方法**：reset 期间释放临时 CPU lookup pin 并使其保存的 lookup 状态失效，同时在传 DMA 引用仍受保护直到完成；新增确定性回归覆盖 eager/lazy 模式与一/两个 cache group。+29/-0，2 文件（`vllm/v1/simple_kv_offload`、`tests/v1/simple_kv_offload`）。**效果**：对 upstream `5f30fc70` 验证——新回归未打补丁时 4 处 `reset()` 返回 False、打补丁后 4 通过；scheduler/kv events/connector/metrics 套件 92 passed、CUDA worker(RTX 4090) 21 passed；真实调度器分配压力诊断与 Qwen2.5-0.5B 诊断中 16 个 lookup 引用被正确释放、reset 后续生成通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修多级 KV(SimpleCPUOffload) 在 reset 时的 CPU pin 生命周期，属 KV offload。",
+      "tags": ["bugfix", "low-risk", "kv-offload", "prefix-cache", "cpu"],
+      "pr_number": 59862
+    },
+    {
+      "sha": "6f75cc7d5d1b5adfb399cbf79a8231ae66844fcf",
+      "comment": "**背景**：修 #59834 的 harmony(gpt-oss) 部分（#59307 修了非 harmony 路径）。`/v1/responses` 流式时 `response.completed` 用 `harmony_to_response_output` 从 harmony 消息重建 output，重建会铸造新的 item `id` 与 function `call_id`，与之前 `response.output_item.added/done` 发出的不再匹配，严格客户端会中断。**方法**：`_process_harmony_streaming_events` 为每条完成的 harmony 消息记录其 `output_item.done` 里发送过的 items（`HarmonyContext.streamed_items_by_message`）；`responses_full_generator` 按对象身份把每条消息匹配到各自记录，`reuse_streamed_item_ids` 按类型把 `id`/`call_id` 拷到该消息重建的 items 上，内容与 `incomplete` 状态仍来自重建，从未流式过（零 delta）的 item 保留新 id；流式 harmony reasoning item 现用 `rs_` 前缀（原 `msg_`）以与非流式/非 harmony 路径一致。按消息匹配很关键：内置 `python` 调用流式为 `code_interpreter_call` 却重建为 `reasoning`，跨消息匹配会错取下一条 reasoning 的 id。+134/-12，5 文件。**效果**：`vllm serve openai/gpt-oss-20b --no-enable-prefix-caching`(1x H200) 用 issue 里的请求复现验证（详见原文截断处）。",
+      "sig": "sig-core",
+      "sig_reason": "修 Responses API harmony 流式 item id 复用，属前端 API 正确性。",
+      "tags": ["bugfix", "medium-risk", "responses-api", "harmony", "gpt-oss", "streaming"],
+      "pr_number": 59859
+    },
+    {
+      "sha": "50b404e71e7cfaec7ac85dcf8304bfc15a5a6bb6",
+      "comment": "**背景**：token 模式下 `/inference/v1/generate` 流式会跳过没有新 token id 的引擎输出，而 abort 总以这样的输出结束（`token_ids=[]`、`finish_reason=\"abort\"`），导致被中断的流只以 `[DONE]` 结束、没有 `finish_reason`（除非 abort 恰好并进一个 pending token delta）；文本模式(#58588) 与 Rust frontend 已发出每个终态输出。**方法**：凡是有 `finish_reason` 的输出在两种输出模式下都发出；每 choice 的 token 计数器改按 `sampling_params.n` 定尺——原先按第一个 output 定尺，`n>1` 时可能只有 choice 0，下一 choice 触发 `IndexError` 使流以 500 error chunk 结束。+76/-32，3 文件（`vllm/entrypoints/scale_out`、`tests/entrypoints/scale_out`）。**效果**：H200 上 `Qwen/Qwen3-0.6B` 实服对照 main 与本 PR：token 模式中途 abort 现以 `finish_reason:\"abort\"` 收尾；排队中 abort 产一个 abort chunk；`n=2` 中途 abort 从“4/7 次 `list index out of range` 500”变“12/12 两个 choice 都 abort”；文本模式/非流 abort/length/EOS stop 不变（详见原文截断处）。",
+      "sig": "sig-core",
+      "sig_reason": "修 scale-out token 流式 abort 的 finish_reason 与 n>1 计数，属前端 API。",
+      "tags": ["bugfix", "medium-risk", "frontend", "scale-out", "streaming", "abort"],
+      "pr_number": 47933
+    },
+    {
+      "sha": "ce49174247fd84c322f293a31cbe1d0460aaa7fe",
+      "comment": "**背景/方法**：修正 FlashInfer all_reduce 的自动 backend 选择——自动选择下 node-local all-reduce group 选 TRTLLM；仅对 multi-node Blackwell group 自动尝试 MNNVL；对既不支持任一 backend 的 multi-node Hopper group 关闭自动 FlashInfer all-reduce fusion；TRTLLM 资格改为按 all-reduce group 校验而非全局分布式环境。+67/-22，2 文件（`vllm/distributed/device_communicators`、`tests/distributed/test_comm_ops.py`）。**效果**：`compileall` 通过；目标 pytest 收集因本地缺既有 `ray` 测试依赖（`ModuleNotFoundError: No module named 'ray'`）未跑成。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修分布式 all_reduce 的 FlashInfer/TRTLLM backend 选择，属大规模服务通信。",
+      "tags": ["bugfix", "high-risk", "distributed", "all-reduce", "flashinfer", "trtllm"],
+      "pr_number": 56891
+    },
+    {
+      "sha": "5e56e9af2aaede223a5f723cba88fa35999ac813",
+      "comment": "**背景**：开 sleep mode 时，`sleep()` 已 unmap 权重与 KV cache 后 CUDA graph 仍保留其私有 tensor pool；在大 MoE 部署上这是每 GPU 数 GiB 睡也睡不掉的显存。**方法**：加 opt-in 的 `sleep_mode_offload_cudagraph`（默认关），把 CUDA graph 捕获进专用 cuMem-backed pool，使 sleep 释放其物理显存、wake 重新映射相同虚拟地址（graph 不重捕获）；关时行为与 main 完全一致（普通 graph pool、custom allreduce 注册 graph buffer、`NCCL_GRAPH_REGISTER` 不动）。设计参考 SGLang 的 `SGLANG_MEMORY_SAVER_CUDA_GRAPH`，基于 aoshen02/vllm#50 的 graph-pool 设计移植到当前 main 并补两处多 GPU 修复；依赖 main 已合入的 #59156/#59158（per-tag pool 列表、除 `weights`/`kv_cache` 外任何 wake 都恢复其余所有 tag），且必须在 #59228（`csrc/cumem_allocator.cpp` 的 free-while-asleep 修复）之后合并，否则睡眠中拆 cuMem graph pool 会双重 unmap 留下 sticky CUDA error。+299/-27，16 文件（含 `vllm/compilation/cuda_graph.py`、`breakable_cudagraph.py`、`docs/features/sleep_mode.md`）。**效果**：用 `--enable-sleep-mode --sleep-mode-offload-cudagraph` 或 `LLM(enable_sleep_mode=True, sleep_mode_offload_cudagraph=True)` 开启；显存节省数字详见原文截断处。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把 CUDA graph 捕获进 cuMem pool 以便 sleep 释放显存，核心是 graph-pool/cuMem 内存管理（虽由 sleep 触发）。",
+      "tags": ["feature", "medium-risk", "cuda-graph", "sleep-mode", "cumem", "memory"],
+      "pr_number": 59160
+    },
+    {
+      "sha": "9e0b6fcf77b57401a08224df89f893459ceee375",
+      "comment": "**背景/方法**：把 Transformers 版本升到 5.18.0（Fixes issue #59756），更新 `requirements/*` 与相关代码；+104/-201，22 文件。该升级抬高了 `MIN_PEFT_VERSION`，连带触发 #59932 把 peft 升到 0.21.1。**效果**：属依赖大版本推进，PR 正文仅一行 issue 链接，改动面广（详见原文）。",
+      "sig": "sig-ci",
+      "sig_reason": "依赖大版本 bump（transformers 5.18.0），属 CI/构建与依赖治理。",
+      "tags": ["ci", "dependency", "low-risk", "transformers", "requirements"],
+      "pr_number": 59621
+    },
+    {
+      "sha": "84bcbc62644356270aaaa5e2d0237d03adc9bb3a",
+      "comment": "**背景/方法**：最新版 tokenspeed MLA backend 现已支持 block-interleaved DCP 分片，这是异构 NIXL 分离式(disagg) KV 传输所必需；本 PR 升级 tokenspeed MLA 版本（按要求连同更新的 cutlass）并启用该支持。+156/-3，3 文件（`requirements/cuda.txt`、`tests/v1/attention`、`vllm/v1/attention`）。**效果**：跑 `tests/v1/attention/test_mla_backends.py`；GSM8K 上 Kimi K3 DCP8 聚合(agg，作基线)与 DCP8 + DCP8 分离式(interleave size 896) 准确率均约 95%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "升级并启用 MLA attention backend 的 block-interleaved DCP 分片能力，属 attention backend。",
+      "tags": ["feature", "low-risk", "mla", "attention", "dcp", "tokenspeed", "disagg"],
+      "pr_number": 59462
+    }
+  ]
+}
