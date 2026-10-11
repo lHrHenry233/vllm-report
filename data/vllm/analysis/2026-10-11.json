@@ -1,0 +1,136 @@
+{
+  "date": "2026-10-11",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-11T20:21:52+08:00",
+  "daily_summary": "15 条的轻量一天，主线偏前端/API 正确性、安全与内存。一、前端与安全成栈：把标量 `priority` 打通进 `LLM.chat()` 并补 `_priority_to_seq` 标量分支(#57243)、给未开 `--enable-scale-out` 的端点从沉默 404 改成带 OpenAI 风格提示的 403(#61042)、把默认 CORS allowed origins 从 `['*']` 收紧为空列表需显式 opt-in(#61009，安全)、把 `--enable-log-outputs`/`--enable-log-deltas` 转发进 Anthropic handler(#60982)、清理一批到期弃用项(#60923)。二、启动与加载内存：fast-start 在外部权重就绪后再取 `init_snapshot` 以免把 IPC daemon 的晚分配重算两次致 KV 无预算(#60966)、在权重加载两个生命周期边界加 `gc.collect()`/`empty_cache()` 把 caching allocator 缓存内存归还给裸 CUDA driver 分配(#57516)。三、KV/分布式：Mooncake store 用 EAGLE 重放边界保留 sliding-window tail(#61012)、packed weight transfer 支持 0-D 标量张量(#52235)、跨多 KV cache group 修投机解码 block 预留(#59880)。四、模型与多模态性能：MiniMax-M3 MSA prefill 直接吃 E4M3 query 免 BF16 拷贝、FP8 KV 上快 26–37%(#60684)、新增 MiniCPM-V 4.7（canvas 3D M-RoPE）(#58674)、修 Qwen3-VL per-video 缓存选项复用(#55203)。另有 RL rollout 跨权重更新返回 token 级 weight-version 区间的早期草稿(#59582)。风险点：#61009 改变默认 CORS 行为（服务浏览器应用须配 origin），#61012/#59880 触及 KV 保留/预留正确性。",
+  "sig_summaries": {
+    "sig-core": "九项，前端/API/安全与启动加载为主。前端与安全：#57243 给 `LLM.chat()`/`_run_chat` 补 `priority` 下传、`_priority_to_seq` 加标量广播分支（修 `llm.generate(.., priority=1)` 的 `int has no len()`）；#61042 被禁的 Python scale-out POST 与 Rust `/inference/v1/generate` 从 404 改 403 + 需 `--enable-scale-out` 的 OpenAI 风格提示（诊断路径从既有 router 派生、复用 `create_error_response`）；#61009 默认 allowed origins 从 `['*']` 收到空列表、外部 origin 不再带 `Access-Control-Allow-Origin`、JSON 预检不再授权；#60982 把 `--enable-log-outputs`/`--enable-log-deltas` 经 `AnthropicServingMessages.__init__` 转发给 `OpenAIServingChat`；#60923 移除到期弃用项（benchmarks `--dataset`、pause 的 `wait_for_inflight_requests`、`vllm/scripts.py` shim、pooling `output_to_response` 兼容分支）。模型/启动/加载：#58674 新增 MiniCPM-V 4.7（canvas 3D M-RoPE、4.6 重构为可继承、rope_delta 补 `+1` 对齐 qwen2/3_vl、还原字面换行）；#60966 把 `init_snapshot` 移到外部权重内存就绪后（避免 IPC daemon 晚分配双计致 KV 预算塌缩、恢复静态 EP IPC 自动 sizing）；#57516 在 `load_model()` 两边界加 `gc.collect()` 与 `empty_cache()` 回收 repacking 临时 buffer 喂 DeepEP v2 `cuMemCreate`/DMA-BUF 等；#60937 把 MRV2 in-place 权重重载从 MRV1 解耦到新 `reload/inplace.py`、config 更新逻辑留在 worker。",
+    "sig-large-scale-serving": "两项，KV connector 与权重传输正确性。#61012 修 `MooncakeStoreCoordinator.store_mask`：此前以 `use_eagle=True` masking 却传非-EAGLE 重放边界，使非 block 对齐 prompt 的保留 tail 高一块、保存 prefix 少一块、联合命中塌成 0；把核心规则抽成 `kv_cache_coordinator.py` 的模块级 `replay_boundaries()` 供两侧共用（非-EAGLE 仍给 `(num_prompt_tokens-1,)`，对齐 prompt 也保留核心较低 resend tail）。#52235 让 packed weight transfer 支持 0-D 标量张量：生产端先 flatten 再按 `uint8` reinterpret（`dim()>0` 约束），`unpack_tensor` 用 `view(shape)` 而非 `view(*shape)`（空 shape 合法），对既有转置/stride/permute 用例字节一致。",
+    "sig-model-performance": "一项。#60684 让 MiniMax-M3 的 MSA prefill 直接以 E4M3 query 进 `fmha_sm100`：此前融合 QK-norm/RoPE/insert kernel 只写 E4M3、`MiniMaxM3SparseMSAImpl` 每次 prefill 又反量化回 BF16 buffer，而两个 prefill kernel 都原生吃 E4M3，故去掉 BF16 拷贝（仅 Triton decode fallback 仍读反量化 query；BF16 cache 与 FP8 默认 Triton decode 路径不变），并把 `fmha_sm100` 从 `be4a52a` bump 到 `968061a`（含 Blackwell prefill port over packed K|V pages）；GB300 每层 FP8 KV 快 26–37%、NVFP4 快 8–13%。",
+    "sig-omni": "一项。#55203 修 Qwen3-VL per-video 缓存选项复用：让每个视频选中的 `fps`/`num_frames` 参与其 cache identity，部分 multimodal-cache 命中时把选项列表连同剩余视频一起过滤，过短选项列表在索引前抛明确 `ValueError`（有/无 processor cache 皆然，未用尾部条目仍支持），配置默认、请求选项、flat/nested 作用域、UUID 复用、encoder profiling 保持既有行为。",
+    "sig-spec-decode": "一项。#59880 修多 KV cache group 下异步 KV 加载的投机 block 预留：既有算法用 scheduler block size 一次性把投机 token margin 转块，但每个 KV cache group 独立从共享 block pool 分配且可能用不同 allocation block size，压力下少预留会使请求被 admit 进异步加载却在完成后无法开始 decode；改为跨所有 cache manager 用各自 block size 求和（单纯乘 group 数在混合 block size 时仍错），并把 promotion-margin 回归测试扩到单/多 group 与混合 block size（32 passed）。",
+    "sig-rl": "一项。#59582（草稿）为 RL rollout 跨越权重更新时提供 token 级可观测性：`pause(mode=keep)` 下一个输出由两版权重采样、而引擎只报当前 `/weight_info` 标签；本 PR 在每条序列最终输出返回 `weight_versions`（对输出 token 索引的连续半开区间、按生成序覆盖每 token 一次、同标签相邻段合并、空输出给 `[]`），`EngineCore` 每步盖当前标签、`OutputProcessor` 记 span start，经 `CompletionOutput.weight_versions` 与 `/inference/v1/generate` 两种输出模式暴露（OpenAI 兼容端点不改）。"
+  },
+  "commits": [
+    {
+      "sha": "c85616efc6f0eaa50ca1f1a09c32368aedffd3d8",
+      "comment": "**背景**：新增对即将发布的 MiniCPM-V 4.7 的支持，架构与 4.6 接近，主要新增是 canvas 3D M-RoPE。**方法**：缩略图在切片画布上重采样、切片与行换行按其几何取位置；把 4.6 重构为可继承（默认行为不变）；视频占位符不再发 `<image_id>` 局部 id（4.7 训练时不含）；修 canvas `rope_delta` 缺 `+1` 以对齐 `qwen2_vl`/`qwen3_vl`；还原输出里字面换行——tokenizer 把换行解码成 `\\` + `n` 两字符（id 1639），代码块、行内代码、LaTeX 与 tool-call 参数保持不动。**效果**：canvas 位置与 `rope_delta` 逐 token 对齐 transformers 4.7 参考（PR #48979），7/7 用例，12 测试通过、ruff check/format 干净（+2368/-64，13 文件，含 `tests/model_executor/test_minicpmv4_7.py` 与 `vllm/model_executor/models`）。",
+      "sig": "sig-core",
+      "sig_reason": "新增 MiniCPM-V 4.7 多模态模型架构支持，属核心引擎的新模型架构。",
+      "tags": ["feature", "low-risk", "model", "multimodal", "minicpm-v", "m-rope"],
+      "pr_number": 58674
+    },
+    {
+      "sha": "f425a212081181e3d6ad2ca92daa74ba0f9e83a4",
+      "comment": "**背景**：`OfflineInferenceMixin._add_chat_requests` 接受并应用 `priority`（`seq_priority = self._priority_to_seq(...)`），但其唯一调用者 `_run_chat` 与 `LLM.chat()` 都没有 `priority` 参数从不传，于是 `llm.chat(messages, priority=1)` 抛 `unexpected keyword argument`，而 `LLM.generate/enqueue/enqueue_chat` 都已暴露它。同类另一缺陷：`_priority_to_seq` 只要 `priority` 非 None 就 `len(priority)`，故 `llm.generate('Hello', priority=1)` 标量报 `object of type 'int' has no len()`——两个 sibling `_params_to_seq`/`_lora_request_to_seq` 都先 `isinstance(x, Sequence)` 再用 `[x]*num_requests` 广播标量，唯 `_priority_to_seq` 缺此分支。**方法**：给 `LLM.chat()`/`_run_chat` 补 `priority` 下传；`_priority_to_seq` 先把 None 归一为 0、再加标量广播分支，其余逻辑与两 sibling 一致。**效果**：现有调用者不受影响（list 仍逐个长度校验、None 仍返回全 0），标量优先广播到全部请求（+65/-12，5 文件）。",
+      "sig": "sig-core",
+      "sig_reason": "修复离线推理前端入口 `LLM.chat()` 的 priority 参数与标量处理，属前端/入口。",
+      "tags": ["bugfix", "low-risk", "frontend", "offline-inference", "priority"],
+      "pr_number": 57243
+    },
+    {
+      "sha": "2339bd39d661965b821bfbe652db8f536e0b3dcd",
+      "comment": "**背景**：`MooncakeStoreCoordinator.store_mask` 镜像核心的稀疏 sliding-window 保留（`SlidingWindowManager.reachable_block_mask`），让 store 保留与本地 prefix cache 相同的 tail，但它在以 `use_eagle=True` masking 时传的是非-EAGLE 重放边界 `(num_prompt_tokens - 1,)`。EAGLE 下 lookup 命中到后一块再退回，核心 `replay_boundaries` 把边界低一个 scheduler block，store 没跟随——非 block 对齐 prompt 的保留 tail 因此高了一块，保存的 prefix 只含连续块所需 `need` 中的 `need - 1`，联合命中塌成 0，只有 block 对齐 prompt 命中。受影响布局为 full-attention target group + sliding-window EAGLE drafter group（DFlash 式）配 `prefix_cache_retention_interval=0`。**方法**：把核心规则抽成 `vllm/v1/core/kv_cache_coordinator.py` 模块级 `replay_boundaries()`（由 `KVCacheCoordinator.cache_blocks` 直接调用、行为不变），并在 `_reachable_masks` 调用它使两侧不再漂移；非-EAGLE 路径仍给 `(num_prompt_tokens - 1,)`，block 对齐 prompt 上 store 现也保留核心较低的那条 resend tail。**效果**：修好 store 侧非对齐 prompt 的 sliding-window+EAGLE 命中（+85/-27，4 文件），与 #57613 可组合，与 #56615/#57444/#46906 非重复，详见原文。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修 Mooncake store 稀疏 sliding-window 保留边界与 KV connector 数据路径，属大规模服务 KV 存储正确性。",
+      "tags": ["bugfix", "medium-risk", "mooncake", "kv-connector", "eagle", "sliding-window", "prefix-cache"],
+      "pr_number": 61012
+    },
+    {
+      "sha": "1789f095881d14966d7d4d9a2647748bf32dd834",
+      "comment": "**背景**：#54579/#55176 之后，未以 `--enable-scale-out` 启动时 `/inference/v1/generate` 的既有调用者收到无解释的 404，让有意的配置闸门看起来像 API 缺失或被删。**方法**：保留既有 opt-in 默认与专用 render/tokens-only 行为；被禁的 Python scale-out POST 路由与 Rust `/inference/v1/generate` 改返 HTTP 403 加 OpenAI 风格错误、说明须以 `--enable-scale-out` 重启——这些 handler 无请求体参数、从不调用渲染/生成/多模态反序列化，配置的 API-key 鉴权仍在其前，未知路径仍 404；两端启动诊断保持 INFO（未用的可选特性被禁是正常态）；Python 诊断路径与方法从既有 router 派生（不维护第二份端点表），错误复用 `create_error_response`、不引入新全局错误框架或中间件。**效果**：调用禁用端点者得到可操作的 HTTP 错误而非沉默 404（+117/-24，5 文件，含 `rust/src/server` 与 `docs/usage/security.md`）；非安全闸门回滚，不改 pickle 设置、模型执行或成功生成响应；Python 24 测试通过，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改进 Python/Rust 两个 scale-out 前端对禁用端点的诊断响应，属 API 前端。",
+      "tags": ["feature", "low-risk", "frontend", "scale-out", "security", "dx"],
+      "pr_number": 61042
+    },
+    {
+      "sha": "fcae5c98870ff2c20659731dce7ba3a3ff0d48aa",
+      "comment": "**背景**：默认 CORS 设置允许任意网站读取浏览器可达的 vLLM 服务响应——Python 与 Rust 两个 serving 前端的默认 allowed origin 列表都是 `['*']`，未配 API key 的部署可被浏览器脚本读取。**方法**：要求运维显式 opt-in browser origin，两端新默认为空列表，显式 `--allowed-origins` 与通配符 opt-in 仍可用。**效果**：默认来自外部 origin 的请求不再带 `Access-Control-Allow-Origin` 头、JSON 预检不再被授权；故意服务浏览器应用的部署须以 `--allowed-origins` 配置可信 origin（+124/-37，8 文件，Python 与 Rust 两端）。这是浏览器访问控制，不替代 API 鉴权、也不阻止所有简单跨域请求发出；3 个 CORS 测试与 cargo fmt 通过，Rust CORS 测试待 Linux 跑，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "收紧两个 serving 前端的默认 CORS origin 策略，属 API 前端与安全默认配置。",
+      "tags": ["security", "medium-risk", "cors", "frontend", "config"],
+      "pr_number": 61009
+    },
+    {
+      "sha": "26a488ad93d12c658449a19dea2eb78f1be38f83",
+      "comment": "**背景**：当 IPC weight-cache daemon 在引擎启动并发加载 zero-copy 权重时，现有初始化顺序会把 daemon 的晚到分配重算两次，导致即便 GPU 有足够空闲内存也没有效 KV cache 预算。举例 100 GiB 总量、`gpu_memory_utilization=90%`：t0 daemon 用 20 GiB 时 `init_snapshot` 记 80 GiB 空闲，t1 daemon 完成在 50 GiB、`get_memory()` 报 50 GiB，t2 引擎自用 25 GiB、实总 75 GiB；目标预算 90 GiB 应给引擎 `90 - 50 = 40` GiB，profiling 却从旧快照测 `80 - 25 = 55` GiB。**方法**：把 `init_snapshot` 移到外部权重内存就绪之后再取；恢复静态 EP IPC 加载下的自动 KV cache sizing。**效果**：用 #57320 的真实 Qwen3-30B-A3B-Instruct MoE、TP=2、EP 开、临时移除固定 KV override：1 passed，baseline/cold fallback/warm zero-copy/zero-copy restart 输出一致，两次 zero-copy 各每 rank 映射 676 tensor，自动 sizing 报约 28 GiB 可用 KV、611440 KV tokens（+3/-2，1 文件 `vllm/v1/worker`）。",
+      "sig": "sig-core",
+      "sig_reason": "修正 fast-start 冷启动阶段 GPU 内存快照时序与 KV 预算，属引擎核心启动/内存管理。",
+      "tags": ["bugfix", "low-risk", "startup", "memory", "weight-cache", "kv-cache", "expert-parallel"],
+      "pr_number": 60966
+    },
+    {
+      "sha": "ef42b4385f8512567703692a5bfbb9c0edc59c89",
+      "comment": "**背景**：修 #57440。`BaseModelLoader.load_model()` 期间 `load_weights()` 与 `process_weights_after_loading()` 造的临时张量（如 FP8/MXFP4 权重 repacking buffer）留在 PyTorch caching allocator 池里（`reserved - allocated`）；离散 GPU 上 `release_device_memory_under_pressure()` 是 no-op（只在集成 GPU 跑），使裸 CUDA driver 分配（DeepEP v2 `cuMemCreate`/DMA-BUF、`NCCL_CUMEM_ENABLE=1`、或次模型 fit 检查 `mem_get_info()`）缺空闲 driver HBM。**方法**：在 `load_model()` 两个权重加载生命周期边界加 `gc.collect()` 与（`current_platform.is_cuda_alike()` 时）`torch.accelerator.empty_cache()`：一在 `load_weights` 之后 `process_weights_after_loading` 之前，二在 `process_weights_after_loading` 之后。**效果**：把临时 buffer 归还给 driver（+9/-0，1 文件 `vllm/model_executor/model_loader`）；2 测试验证精确顺序 `load_weights → gc/empty_cache → process_weights → gc/empty_cache`，并在非 CUDA 平台跳过 `empty_cache`。",
+      "sig": "sig-core",
+      "sig_reason": "在模型权重加载生命周期回收 allocator 缓存内存，属模型加载/内存管理。",
+      "tags": ["bugfix", "low-risk", "model-loading", "memory", "allocator", "cuda"],
+      "pr_number": 57516
+    },
+    {
+      "sha": "61f084b5f3e58aa3d3eb5c86aeaf4686c460c478",
+      "comment": "**背景**：Qwen3-VL 在重复条目与部分 multimodal-cache 命中时会丢失每个视频的有效采样选项。**方法**：让每个视频选中的 `fps` 与 `num_frames` 参与其 cache identity；部分 cache 命中时把选项列表连同剩余视频一起过滤；在索引前拒绝过短的选项列表并抛明确 `ValueError`（有/无 processor cache 皆然，未用尾部条目仍支持）；配置默认、请求选项、flat/nested 作用域、UUID 复用与 encoder profiling 保持既有行为。**效果**：缓存回归覆盖 prompts、占位符、张量、hash、scalar-reference grid、重复视频、部分命中、重排、模型/请求选项、flat/nested 作用域与仅 UUID 复用（输入选项不被修改）；短列表复现此前 `IndexError` 现改抛 `ValueError`；Qwen3 processor、generic processing、cache 套件通过（+197/-45，3 文件），CUDA sleep/wake 集成在 CPU 套件跳过，详见原文。",
+      "sig": "sig-omni",
+      "sig_reason": "修 Qwen3-VL 视频 per-video 采样选项与多模态缓存复用，属多模态处理。",
+      "tags": ["bugfix", "low-risk", "multimodal", "video", "qwen3-vl", "cache"],
+      "pr_number": 55203
+    },
+    {
+      "sha": "2eb491e18b1ce5b8a25e4c88f32dbb5d028d525c",
+      "comment": "**背景**：开 CUTLASS MSA sparse decode（NVFP4 KV cache，或 FP8 E4M3 cache 配 `CUTLASS_MSA` decode backend）时，融合的 QK-norm/RoPE/insert kernel 只以 E4M3 写 MiniMax-M3 的 query，`MiniMaxM3SparseMSAImpl` 每次 prefill 前又把它反量化回 BF16 query buffer；而两个 `fmha_sm100` prefill kernel 都原生接受 E4M3 query。**方法**：prefill 直接原样传 E4M3 query、不再做 BF16 拷贝（仅 Triton decode fallback 仍读反量化 query）；把 `fmha_sm100`(vllm-project/MSA) 从 `be4a52a` bump 到 `968061a`，新 pin 含 MSA 的 Blackwell prefill port，现以 E4M3 query 服务 over vLLM 的 packed K|V pages（MSA#32）；BF16 cache 与 FP8 cache 默认 Triton decode 后端仍传 BF16 query、路径不变。**效果**：GB300 每层 MSA prefill attention 在 FP8 KV cache 快 26–37%、NVFP4 KV cache 快 8–13%；新增 `test_msa_prefill_reads_query_fp8_over_fp8_cache[tp1|tp4]` 与改后的 nvfp4 参考用例，240 passed、45 skipped（均 ROCm-only）（+176/-32，4 文件含 `cmake/external_projects/fmha_sm100.cmake`）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "让 MiniMax-M3 MSA prefill 内核直接消费 E4M3 query 以免 BF16 拷贝并 bump kernel 提速，属 attention 内核性能。",
+      "tags": ["performance", "low-risk", "attention", "msa", "minimax-m3", "fp8", "nvfp4", "kernel"],
+      "pr_number": 60684
+    },
+    {
+      "sha": "f8471164bf9f5190752fd7b903d415a34fc4ba1c",
+      "comment": "**背景**：为 MRV1 移除做准备，把原先长在 MRV1 `gpu_model_runner.py` 的 in-place 权重重载逻辑与 MRV2 解耦。**方法**：把重载逻辑移到新工具模块 `vllm/model_executor/model_loader/reload/inplace.py`（`get_parameter_for_reload` 解析 checkpoint 名而不改模块树、遇 `BaseLayerWithLoRA` 取其 `base_layer`；`reload_weights` 从权重迭代器或磁盘就地重载，调用方负责失效 LoRA/encoder/multimodal 等派生状态），MRV2 `gpu/model_runner.py` 改调它；config 更新逻辑留在 worker——`gpu_worker.update_config` 现直接在 worker 内校验 `load_config`/`model_config`、经 `update_config()` 同步到 worker、model_runner 与共享 `VllmConfig`（不再委托 model_runner）。**效果**：MRV2 权重重载不再依赖 MRV1 代码路径，为移除 MRV1 铺路（+215/-150，6 文件：`reload/inplace.py`、`gpu/model_runner.py`、`gpu_model_runner.py`、`gpu_worker.py` 与两个测试）。",
+      "sig": "sig-core",
+      "sig_reason": "把 model runner v2 的 in-place 权重重载从 MRV1 解耦为工具模块，属引擎核心重构。",
+      "tags": ["refactor", "low-risk", "model-runner-v2", "weight-reload", "config"],
+      "pr_number": 60937
+    },
+    {
+      "sha": "01abe975b5837f9e0722a196a28e57331735e0a6",
+      "comment": "**背景**：修多 KV cache group 下异步 KV 加载时投机解码的 block 预留。KV 内存压力下少预留这些 block，会让请求被 admit 进一次异步 KV load、但加载完成后仍无法开始 decode。既有算法用 scheduler block size 一次性把投机 token margin 转成 block，但每个 KV cache group 独立从共享 block pool 分配、且可能用不同的 allocation block size。**方法**：跨所有 cache manager 用各自的 block size 求和预留（单纯把旧结果乘 group 数在混合 block size 时仍不够）；把既有 promotion-margin 回归测试扩展到单 group、多 group 与混合 block size 三种配置。**效果**：三配置矩阵里原实现单 group 过、多 group 与混合 block size 失败，乘 group 数只在混合 block size 失败，本修复三项全过；远端 prefill/decode 生命周期与 KV load 失败恢复 32 passed，更广 scheduler/decode/recovery 运行无新增失败（+128/-41，3 文件）；未跑实时 NIXL P/D 与模型级评测，详见原文。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "核心是修正投机解码 token margin 的 block 预留量，属 spec decode 与调度分配。",
+      "tags": ["bugfix", "medium-risk", "spec-decode", "kv-connector", "scheduler", "kv-cache-groups"],
+      "pr_number": 59880
+    },
+    {
+      "sha": "b89852aad0854cc8df9138bc412b9a75c1fa8120",
+      "comment": "**背景**：RL rollout 常跨越一次权重更新——`pause(mode='keep')` 下运行中请求被冻结、权重与 weight-version 标签改变后恢复，于是一个输出由两版权重采样；vLLM 只报引擎当前标签（`/weight_info`），调用方分不清哪些 token 来自哪版权重。此 PR 为供他人早测的草稿版。**方法**：在每条序列的最终输出返回采样各 token 区间的权重标签 `weight_versions`——对输出 token 索引（不含 prompt）的半开区间列表，连续且按生成序覆盖每个返回 token 一次；同标签相邻区间合并（A→B→A 给三段）、无 token 输出给 `[]`；token 标签是采样它那步返回输出时引擎的标签（更新流程在暂停、无 step in-flight 时设标签故每 token 得正确标签）；`EngineCore` 给每步 `EngineCoreOutputs` 盖当前标签（紧邻既有 iteration details），`OutputProcessor` 在 token 未按预期标签到达时记 span start，scheduler 与权重更新路径不变。**效果**：列表经 `CompletionOutput.weight_versions` 与 `/inference/v1/generate` choices 两种输出模式暴露（含 abort 输出、stream 最后一块即使无新 token 也发），OpenAI 兼容端点本 PR 不改（+169/-28，14 文件，含 `examples/rl/rlhf_async_new_apis.py`、`docs/training/async_rl.md`）。",
+      "sig": "sig-rl",
+      "sig_reason": "为 RL rollout 跨权重更新返回 token 级 weight-version 区间以区分采样来源，属 RL 生态（推翻 sig_hint core）。",
+      "tags": ["feature", "low-risk", "rl", "weight-version", "output", "rollout", "draft"],
+      "pr_number": 59582
+    },
+    {
+      "sha": "3c062d391d15cfa41d3f321cad24f3030c892a97",
+      "comment": "**背景**：packed weight transfer 对 0-D（标量）张量失败。生产端 `pack_tensors`/`packed_ipc_producer` 先按 `uint8` reinterpret 再 flatten，而 reinterpret 成不同元素大小的 dtype 需要 `dim() > 0`，标量抛 `self.dim() cannot be 0 to view Float as Byte`；消费端 `unpack_tensor` 用 `.view(*shape)` 还原形状，标量 `shape == []` 使调用变 `view()` 抛 `TypeError`。一个标量会拖垮整个被打包进的 chunk。unpacked IPC 路径经 `reduce_tensor`/`rebuild_cuda_tensor` 无 dtype reinterpret 已能往返 0-D；接收端 `linear.py` 的 `weight_loader` 本就能在加载时 reshape 无形状权重（scale 常无形状，如 AutoFP8），但 `unpack_tensor` 提前抛异常。**方法**：两条 packed 生产路径都先 flatten 再 reinterpret dtype（使 uint8 view 永不见 0-dim）；`unpack_tensor` 把形状序列传给 `view()`（用 `view(shape)` 而非 `reshape` 以保留既有 view 语义，空 shape 合法）。**效果**：对既有测试覆盖的所有形状（含转置、stride、permute）字节一致，flatten-before-reinterpret 顺序与同包 `shm_broadcast.py` 等既有做法一致（+31/-4，2 文件含 `tests/distributed/test_packed_tensor.py`）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修 packed IPC weight transfer 对 0-D 标量张量的 pack/unpack，属分布式权重传输。",
+      "tags": ["bugfix", "low-risk", "distributed", "weight-transfer", "ipc", "tensor"],
+      "pr_number": 52235
+    },
+    {
+      "sha": "276fbcff2717bd934cfa37c8a2e4c391f3e7237b",
+      "comment": "**背景**：清理一批已排期到期的弃用项。**方法**：删 `vllm/benchmarks/throughput.py` 的 `--dataset` 参数及其告警与默认逻辑（改用 `--dataset-name`/`--dataset-path`）；删 `EngineClient.pause`、`AsyncLLM.pause_generation` 与 RL online `api_router.pause_generation` 的弃用参数 `wait_for_inflight_requests`（以 `mode='wait'` 替代）；整体删除向后兼容 shim `vllm/scripts.py`（原告警并转发到 `vllm.entrypoints.cli.main`）；删 pooling `io_processor.py` 里对已弃用 `IOProcessor.output_to_response` 的兼容分支（`IOProcessorResponse` 现直接透明包装输出数据）；删 Rust `routes/pause.rs` 相应 TODO 注释。**效果**：移除过渡期弃用代码（+3/-81，7 文件）。",
+      "sig": "sig-core",
+      "sig_reason": "移除引擎/前端/CLI 中到期的弃用 API 与兼容 shim，属核心清理。",
+      "tags": ["chore", "low-risk", "deprecation", "cleanup", "cli", "api"],
+      "pr_number": 60923
+    },
+    {
+      "sha": "187a0eb98aa42341d703f83421d693fa7585581b",
+      "comment": "**背景**：修 #60971。`--enable-log-outputs`（与 `--enable-log-deltas`）作为服务级 flags 被接受却从未转发给 Anthropic `/v1/messages` handler，输出日志在那里停在父类默认值——尽管 `create_messages` 复用共享的 `create_chat_completion` 实现、其中日志以 `self.enable_log_outputs` 为门。**方法**：`AnthropicServingMessages.__init__` 现接受 `enable_log_outputs`/`enable_log_deltas`（默认同父类 `False`/`True`）并转发给 `OpenAIServingChat.__init__`；`init_generate_state` 构造 handler 时传 `args.enable_log_outputs`/`args.enable_log_deltas`（与相邻 Chat Completions 设置一致）。**效果**：Anthropic handler 现尊重这两个 flag（+6/-0，2 文件：`vllm/entrypoints/anthropic`、`vllm/entrypoints/generate`）；评审后删去测试，仅构造级 flag 转发由 CI 覆盖。",
+      "sig": "sig-core",
+      "sig_reason": "把服务级日志 flag 正确转发进 Anthropic messages handler，属 API 前端。",
+      "tags": ["bugfix", "low-risk", "frontend", "anthropic", "logging"],
+      "pr_number": 60982
+    }
+  ]
+}
