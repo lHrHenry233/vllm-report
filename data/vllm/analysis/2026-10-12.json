@@ -1,0 +1,87 @@
+{
+  "date": "2026-10-12",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-12T12:08:00+08:00",
+  "daily_summary": "9 条的轻量一天，主线是 hybrid/Mamba 状态正确性与 XPU 平台推进。一、状态与 warmup 正确性成栈：RecoverSSM align 模式在恰好落在 Mamba block 边界时把最终 state 列从 `total // block_size` 改为 `max(total - 1, 0) // block_size`(#59962)、GLM-5.3-Flash 补传 `--mamba-ssm-cache-dtype` 使 KDA recurrent state 不再恒为 float32(#59147)、MRV2 上修 FlashInfer attention warmup 的 token 预算夹取与 ReplaySSM autotune 的 Mamba metadata 保留(#61013)。二、通信兼容：MiniMax 融合 allreduce+RMSNorm 的 CUDA IPC handle 交换改走 `handle.getPtr()` + ctypes 复制 64 字节，适配移除了 `.reserved` 字段的 cuda-bindings 13.4(#60917)。三、XPU：FA kernel block size 用 `MultipleOf(64)` 进入支持列表并对退化值告警(#57297)、`tests/v1/cudagraph/` 去掉 CUDA 硬编码让图测试在 XPU 上真跑(#60784)。另有 CI 侧把仍钉在 MRV1 的用例切到 MRV2 并删掉 `force_v1_runner`(#61014)、前端离线 `chat()`/`enqueue_chat()` 尊重 `LLM(chat_template=...)`(#61061)、量化侧从顶层 config 读 `quantization_config` 使 Bailing V3 VL 的 MXFP4 专家不再被当 FP8 加载(#59026)。风险点：#59962 与 #61013 触及 Mamba state 索引与 warmup 路径，且 #59962 自述上游全模型评测仍 pending；#61014 改变 CI 默认 runner 覆盖面。",
+  "sig_summaries": {
+    "sig-ci": "两项，都是将 XPU/平台能力与 MRV2 覆盖补齐到测试侧。#60784 给 `tests/v1/cudagraph/` 四个测试去 CUDA 硬编码：以 `HAS_DEVICE_GRAPH = is_cuda_alike() or is_xpu()` 与 `DEVICE_TYPE = current_platform.device_type` 替换 skip 门与 `device=\"cuda\"`，XPU 上复用 `xpu_model_runner._torch_cuda_wrapper()` 把 `torch.cuda` 图/流 API 路由到 `torch.xpu`，并补 XPU 的 cudagraph mode 组合表，产品代码零改动。#61014 移除 `.buildkite/test-amd.yaml` 与 `test_areas/quantization.yaml` 里的 `VLLM_USE_V2_MODEL_RUNNER=0` 钉法、删 `tests/utils.py` 的 `force_v1_runner` 参数注入，并把多个单测的 `use_v2_model_runner` 由 `False` 改 `True`（`test_gpu_worker` 的 dummy runner 补 `is_pooling_model=False`、`test_scheduler` 加 MRV2 pp 交错断言、ReplaySSM e2e 改为显式 v1/v2 参数化）。",
+    "sig-core": "四项，集中在 hybrid/Mamba 状态索引、MRV2 warmup 与离线前端接线。#59962 修 RecoverSSM align 模式在恰好 block 边界选错 state 列：KDA commit planner 与 V2 postprocessing 两处 Triton 表达式统一成 `tl.maximum(total - 1, 0) // block_size` 并保留 block table 宽度上界，非 align 行为不变，测试扩到边界邻居/请求 remap/第一与第二精确边界（原代码 4 failed、修后 19 passed），上游 Kimi-K3 全模型评测仍 pending。#61013 新增 `mixed_batch_attention_warmup()` 供 FlashInfer 与 MiniMax M3 MSA warmup 共用（夹住 token 数、V1 保留混合 dummy batch、MRV2 走 `run_mixed_prefill_decode_warmup()`），MRV2 `_dummy_run` 现与 V1 一样断言 token 预算，profile 丢弃 Mamba metadata 的条件加上 `and not valid_dummy_state_slots` 使 ReplaySSM autotune 真正跑起来。#59147 给 `kda_state_dtype()` 两处调用补传 `cache_config.mamba_ssm_cache_dtype`，使 `--mamba-ssm-cache-dtype bfloat16` 对 GLM-5.3-Flash 生效（state page 减半、TP2 块长 2304→1280、spec-decode decode 实例并发约 1.25 倍）。#61061 修离线共享预处理把 `None` 直传 renderer、使 `LLM(chat_template=...)` 在 `chat()`/`enqueue_chat()` 被静默忽略，per-call 显式模板仍可覆盖。",
+    "sig-model-performance": "一项。#57297 让 XPU 上 `flash_attn_varlen_func` 偏好的 64 倍数 block size 回到正式支持列表：`FlashAttentionBackend.get_supported_kernel_block_sizes` 在 XPU 返回 `[MultipleOf(64)]`，`init_attn_backend` 在 `prepare_kernel_block_sizes` 之后逐 KV cache group 检查、非 64 倍数时 `warning_once` 提示未充分优化（用户显式 `--block-size 16` 仍被尊重只告警）；此前 #53007 使 Phi-3.5-mini 的最终 kernel block size 从 64 退到 16。8 个 kv_connector 单测改用新 helper `maybe_update_block_size`（XPU 返回 64）使 block 数与 matched tokens 断言随平台推导，XPU CI 同时解除对 `test_nixl_connector_hma.py` 的 ignore。",
+    "sig-large-scale-serving": "一项。#60917 修 MiniMax 融合 allreduce+RMSNorm 的跨 GPU IPC handle 交换在 cuda-bindings >= 13.4 上崩溃：`cudaIpcMemHandle_t.reserved` 被移除使 `bytes(local_handle.reserved)` 抛 `AttributeError`，vLLM 回退到较慢的非融合 allreduce 路径并让 `test_minimax_reduce_rms_qk` 在 torch-nightly lane 失败；改用 `handle.getPtr()` 经 `ctypes.string_at`/`ctypes.memmove` 复制这 64 字节（CUDA ABI 固定其为不透明 `char reserved[64]`，所有版本皆支持故无需版本判断），新增 `_ipc_handle_to_bytes`/`_ipc_handle_from_bytes` 并断言长度，改动限于 `minimax_rms_norm/lamport_workspace.py`（+20/-3）。",
+    "sig-quantization": "一项。#59026 修 `inclusionAI/Ling-3.0-flash-VL-fp4` 全平台权重加载失败（`_load_w2` 处 tensor size 3 vs 12 不匹配）：routed experts 是 MXFP4，但 `_configure_ling_fp8_quant_config` 只读 `config.quantization_config`，而 VL 的语言塔由无该字段的 `text_config` 构建，helper 提前返回、`store_dtype` 未设，专家被分到 `Fp8MoEMethod` 而非 `Mxfp4MoEMethod`（并因 FP8 buffer 约 2 倍大而 TP=1 OOM）；改为回退到当前 vLLM config 的顶层 `hf_config`，纯文本 Ling 与 MTP draft 不变。"
+  },
+  "commits": [
+    {
+      "sha": "bfa7e5b7afe40ebe48288801a2baf5c1135cd881",
+      "comment": "**背景**：`tests/v1/cudagraph/` 下的图测试硬编码 CUDA——skip 门写作 `torch.cuda.is_available()` / `@pytest.mark.skipif(not current_platform.is_cuda())`、张量写作 `device=\"cuda\"`，XPU 上 breakable cudagraph、dispatcher、cudagraph mode 组合、encoder cudagraph 这些用例整体被跳过。PR 自述主旨即 remove hardcode in graph tests。**方法**：各文件引入 `HAS_DEVICE_GRAPH = current_platform.is_cuda_alike() or current_platform.is_xpu()` 与 `DEVICE_TYPE = current_platform.device_type` 替换门控与设备参数；XPU 分支复用 `vllm.v1.worker.xpu_model_runner._torch_cuda_wrapper()`，把 `torch.cuda` 的 graph/stream API 路由到 `torch.xpu`（与 `XPUModelRunner` 一致）；`test_cudagraph_mode.py` 为 XPU 补 `combo_cases_1`（FA2/TritonAttn 的 FULL 与 FULL_AND_PIECEWISE 均可）；`test_cudagraph_dispatch.py` 的 mock config 补 `use_cumem_cudagraph_pool = False`，设备改为 `torch.device(current_platform.device_type, 0)`。**效果**：图测试在 XPU 上不再被跳过、可在 Intel lane 验证，产品代码未改动（+63/-32，4 个测试文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "纯测试侧去平台硬编码以打开 XPU 图测试覆盖，属 CI/测试基建；sig_hint 亦为 sig-ci。",
+      "tags": ["test", "ci", "low-risk", "xpu", "cuda-graph", "platform"],
+      "pr_number": 60784
+    },
+    {
+      "sha": "f147949be8b9e576f80133bee01e717ee7c5db0e",
+      "comment": "**背景**：XPU 上 `flash_attn_varlen_func` 从性能角度偏好 `block_size` 为 64 的倍数，此前靠 `FlashAttentionBackend.get_preferred_block_size` 这条旁路满足；但 `prepare_kernel_block_size` 引入后最终 kernel block size 会落到 16、32 等非偏好值——以 `Microsoft/Phi-3.5-mini-instruct` 为例，#53007 为 SWA 层选 primary block size 改变了 KV cache spec，使最终 kernel block size 从 64 退到 16。**方法**：`get_supported_kernel_block_sizes` 在 `current_platform.is_xpu()` 时直接返回 `[MultipleOf(64)]`，把平台偏好做成正式支持列表而非事后修正；`vllm/v1/worker/gpu/attn_utils.py: init_attn_backend` 在 `prepare_kernel_block_sizes()` 之后逐 KV cache group 检查，若 `selected_kernel_block_size % 64 != 0` 则对该组每个 backend/kv_cache_spec `logger.warning_once` 提示未充分优化；用户显式 `--block-size 16` 仍被尊重（只告警）。8 个 `tests/v1/kv_connector/unit/` 单测改用新 helper `maybe_update_block_size`（XPU 返回 64、其余原值）使 `num_blocks` 与 matched tokens 断言随平台推导，`.buildkite/intel_jobs/test-intel.yaml` 相应解除对 `test_nixl_connector_hma.py` 的 ignore。**效果**：Phi-3.5-mini 在 XPU 上 kernel block size 回到 64 且告警消失（此前那条 `kernel_block_size=16, SlidingWindowSpec(block_size=16, head_size=96, sliding_window=262144)` 警告不再出现），避免小页造成的 FA 性能损失；改动 +269/-126、11 文件，其中生产代码仅 +21 行（`attn_utils.py` +19、`flash_attn.py` +2），余为测试与 CI。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 XPU 上 FlashAttention kernel 的 block size 选择与未优化告警（attention kernel 性能），非 KV connector 功能本身，故推翻 sig_hint 的 sig-large-scale-serving。",
+      "tags": ["performance", "medium-risk", "xpu", "attention", "flash-attn", "block-size", "kv-cache-spec"],
+      "pr_number": 57297
+    },
+    {
+      "sha": "124b89d5b7bbbf7599763858c247848e073b024a",
+      "comment": "**背景**：修 #59933（RecoverSSM 投机 KDA 解码的状态恢复路径）。align 模式下最终 state 列由 `total // block_size` 计算，`total` 恰为 block_size 整数倍时会提前进到下一块，于是提交与记录的 state 落在错误 block table 列——KDA commit planner（`vllm/models/kimi_k3/nvidia/ops/recoverssm.py` 的 `_prepare_commit_plan_kernel`）与 V2 postprocessing（`vllm/v1/worker/gpu/model_states/recoverssm.py` 的 `_postprocess_recoverssm_align_kernel`）两处都有同一算术缺陷。**方法**：两处统一改为 `tl.maximum(total - 1, 0) // block_size`（即取最后一个被接受 token 所在块），并保留既有的零长 clamp 与 `tl.minimum(..., block_table_width - 1)` 上界；非 align 行为不变。测试把 `test_kda_recoverssm_verify_and_group_commit` 参数化为 accepted `(2, 8)/(3, 4)/(5, 8)`、把 mixed-batch CUDA 用例参数化为 (computed, sampled, expected_column) 的 `(4,3,0)/(4,4,0)/(4,5,1)/(8,8,1)/(8,9,2)`，覆盖边界邻居、请求 remap 与第一/第二精确边界，block 选取从 `(4 + commit_len) // 8` 改为查表 `{2:0, 3:0, 4:0, 5:1, 8:1}`。**效果**：新测试对原生产代码 4 failed/15 passed（两处 KDA committed-state 对 `naive_recurrent_kda` 比较失败、两处 totals 8 与 16 的 V2 state 列错误），修后 19 passed；生产改动仅 +3/-2（4 文件、+21/-9），mypy 等 pre-commit 通过。PR 明确声明上游 Kimi-K3 全模型精度/生成评测仍未完成（其 GSM8K 配置需 TP4，验证在 RTX 4060 单卡完成），不做吞吐或延迟声明，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "修 V2 worker ModelState 与 KDA planner 的 Mamba state 索引算术，属核心 model runner/状态管理正确性（投机解码只是触发场景），与历史同类 RecoverSSM 修复归类一致。",
+      "tags": ["bugfix", "high-risk", "recoverssm", "kda", "mamba", "block-boundary", "spec-decode"],
+      "pr_number": 59962
+    },
+    {
+      "sha": "03091e28b8ba956634c153beab0e52decafdef31",
+      "comment": "**背景**：`inclusionAI/Ling-3.0-flash-VL-fp4` 在所有平台权重加载即失败：`RuntimeError: The size of tensor a (3) must match the size of tensor b (12) at non-singleton dimension 1`（`routed_experts.py, _load_w2`）。routed experts 实为 MXFP4（`routed_experts_quant_method: mxfp4`），但 `_configure_ling_fp8_quant_config` 只从 `config.quantization_config` 读该字段，而 VL 模型的语言塔由 `text_config` 构建、其上并无 `quantization_config`（它挂在顶层 VL config），helper 提前返回、`store_dtype` 保持未设，专家于是拿到 `Fp8MoEMethod` 而非 `Mxfp4MoEMethod`；同一缺陷还使 TP=1 OOM，因为 FP8 专家 buffer 约为 MXFP4 的 2 倍。**方法**：helper 在收到的 config 缺 `quantization_config` 时回退读取当前 vLLM config 的顶层 `hf_config`；纯文本 Ling 与已自带 `quantization_config` 的 MTP draft 行为不变（+13/-1，1 文件，`vllm/model_executor/models`）。**效果**：XPU（4x Arc Pro B70，TP=4，nightly-29468dde 镜像）端到端下 MoE 后端由 `TRITON Fp8 MoE` 变为 `XPU Mxfp4 MoE`、加载成功（16.51 GiB/rank，KV cache 693,767 tokens），文本与图像 chat 均给出正确答案（`3+5-2` → `6`；红方块左上、蓝圆右下），gsm8k 5-shot flexible/strict 为 0.8362 ± 0.0102 / 0.8249 ± 0.0105（文本同族 `Ling-3.0-flash-fp8` 为 0.8302 / 0.7688）；既有 `tests/transformers_utils/test_bailing_moe_v3_vl_config.py` 6/6 通过。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是 MXFP4 与 FP8 MoE 量化方法的分派正确性（quantization_config 读取路径），属量化范畴。",
+      "tags": ["bugfix", "medium-risk", "quantization", "mxfp4", "fp8", "moe", "bailing-v3-vl", "config"],
+      "pr_number": 59026
+    },
+    {
+      "sha": "cc9b0f097d49abfa6fc94d1d773dca1cc2b9619c",
+      "comment": "**背景**：修 vllm #58599 与 pytorch/test-infra #8931。MiniMax 融合 allreduce+RMSNorm kernel 需要每个 GPU 直读其他 GPU 显存：各 rank 分配 buffer、取 64 字节 `cudaIpcMemHandle_t`，经 `torch.distributed.all_gather_object` 互换后再 `cudaIpcOpenMemHandle` 打开对端 buffer。vLLM 原先通过 `.reserved` 字段把 handle 转 bytes 再还原，而 cuda-bindings 13.4（cuda-python 的一部分）已从 `cudaIpcMemHandle_t` 移除该字段，代码抛 `AttributeError: cuda.bindings.runtime.cudaIpcMemHandle_t object has no attribute reserved`，vLLM 随即回退到较慢的非融合 allreduce 路径、`test_minimax_reduce_rms_qk` 失败；装有 cuda-bindings 13.4.x 的 torch-nightly CI lane 首当其冲。**方法**：改为经 `handle.getPtr()`（handle 的内存地址）用 ctypes 搬运这 64 字节——新增 `_ipc_handle_to_bytes()` 以 `ctypes.string_at(handle.getPtr(), 64)` 读出、`_ipc_handle_from_bytes()` 新建 `cudaIpcMemHandle_t()` 后 `ctypes.memmove` 写入并断言长度，`IpcBuffer` 的 gather/open 两侧分别替换 `bytes(local_handle.reserved)` 与 `handle.reserved = ...`；注释说明 CUDA ABI 固定 handle 为不透明 `char reserved[64]`，所有 cuda-bindings 版本都支持 `getPtr()`，故不需版本探测。**效果**：`pytest tests/kernels/core/test_minimax_reduce_rms.py::test_minimax_reduce_rms_qk -k 2-` 由 AttributeError + `Falling back to the eager allreduce` 日志变为 6 passed、12 skipped（4/8 GPU 用例因只有 2 卡跳过），回退日志消失即融合路径恢复；改动限于 `vllm/model_executor/layers/minimax_rms_norm/lamport_workspace.py`（+20/-3）。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是 TP 跨 GPU 自定义 allreduce 的 CUDA IPC handle 交换（分布式通信兼容），与历史 allreduce workspace 类修复归类一致；虽落在 model_executor/layers 且 hint 为 sig-core，仍按主旨归入大规模 serving 通信栈。",
+      "tags": ["bugfix", "medium-risk", "custom-allreduce", "cuda-ipc", "cuda-bindings", "tp", "minimax", "compat"],
+      "pr_number": 60917
+    },
+    {
+      "sha": "3fe917abb13160d60bea5330399f5c09ca282348",
+      "comment": "**背景**：MRV2（Model Runner V2）上两处 warmup 缺陷。FlashInfer attention warmup 用硬编码 16 token 的混合 dummy batch 且不夹到 `max_num_batched_tokens`：V1 上触发 `num_tokens <= max_num_tokens` 断言；MRV2 上 `make_dummy` 会把输入 buffer 静默切得比 `query_start_loc` 短，到 FlashInfer forward 才以 `prefill_query.shape[0] == num_prefill_tokens` 失败——在 FlashInfer 为默认后端的 Blackwell 上可见（如 `tests/v1/core/test_scheduler_e2e.py`）；同时 MRV2 的 `_dummy_run` 忽略 `create_mixed_batch`，warmup 从未真正跑过 prefill+decode 混合批。ReplaySSM 侧：MRV2 的 profile dummy run 会丢弃 Mamba metadata，使 FlashInfer ReplaySSM autotune 从未在执行过的 kernel 上生效、`valid_dummy_state_slots` 形同空转。**方法**：在 `vllm/model_executor/warmup/attention_warmup.py` 新增 `mixed_batch_attention_warmup()`（+42 行）供 FlashInfer 与 MiniMax M3 MSA 两处 warmup 共用（各自原本的 `_dummy_run` 调用改为一次调用，`kernel_warmup.py` -9/+4、`minimax_m3_msa_warmup.py` -7/+4）——它夹住 token 数、V1 保持原混合 dummy batch、MRV2 改走 `run_mixed_prefill_decode_warmup()` 并在其无法运行时跳过；MRV2 `_dummy_run` 现与 V1 一致断言 token 预算；profile 丢弃 Mamba metadata 的条件加上 `and not valid_dummy_state_slots`，使设了该标志的 profile run 保留 Mamba metadata 在各自独立 state slot 上跑真实 Mamba kernel（注释提示调用方须恢复该状态）。**效果**：FlashInfer warmup 与 ReplaySSM autotune 在 MRV2 上恢复生效，混合 prefill+decode 批真正被预热（+129/-17，5 文件，含 71 行新增 `tests/model_executor/test_attention_warmup.py` 回归覆盖）。",
+      "sig": "sig-core",
+      "sig_reason": "修 MRV2 model runner 的 dummy run/warmup 与 autotune 门控（启动执行路径正确性），属核心引擎；attention/SSM 只是受害后端。",
+      "tags": ["bugfix", "high-risk", "mrv2", "warmup", "flashinfer", "replayssm", "spec-decode"],
+      "pr_number": 61013
+    },
+    {
+      "sha": "f26d9f432ced7b1087d02d29bffed2249df1a18e",
+      "comment": "**背景**：`Glm5NextLinearAttention.get_state_dtype()` 与 `Glm5NextForCausalLM.get_mamba_state_dtype_from_config()` 调用 `MambaStateDtypeCalculator.kda_state_dtype()` 时都没传 SSM cache dtype，KDA recurrent state 因此恒为 float32，`--mamba-ssm-cache-dtype bfloat16` 对 GLM-5.3-Flash 被静默忽略（Kimi-K3 的 KDA 已正确透传该参数）。**方法**：两处都补传 `cache_config.mamba_ssm_cache_dtype`（`vllm/models/glm5next/common/kda.py` 与 `common/model.py` 各 +3/-1）；`Glm5NextForConditionalGeneration` 委托给 causal-LM 类，故多模态入口一并修好。**效果**：新增 `tests/models/glm5next/test_kda_state_dtype.py`（+41 行）要求 `auto`/`float32`/`bfloat16` 同时抵达模型级与层级 recurrent state dtype（bf16 用例在 main 上失败），`tests/models/glm5next` 共 14 passed；GLM-5.3-Flash TP2 / B300 端到端下 KV cache spec 开始报告 bf16 state page，长上下文 teacher-forced NLL 与 float32 state 在 run-to-run 噪声内一致。为何重要：bf16 使 state page 减半，而 Mamba align 模式的 prefix caching 依该 page 决定 attention block 大小，TP2 下块长从 2304 缩到 1280 token；投机解码时每请求持 `2 + num_speculative_tokens` 个 state block/group，decode 实例的并发上限正由此约束——实测 K=4 的 P/D decode 实例在耗尽 state block 前可承载约 1.25 倍并发（约 64 → 80+）。",
+      "sig": "sig-core",
+      "sig_reason": "修模型侧 state dtype 与 config 选项（`--mamba-ssm-cache-dtype`）的接线，属核心 config/KV cache spec 正确性；并发提升是派生收益而非 kernel 优化。",
+      "tags": ["bugfix", "medium-risk", "glm-5.3-flash", "kda", "mamba", "config", "kv-cache-spec", "spec-decode"],
+      "pr_number": 59147
+    },
+    {
+      "sha": "c059bee812842fb76c2b045e240c02f37c0d498d",
+      "comment": "**背景**：一批 CI 用例仍被不必要地钉在 MRV1（V1 model runner）上跑，靠 `VLLM_USE_V2_MODEL_RUNNER=0` 或测试参数 `force_v1_runner=True` 实现，使 MRV2 默认路径缺覆盖、MRV1 专项测试相互混淆。**方法**：删除 `.buildkite/test-amd.yaml`（mi300 与 mi355 的 models/quantization、torchao 作业）与 `.buildkite/test_areas/quantization.yaml`（两个 job 的 `env: VLLM_USE_V2_MODEL_RUNNER: 0` 及其 ROCm 侧使用平台默认的 unset 注释）中的 V1 钉法；从 `tests/utils.py` 的 `compare_two_settings`/`compare_all_settings` 移除 `force_v1_runner` 参数与其向 `all_envs` 注入 env 的逻辑，并清理 `tests/compile/correctness_e2e/test_attn_quant.py` 的对应调用；`tests/v1/core/utils.py: create_scheduler` 的默认判定由 `bool(envs.VLLM_USE_V2_MODEL_RUNNER)` 改为 `envs.VLLM_USE_V2_MODEL_RUNNER is not False`；把 `tests/basic_correctness/memory/sleep_mode/test_sleep_mode.py` 的 `test_deep_sleep_fp8_kvcache_mrv1*` 去掉 `_mrv1` 后缀与 `monkeypatch.setenv` 设定（注释改为直接表述 fp8 KV cache 须在 level-2 sleep 后正确恢复），将 `test_kda_metadata`、`test_eagle3_aux_hidden_states_pp`、`test_gpu_worker`、offloading `test_config` 的 `use_v2_model_runner`/`v2` 默认由 `False` 翻为 `True`（`test_gpu_worker` 的 dummy runner 补 `is_pooling_model=False`）；`tests/v1/core/test_scheduler.py` 为 MRV2 依 pp_size 交错同请求 decode（匹配 worker 侧 sampled-token 广播节奏）追加一步 `schedule()` 断言；`tests/v1/e2e/test_replayssm_decode.py` 改为显式 `[False, True]` 参数化并在 monkeypatch 上下文内断言 `vllm_config.use_v2_model_runner`，使两个 runner 都被覆盖而非只跑 V1。**效果**：这些用例现随默认 runner 走 MRV2，同时清掉一个只为 V1 存在的测试参数（+59/-66，12 文件）。",
+      "sig": "sig-ci",
+      "sig_reason": "纯 CI 覆盖与测试基建调整（Buildkite yaml 与 tests/ 下的 runner 默认），不改产品代码，属 SIG CI。",
+      "tags": ["test", "ci", "medium-risk", "mrv2", "model-runner", "buildkite"],
+      "pr_number": 61014
+    },
+    {
+      "sha": "b99fdbe1f896abd7f4b133685a37397c3427f7d5",
+      "comment": "**背景**：`LLM(chat_template=...)` 构造时保存的模板在 `chat()` 与 `enqueue_chat()` 里被忽略——共享的离线预处理路径在没有 per-call 模板时把 `None` 一路传给 renderer，于是静默回退到 tokenizer 自带模板，用户配置的模板不生效且不报错。**方法**：在预处理前先解析构造器默认模板（`vllm/entrypoints/common/offline.py`，+4/-1），per-call 显式 `chat_template=` 仍按既有优先级覆盖构造器默认；PR 明确不新增测试文件或抽象，仅在既有 `tests/entrypoints/multimodal/llm/test_mm_processor_kwargs.py` 补 1 行。**效果**：真实 Qwen3-0.6B 推理验证（基线 `187a0eb98aa`、RTX 5090、Python 3.12、PyTorch 2.13.0+cu130、Transformers 5.16.1、eager）：两个构造器默认用例在 main 上失败、改动后通过、回退后再次失败，两个显式覆盖对照全程通过（逐 token 比对 prompt 与生成文本，`CHAT_TEMPLATE_MISMATCH` 消失），`pre-commit --hook-stage manual` 通过。重复性检查：#60877 关乎 Sentence Transformers 打分模板、#46801 关乎字典值 HF 模板，均未把离线构造器默认接到这两个入口，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "修离线前端入口 `chat()`/`enqueue_chat()` 的 chat template 接线，属 API 前端/入口正确性；改动不涉及多模态处理，故推翻 sig_hint 的 sig-omni。",
+      "tags": ["bugfix", "low-risk", "frontend", "offline-inference", "chat-template", "entrypoint"],
+      "pr_number": 61061
+    }
+  ]
+}
