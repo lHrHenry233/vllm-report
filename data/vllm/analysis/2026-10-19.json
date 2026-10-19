@@ -1,0 +1,311 @@
+{
+  "date": "2026-10-19",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-19T11:20:00+08:00",
+  "daily_summary": "18 条提交里有 4 条在给 ROCm 10 镜像转默认（#58761）之后暴露的一串 nightly 红灯收口：#62241 给 `ExecutorWithExternalLauncher` 补 `shutdown()` 销毁 vLLM 自己拥有的 TP/PP/DP/EP 组，解释 MI355 torchrun DP + EP 退出期 SIGABRT 的根因（ROCm 10 的 RCCL 不容忍静态析构时销毁 joinable 线程），#62286 在同一条 CI 步骤上摘掉 `optional: false` 并钉 `NCCL_RAS_ENABLE=0`、开 `TORCH_CPP_LOG_LEVEL=INFO` 作为过渡，#62280 则查明 P/D 精度用例的 bf16 偏差来自 Inductor deterministic mode 不管 pointwise kernel 的 XBLOCK（该 XBLOCK 决定融合 QK-norm + RoPE 里哪些乘加被折成 FMA），关掉 `triton.autotune_pointwise` 后逐位一致，#62274 把 #61118 无条件设置的 `inductor_config.batch_invariant` 改成 torch 有这个选项才设，解掉 nightly 95663 上 10 个 AMD 失败。能力面两条最重：#62074 落地 Reflection Beam-1.0（501B 总参 / 23B 激活 MoE 的 day-0 支持，含 DFlash2 drafter，GB200 TP8 + NVFP4 在并发 128 下自适应验证 16,632 tok/s）与 #62207 补 Muse Spark Open 的 reasoning / tool 解析器（Python 加 Rust 统一解析器，PR 描述是空模板、只能按 diff 与文档还原）。内核与服务正确性另有三件值得记：#61938 修 Triton MLA decode 的 int32 偏移溢出并把 logits workspace 算进 memory profiling（此前 Kimi-Linear-48B（默认 1M 上下文）与 LongCat-Flash-Lite-FP8 等在 MI355 上按默认设置 vllm serve 就在 graph capture 期撞上 GPU 访存错误），#61002 让 NixlConnector 用 gcd 尺寸 kernel 块配对 ROCm 异构 TP 下互相不整除的 hybrid MLA 块，#60735 给 DBO 下跨流读写的 DeepEP HT 缓冲补 `record_stream`（修 DeepGEMM FP8 MoE 启动即崩）。其余是度量与契约的小口子：#62341 不再把 chat 流式里只有 role 的空 chunk 计为输出、#62072 让 beam search 认 generation config 里的额外 EOS、#61884 把不支持 LoRA 的模型在配置校验期拒绝、#61618 保证激活失败的 adapter 可重试、#62228 删掉无人读取的 Ray executor 环境变量。",
+  "sig_summaries": {
+    "sig-core": "9 条，三条是前端契约、两条是 LoRA、其余是模型与执行器。前端：#62074 给 Reflection Beam-1.0（501B/23B MoE）做 day-0 支持并自带 DFlash2 drafter；#62207 加 Muse Spark Open 的 `muse`/`musespark1x` reasoning 与 tool 解析器（Python 与 Rust 两套，`muse_glimmer` 改为复用同一实现、保留原通道语义）；#61892 把 Rust 前端 gRPC 的结构化输出从一律降到 guidance 改为统一走 xgrammar，并让 xgrammar backend 自己编译 `choice`、把 Python 的 schema 关键字检查搬进 Rust 共享校验；#62072 把 beam search 的终止集合从 tokenizer EOS 扩到 generation config 的 `eos_token_id`，并把终止 token 报为 `stop_reason`、从文本与 length-normalized 分数里排除。LoRA 两条互补：#61884 在未实现 `SupportsLoRA` 的 125 个架构上把 `enable_lora=True` 从 EngineCore 里的裸 AssertionError 提前到配置校验期的 ValidationError，#61618 把激活元数据的提交挪到全部层加载成功之后以免失败后重试假成功。#62241 补 external-launcher 的通信组销毁，#62274 给 `batch_invariant` 加 torch 版本防御，#62228 删掉 #61712/#61713 之后无人读取的 `VLLM_USE_RAY_V2_EXECUTOR_BACKEND`。",
+    "sig-model-performance": "3 条，两条在 MI355。#62131 让 DSv4.1-Flash mono decode（`--monokernel`）把 DSpark draft 的三层也跑在合并的 K1/K2 kernel 上（沿 ATOM 的 `DraftMonoRunner` 做法，不新增开关），TP4 c1 graph profile 下每步 kernel 时间由约 640 us 降到约 227 us、每步省约 414 us，AgentX c1 每请求 ITL p50 在 TP4 与 TP2 各低 0.030 ms（约 1.8%），平均接受长度与 GSM8K 不变；#61938 修 Triton MLA decode 的 `cur_batch * stride_mid_ob` int32 溢出（128K 以上、512 splits、32 head 时从 batch 第 256 行起超过 2^31，而 FULL graph 跑到 512），并用 `reserve_profiling_workspace()` 钩子把最坏 32 GiB 的 logits workspace 计入 profiling，否则 KV cache 按空闲内存定容量必然 OOM；#62341 是 benchmark 客户端的度量修正——`--backend openai-chat` 把只带 role 的开包 chunk 计为流式输出，导致 600 个请求里 208 个出现 `len(itl) == output_tokens` 这种不可能计数、每个请求首个 ITL 中位只有 4 us 在量元数据到达，修复后汇总指标变化都小于 run-to-run 抖动但 `--save-detailed` 的样本数组恢复正确。",
+    "sig-large-scale-serving": "2 条，都在专家并行 / P-D 传输的缓冲与配对语义上。#61002 让 NixlConnector 在 P、D 的 hybrid MLA 块大小互相不整除时（ROCm 上 hybrid 块跟随 TP 切分的 SSM page，异构 TP 就不同尺寸；CUDA 上 MLA backend 强制 64 token kernel 块故总能整除）握手不再 assert：`_split_remote_blocks` 把远端块看成 gcd 尺寸的 kernel 块（Kimi-K3 的 2944 视为 23 × 128）再走既有比例路径与 D 的 45 个子块配对、未传尾部清零，开 prefix caching 时仍按既有 hybrid 检查拒绝；实测 `pd-tp2-dep2` 由握手失败到 4/4、新用例 28 败到 28 过，吞吐与 gsm8k 与等块情形同量级。#60735 修 DBO 下 DeepEP high-throughput 的跨流缓冲生命周期：dispatch 输出在 comm 流分配、compute 流读取，combine 输入反向，caching allocator 不知情而被另一个 microbatch 覆写，配 DeepGEMM FP8 MoE 在 `ep_scatter` 启动即非法内存访问；解法是对每个跨流张量 `record_stream`，代价是每 MoE 层每 microbatch 至多 9 次调用，GLM-5.3 FP8 完整 GSM8K 0.912-0.927。",
+    "sig-ci": "2 条都是 ROCm 10 转默认（#58761）后的 nightly 95663 收口，且都不改引擎行为。#62286 给 MI355 DP + EP 的 mirror 步骤摘掉 `optional: false`（继承父步骤的 `optional: true`、不再 gate PR 构建），并在 commands 里（`env:` 传不到 AMD 测试容器）导出 `NCCL_RAS_ENABLE=0`（带 TODO，等 ROCm/rocm-systems#13572）与 `TORCH_CPP_LOG_LEVEL=INFO` 以留下每 process group 约 60 行的 teardown 日志；根因仍在排查，两 rank 不复现，vLLM 在 ROCm 上本就默认关 RAS，这里只是钉住。#62280 在 `test_write_dummy_e2e_rocm.py` 里紧邻 deterministic mode 关掉 Inductor 的 pointwise autotuning（`triton.autotune_pointwise`），因为 deterministic mode 只钉 reduction config、pointwise kernel 的 XBLOCK 仍按时序挑而在 ROCm 上随机落到不同 FMA 折叠，使同机两个 direct serve 的首 token log-prob 差 1-2 个 bf16 步；改后 CI 失败的 `qwen3_dense-TRITON_ATTN-P_FULL_AND_PIECEWISE-D_FULL_AND_PIECEWISE` 在 MI355 上 10/10 通过、距离恰为 0.0。",
+    "sig-omni": "1 条是纯可见性修正：#62204 把 `VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB` 会把重试的下载尝试一并计入请求预算这件事写进错误消息（补 including retried attempts）与 `docs/usage/security.md`（说明含并发下载与重试尝试），并加同步/异步测试固定该行为。该计数是刻意保留的安全设计——不断断开的 media URL 否则可借重试搬过限额数倍，PR 原本的「失败尝试退还字节」被否掉后改成文档化，因此行为零变更，`tests/test_connections.py` 由 2 败 7 过到 9 过。",
+    "sig-spec-decode": "1 条把 spec decode 与结构化输出的 mask 记账从 CPU 搬到 GPU：#52477 让 GPU 上每请求的 logit 数决定哪些 grammar mask 行被应用——调度器为每个结构化输出请求发固定宽度的 `num_spec_tokens + 1` 行块，MRV2 kernel 每请求只 launch 一次且只作用于 device `cu_num_logits` 里活跃的位置（例如自适应验证零预算 step 之后只剩 bonus），从而删掉 `_build_grammar_mapping` 与 worker 对 `cu_num_logits_np`/调度 draft 计数的依赖，分片采样按整块切、MRV1 展开成 packed 布局；它取代已合入的 #52436 CPU 侧修法并与该 PR 作者共同署名。净减 86 行（+54/-140、10 文件），单测 102 passed / 1 xfailed，GPU 用例提交时仍待跑。"
+  },
+  "commits": [
+    {
+      "sha": "dcf8158cdc3843cda9830936ca9cadf477f1c3dc",
+      "comment": "**背景**：chat benchmark 客户端把流式响应里只有角色、没有内容的开包 chunk（delta 为 assistant 角色且 content 是空字符串）计为一次流式输出，于是 TTFT 量到的是元数据到达、第一个真实 token 又额外挂一个虚假 ITL 样本；#3768 到 #12288 之间曾有防护，之后丢失，原始报告是 #3759。**方法**：在 `benchmarks/backend_request_func.py` 加 `_choice_has_streamed_output()`，只有 delta（或 message）携带 content、reasoning、tool_calls、function_call 之一才算输出，两个 chat 客户端（packaged 与 legacy）都接、约 43 行，`async_request_openai_completions` 与 `async_request_openai_audio` 不动。**效果**：+229/-4、3 文件，`tests/benchmarks/test_endpoint_request_func_timing.py` 由 18 个用例扩到 26 个并参数化覆盖两套客户端，新增的 8 个在 main 上全失败。据 PR 统计，main 上 600 个请求里 208 个出现 `len(itl) == output_tokens`（不可能，最多应是 output_tokens 减 1），同一服务器 `/v1/completions` 恰为 200 × 255 且零异常计数；且每个请求首个 ITL 中位约 4 us 在量元数据，误差方向是让 chat 显得略快。修复后打印指标均值中位数移动都小于 run-to-run 抖动，真正被修的是 `--save-detailed` 写出的样本数组，vLLM 实测速度不变。验证表之后的内容在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是性能回归基准（TTFT/ITL/TPOT 采样）的度量正确性；只改 benchmark 客户端，不触及引擎、调度或服务代码。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "benchmark",
+        "ttft",
+        "itl",
+        "openai-chat",
+        "streaming"
+      ],
+      "pr_number": 62341
+    },
+    {
+      "sha": "37891a98ea0789607b9ec1c5e896f837b6072ca2",
+      "comment": "**背景**：对未实现 `SupportsLoRA` 的模型打开 `enable_lora=True` 时，失败发生在引擎内部——Zamba2 在 `zamba2.py:719`、Mamba2 在 `mamba2.py:106` 抛裸 `AssertionError`，对外只表现为 Engine core initialization failed 的 RuntimeError，用户难以归因（#61850）。**方法**：把能力信息提到配置可见的层面——`vllm/model_executor/models/registry.py` 的 `_ModelInfo` 新增 `supports_lora` 字段（取自 interfaces 的 `supports_lora` 检查），`vllm/config/lora.py` 的 `verify_with_model_config` 在 `model_config.is_lora_supported` 为假时抛 ValueError（消息点明不支持的架构与模型名、并说明支持的模型须实现 `SupportsLoRA` 接口、请不开 `enable_lora` 运行），经 `vllm/config/model.py` 接线后由 `VllmConfig` 汇总成 `ValidationError`；`mamba2.py` 与 `zamba2.py` 里原先的内置 assert 随之删掉。覆盖当前 125 个无 `SupportsLoRA` 的注册架构而非只 Zamba2/Mamba2。**效果**：+37/-6、6 文件（含 `tests/test_config.py` 增 22 行）。复现片段跑在 CPU backend 且 `load_format=\"dummy\"`（失败早于权重加载）：Zamba2-7B-instruct 在 main（a97d19d792）上是 AssertionError、本 PR 后变成校验期 ValidationError 且不再启动 EngineCore，Zamba2-1.2B、mamba2-codestral tiny 在不开 LoRA 时、Qwen3-0.6B 在开 LoRA 时前后都能正常启动生成。验证细节在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改的是配置校验与模型加载契约（config 系统属 core），不改变 LoRA 运行时实现。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "lora",
+        "config",
+        "validation",
+        "model-loading"
+      ],
+      "pr_number": 61884
+    },
+    {
+      "sha": "38127f629025ff4df7c5844f7c0cf94571c8613e",
+      "comment": "**背景**：`VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB` 的请求级下载预算把重试的尝试一并计入，但这一点此前不可见；本 PR 原本要在重试前退还失败尝试的字节，@jperezdealgaba 以安全理由否掉（持续断开的 media URL 可以靠重试搬过限额的数倍），@DarkLight1337 建议保留行为并把它写清楚。**方法**：`vllm/connections.py` 的预算错误消息补上 including retried attempts 并给出含重试的累计字节，`docs/usage/security.md` 对应条目改为说明预算包含并发下载与重试尝试，`tests/test_connections.py` 新增同步与异步用例固定该行为（测试助手改为允许在 chunk 列表里放异常，以模拟传输中途断开后重试）。**效果**：+58/-5、3 文件，无行为变更；`pytest tests/test_connections.py` 由 main 的 2 failed / 7 passed（新用例缺关键字）变 9 passed，更大范围的连接与多模态 media 组合为 110 passed / 3 failed 且三个失败在 main 同样发生（本机缺 PyAV），pre-commit manual hook 全绿。说明该操作者看到限额内 media 报错时能明白原因。测试后续在截断处之后，详见原文。",
+      "sig": "sig-omni",
+      "sig_reason": "预算对象是多模态 media 下载的请求级限额（标题亦标 Multimodal），落点是让该安全语义可见；sig_hint other 只反映 docs 路径。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "multimodal",
+        "security",
+        "media-download",
+        "test"
+      ],
+      "pr_number": 62204
+    },
+    {
+      "sha": "e719b41e2233db39041ba78a70ac8f425a7f03e1",
+      "comment": "**背景**：DeepSeek-V4.1-Flash 在 MI355X 上的 mono decode（`--monokernel`）此前只把 target 层跑在合并的 K1/K2 kernel 上，DSpark draft 的三层仍走 vLLM 的 per-op 路径；这是 #60397 与 #61082 的后续，做法对齐 ATOM 的 `DraftMonoRunner`。**方法**：让 draft 三层同样接入 mono kernel，改动集中在 `vllm/models/deepseek_v41/amd/mono/`（`mono_decode.py`、`layer.py`、`runner.py`、`attention/front.py`、README）与 `tests/models/test_dsv41_mono_decode.py`；沿用 target 层的 `--monokernel` 开关、不新增配置项。与 #60731（gfx942 移植）文件重叠，后合入的一方需要 rebase。**效果**：+251/-56、6 文件。TP4 c1 的 graph profile 下 draft 三层每步 kernel 时间约 227 us、原路径约 640 us，即每步少约 414 us GPU 时间；AgentX 在 c1 的每请求 ITL p50 比 InferenceX 的 `--monokernel` 跑法低 0.030 ms（约 1.8%），TP4 为 1.646 对 1.678 ms、TP2 为 1.970 对 2.000 ms。draft 质量不变：DSpark 平均接受长度 TP4 为 3.889（末次 rebase 上 3.935）、TP2 为 3.917，对照不开 mono 的 3.899 / 3.896，GSM8K 为 0.975 / 0.972；层间对齐在真实 eager decode step 上 x 输出 cosine 不低于 0.99975（相对 L2 最高 2.3%，源于 MoE top-3 路由近平手），residual / post / comb / pre mix cosine 不低于 0.9999；target 层 ISA 与 main 完全相同。结果表之后的内容在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 ROCm 上 DSv4.1 mono decode 的 kernel 合并与时延收益（与 #60397、#61082 同线，此前都归性能）；draft 层只是收益对象，投机语义未变。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "mi355x",
+        "deepseek-v4.1",
+        "dspark",
+        "monokernel",
+        "decode"
+      ],
+      "pr_number": 62131
+    },
+    {
+      "sha": "83db1ab4967759df85d1915e27d1974764f869e0",
+      "comment": "**背景**：LoRA 激活失败时（例如第二层 A 张量形状不兼容使 `set_lora` 抛异常），adapter 已被标记为 active 并分到 GPU slot，因此重试会跳过加载、把只拷了一部分的权重当成激活成功对外服务。**方法**：`vllm/lora/model_manager.py` 把激活元数据的提交挪到所有 layer-loading 调用成功返回之后（+2/-2、1 文件）。**效果**：失败的激活原样传播异常、既不标记 active 也不分配 slot；重试缓存中的 adapter 会重新执行加载，未修正的畸形 adapter 继续失败而非假成功；成功加载、容量检查与 LRU 驱逐行为保持。随附回归测试按维护者要求移除（原用例基于既有 manager fixture 与真实 layer buffer，两种 manager 实现都覆盖，在 main 上失败、修复后通过），`tests/lora/test_lora_manager.py` 现与 base 逐字节一致；移除测试并合入 main 之后，`vllm/lora/model_manager.py` 与 `73be6d45` 提交上的产物逐字节相同，PR 里的 CPU 回归与真实 GPU 引擎验证（基线 `de8828bf`）早于该 merge。验证细节在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 LoRA model manager 的激活状态提交时序（模型加载/运行时状态契约），属 core。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "lora",
+        "state-management",
+        "retry"
+      ],
+      "pr_number": 61618
+    },
+    {
+      "sha": "3497d72a72cc4145b5e5600c7569b71b9578584d",
+      "comment": "**背景**：#61879（Muse Spark Open 支持）切片之一，PR 描述是未填写的空模板（Overview / Claims / Validation 皆空），以下依据 diff 与文档还原。现有 `muse_glimmer` 解析器按 Glimmer 的通道语义编写，不覆盖 Muse Spark Open 的 ATEM 工具调用格式以及 to=self / user / commentary / developer 通道路由规则。**方法**：新增 Python 侧 `vllm/reasoning/muse_reasoning_parser.py`（`MuseReasoningParser`）与 `vllm/tool_parsers/muse_tool_parser.py`（`MuseToolParser`），注册名 `muse` 并附别名 `musespark1x`；由于 Muse 的分帧特殊 token（message / eom / eot）在不同 checkpoint 的 tokenizer 里不保证是单 token，解析器用 regex 在解码文本上工作而不继承单 start/end token 基类，并要求未闭合的推理段遇到下一个通道头即停止——文档注释记录了一个模型侧缺陷（可选参数工具的空参数调用会写出没有 eom 的推理段），若正则一路吃到文本末尾则推理阶段永不结束、工具解析器不被调用、整段生成被丢成空。路由规则为 to=self 与无接收者消息进 reasoning、to=user 与 to=commentary 进 content、工具接收者走 ATEM 工具调用抽取、to=developer 丢弃，分帧 token 解析后不上浮。Rust 前端新增 `rust/src/parser/src/unified/muse.rs` 的统一解析器（`muse`、`musespark1x`，并按 Muse Spark 模型名自动选择），Glimmer 的自动选择不受影响；`muse_glimmer` 两个入口改为复用同一 Muse 实现、保留原通道语义（含无接收者的 tool-parser 内容）。**效果**：+3087/-825、14 文件（glimmer 两文件分别缩到 325 / 507 行），新增 `tests/tool_use/test_muse.py`（615 行）、`test_muse_parse_delta.py`（228 行）、`test_muse_glimmer.py`，`docs/features/tool_calling.md` 增加 muse 一节说明 `--enable-auto-tool-choice --tool-call-parser muse --reasoning-parser muse` 用法，并明确「解析器可用不等于能跑 Muse Spark 模型」。",
+      "sig": "sig-core",
+      "sig_reason": "落点是前端的 reasoning / tool calling 解析器契约（Python 与 Rust 两套），与 #62074 的模型本体切片分属不同关注面。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "frontend",
+        "rust-frontend",
+        "tool-calling",
+        "reasoning-parser",
+        "docs"
+      ],
+      "pr_number": 62207
+    },
+    {
+      "sha": "b0d61e5d26561f865bf89688eb0aea5000133a42",
+      "comment": "**背景**：Reflection 的 Beam-1.0（`BeamForCausalLM`）是 501B 总参数 / 23B 激活的 MoE，需要 day-0 支持，含其 DFlash2 drafter `DFlash2BeamDraftModel`；本 PR 是 #61978 的模型切片，基于已合入的 #62042，不依赖 FlashInfer nightly——beam 的 reasoning 与 tool 解析器在 #62052，带 norm 与 MoE-finalize epilogue 的融合 MNNVL all-reduce 拆成堆叠后续 PR，需要 FlashInfer nightly 的 MegaMoE（attention DP 加专家并行，走 FlashInfer CuTeDSL）在 #62073。**方法**：新增 `vllm/models/beam/nvidia/`（`model.py`、`attention.py` / `attention_ops.py` / `attention_ops_cutedsl.py`、`layernorm.py`、`activation.py`、`projection.py`、`moe.py`，以及 `dflash2.py` 与其 context / conv / ops 文件）、`vllm/transformers_utils/configs/beam.py`（`BeamConfig`），并接 `vllm/config/vllm.py`、`vllm/model_executor/models/registry.py`、`vllm/v1/worker/gpu/spec_decode/__init__.py`。架构为混合滑窗（RoPE）与全注意力 NoPE 层加 SSMax、per-head Q/K norm 与 sigmoid 输出门、DeepSeek-V3 风格 MoE 配 FP32 router、sandwich norm 与 depth-scaled residual；`BeamConfig` 与模型都按已发布 `config.json` 的 `layer_types`、`mlp_layer_types`、分类型 `rope_parameters` 走，发布配置没有覆盖的行为一律固定而非可切；可跑张量、数据或专家并行。Blackwell 融合 kernel 覆盖 attention、norm/residual 边界与 DFlash2 context 算子，TP all-reduce 本 PR 走 vLLM 标准路径；DFlash2 投机解码支持 FP8 KV cache 与自适应验证，drafter 自包含、不继承 Qwen3 DFlash 类。**效果**：+4482/-46、29 文件（`tests/models/test_beam_construction.py`、`test_beam_numerics.py`、`test_beam_weight_mapping.py`、`tests/transformers_utils/test_beam_config.py`、扩充的 `tests/v1/spec_decode/test_dflash2.py`，以及 models registry 与 Buildkite `models_basic.yaml`、supported_models 文档）。GB200 TP8 上 Beam-1.0 NVFP4 + DFlash2（7 个 draft token）、SPEED-Bench `throughput_1k` 低熵子集贪心解码：并发 1 为固定 draft 708 / 自适应 707 tok/s（接受长度 3.71 对 3.61），并发 128 为 15,012 对 16,632 tok/s（3.68 对 3.23）；作者注明该表测自包含融合 all-reduce 的上一版本、本版本重跑待完成。serve 命令与后续验证在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "主旨是新模型架构的 day-0 支持（模型注册、config、权重映射）；Blackwell kernel 与 DFlash2 都是为该模型服务，性能声明也仍在待重跑状态。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "model-support",
+        "reflection-beam",
+        "moe",
+        "spec-decode",
+        "dflash2",
+        "blackwell",
+        "nvfp4"
+      ],
+      "pr_number": 62074
+    },
+    {
+      "sha": "c07c59f8211acb5283324a3644250d1672ce2e1a",
+      "comment": "**背景**：ROCm 10 镜像成为默认之后（#58761），`:amd: (MI355) Distributed DP + EP` 间歇性在退出时 abort——`examples/features/torchrun/torchrun_dp_example_offline.py --tp-size=2 --dp-size=4 --enable-ep` 上多个 rank 报 terminate called without an active exception（SIGABRT）。根因：`UniProcExecutor.shutdown()` 只调 `worker.shutdown()`，`MultiprocExecutor` 的 worker 还会额外调 `destroy_model_parallel()` 与 `destroy_distributed_environment()` 来 abort PyNCCL communicator 并销毁 NCCL 子组；external-launcher 模式（torchrun、`distributed_executor_backend=\"external_launcher\"`）下没人做，于是每个 rank 带着活的 RCCL communicator 退出、由静态析构销毁其中仍 joinable 的 `std::thread`，而销毁 joinable 线程按标准即触发 `std::terminate`；ROCm 7.2 的 RCCL 容忍，ROCm 10 间歇性不容忍。**方法**：给 `ExecutorWithExternalLauncher` 加 `shutdown()`，在 `super().shutdown()` 之后调 `destroy_model_parallel()` 销毁 vLLM 拥有的 TP/PP/DP/EP 组；world 组与默认 process group 可能归 launcher，故保持不动。**效果**：+12/-0、1 文件（`vllm/v1/executor/uniproc_executor.py`），消除该示例在 MI355 + ROCm 10 上的退出期 abort。动机链接到 CI build 95633 的输出；PR 检查表里 Testing and Validation 未勾选，即由 CI 步骤确认。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 executor 关停路径与分布式资源释放契约（`vllm/v1/executor`），ROCm 只是暴露面；CI 摘 gate 由 #62286 单独承担。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rocm",
+        "executor",
+        "external-launcher",
+        "shutdown",
+        "rccl",
+        "teardown"
+      ],
+      "pr_number": 62241
+    },
+    {
+      "sha": "689effee6d07bfeb0afe42d44046141657238c23",
+      "comment": "**背景**：MI355 上以默认上下文长度 `vllm serve` Kimi-Linear-48B-A3B-Instruct、LongCat-Flash-Lite-FP8、DeepSeek-V2-Lite-Chat 会在 CUDA graph capture 期间死于 GPU 访存错误（写只读页）。两个 bug 叠在一起，第二个只在第一个修好后才显形：其一，split-KV 的 logits 偏移 `cur_batch * stride_mid_ob` 用 int32 计算，上下文中 128K 时 `_compute_num_kv_splits` 在 MI355（2 × 256 CU）上选 512 splits，32 head 下单个请求的 logits 跨 32 × 512 × 513 约 8.4M 浮点，从 batch 第 256 行起偏移越过 2^31，而 FULL graph capture 会跑到 512 行；其二，logits workspace 没进 memory profiling——#46819 在 metadata builder 创建时预留最坏情况（LongCat 默认 1024 seqs × 32 heads × 512 splits × 513 × fp32 为 32 GiB），而 builder 创建发生在 profiling 之后，KV cache 于是按这块内存仍空闲来定容量，分配时 OOM（尝试 164.67 GiB、实际可用 157.84 GiB）。**方法**：`triton_decode_attention.py` 沿 #47671 的做法在六处 logits 偏移（stage 1 的 normal / grouped store 与 stage 2 的 load）改用 int64；`MLAAttentionImpl` 新增 no-op 钩子 `reserve_profiling_workspace()`，在 MLA 的 profiling 分支中与既有 `kv_b_proj` scratch 模拟相邻处调用，`TritonMLAImpl` 覆写它在 profiling 期按上界（`max_num_seqs` 乘 `max_decode_query_len`）预留 logits workspace，builder 原有的预留随之变成 no-op；`test_triton_decode_attention.py` 加 logits 元素数超过 2^31 的回归用例，grouped（MLA）与 normal kernel 都覆盖。**效果**：+126/-34、5 文件（`vllm/v1/attention/ops/triton_decode_attention.py`、`vllm/v1/attention/backends/mla/triton_mla.py`、`vllm/model_executor/layers/attention/mla_attention.py`、`vllm/v1/attention/backend.py` 及测试）。MI355 TP1 上 main 与本 PR 的逐模型对照表在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 Triton MLA decode kernel 的寻址与 attention 后端的显存预留；并行拓扑与引擎契约未变（sig_hint 亦为性能）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rocm",
+        "mi355",
+        "attention",
+        "mla",
+        "triton",
+        "int32-overflow",
+        "memory-profiling",
+        "cuda-graph"
+      ],
+      "pr_number": 61938
+    },
+    {
+      "sha": "0ee62b99b663b76ebd4fb5a4ef63740932cf8b5e",
+      "comment": "**背景**：ROCm 10 镜像成为默认后（#58761），MI355 的 torchrun DP + EP 用例在八个 rank 全部生成完成约 15 s 后有 1 到 5 个 rank 在主线程 abort（terminate called without an active exception，见 nightly build 95651、95663），根因仍在排查、两个 rank 不复现；该步骤此前 `optional: false`，会把 PR 构建整体卡住。**方法**：改 `.buildkite/test_areas/distributed.yaml` 的 MI355 DP + EP mirror——去掉 `optional: false` 以继承父步骤的 `optional: true` 从而不再 gate PR 构建；在该步骤 commands 里导出 `NCCL_RAS_ENABLE=0` 并留 TODO 待 ROCm/rocm-systems#13572 修好后移除，另导出 `TORCH_CPP_LOG_LEVEL=INFO` 让 ProcessGroupNCCL 按 process group 打印 teardown 日志（每 rank 约 60 行）以观察哪个组在 abort 前停滞；因为 `env:` 传不到 AMD 测试容器，所以只能写在 commands 中。**效果**：+8/-1、1 文件，属临时遏制而非修复：vLLM 在 ROCm 上本就默认 `NCCL_RAS_ENABLE=0`，这里只是为该步骤钉住，不改变 abort 本身。PR 描述自述由 AI 起草、每一行经提交人复核。",
+      "sig": "sig-ci",
+      "sig_reason": "只动 Buildkite 测试步骤的 optional 与两个环境变量，不触碰引擎；真正的修复在 #62241。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "rocm",
+        "buildkite",
+        "flaky-test",
+        "dp-ep",
+        "nccl"
+      ],
+      "pr_number": 62286
+    },
+    {
+      "sha": "8e5cae09f16d779a43524fd2af1142bdce2a592c",
+      "comment": "**背景**：ROCm 10 成为默认镜像后（#58761），MoRIIO dummy 权重的 P/D 端到端测试里 attention-only 用例以首 token log-prob 距离 1 到 2 个 bf16 步（0.03 到 0.14）失败（nightly 95663）。与 P/D 无关：同一 GPU 上两个普通 direct serve 跑同一模型也差同样多，而每个服务自身跨次重复逐位稳定。根因是 Inductor 的 deterministic mode 只钉 reduction kernel 的 config，pointwise kernel 的 XBLOCK 仍靠计时挑选；在 ROCm 上 XBLOCK 决定融合后的 QK-norm 加 RoPE kernel 里哪些乘加被折成 FMA（XBLOCK 1024 时有 4 个未融合的 packed 加法、4096 时没有），而候选之间在计时噪声内，于是每个服务落到随机 config。**方法**：在 `tests/v1/kv_connector` 的 `test_write_dummy_e2e_rocm.py` 里紧邻 deterministic mode 关掉 Inductor 的 pointwise autotuning（`triton.autotune_pointwise`），并更新解释理由的注释与 docstring。**效果**：+12/-7、1 文件。在两个新进程里钉住每个 pointwise kernel 的 config 后两者逐位一致；只翻 QK-norm 加 RoPE kernel 的 XBLOCK 即可复现 CI 观察到的距离。原本失败的 `qwen3_dense-TRITON_ATTN-P_FULL_AND_PIECEWISE-D_FULL_AND_PIECEWISE` 在 MI355 + ROCm 10 上 10/10 通过（距离恰为 0.0，外部 prefix cache 全命中）。PR 自述由 AI 起草、逐行经提交人复核。",
+      "sig": "sig-ci",
+      "sig_reason": "只改测试内的编译确定性开关、不动生产路径；动机是 ROCm nightly 的浮点比较 flake。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "rocm",
+        "test",
+        "torch-compile",
+        "inductor",
+        "determinism",
+        "pd-disaggregation"
+      ],
+      "pr_number": 62280
+    },
+    {
+      "sha": "52e88e25ec7476a85a964f0e58cf3e8dbeb4977c",
+      "comment": "**背景**：#61712 移除 legacy Ray compiled-graph executor、#61713 清掉其 driver 侧 GPU pin 之后，`RayExecutorV2` 已是唯一的 Ray executor，`VLLM_USE_RAY_V2_EXECUTOR_BACKEND` 不再被任何地方读取。**方法**：从 `vllm/envs.py` 删除该环境变量定义（+0/-7、1 文件），树内无读取者。**效果**：无行为变更，pre-commit（ruff、mypy）通过；对外是移除一个已失效的开关。",
+      "sig": "sig-core",
+      "sig_reason": "清理 executor 相关的环境变量面，属 core 的配置/执行器遗留收尾。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "config",
+        "env-var",
+        "ray",
+        "cleanup"
+      ],
+      "pr_number": 62228
+    },
+    {
+      "sha": "8f17dbf707459686eb7e500748552be98612218c",
+      "comment": "**背景**：hybrid MLA 模型（SSM 页与注意力页交织）的 KV 块大小跟随 TP 切分的 SSM page，因此 P 与 D 跑不同 TP 时两边块大小不同；若两者互相不整除，NixlConnector 在握手期就 assert。CUDA 上 MLA backend 强制 64 token 的 kernel block 使尺寸总能整除，而 ROCm 的 AITER MLA 接受任意 kernel block 尺寸，于是 `block_size_ratio` 断言失败：Kimi-K3 的 P TP2（2944 token 块）对 D TP1（5760）此前握手即失败。**方法**：握手时 `_split_remote_blocks` 把远端块看成 gcd 尺寸的 kernel 块（2944 视作 23 × 128），再交给既有的 `block_size_ratio` 大于 1 的路径与 D 的 45 个子块配对，并把未传输的尾部清零；改动落在 `vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py`。适用范围仅限普通 stride 远端区域的 hybrid MLA；开启 prefix caching 时 D 仍按既有 hybrid 检查拒绝这类配对，与 CUDA 行为一致。**效果**：+123/-16、2 文件（含单测 `test_nixl_desc_geometry.py`）。MI355 + AITER MLA：`test_prefix_cache.py -k pd-tp2-dep2`（Kimi-K3）由握手失败变为 4/4 通过、连续 10 次运行全过；新增 `test_hetero_non_divisible_block_sizes` 由 28 个失败到 28 个通过；今天可用的配对不会走到新代码、不受影响。模型级用 `moonshotai/Kimi-Linear-48B-A3B-Instruct` 跑 NIXL P/D，每列 5 次全新服务取均值加减标准差：4096 入 / 128 出、并发 16 下 P TP2 到 D TP1 等 2048 块时 req/s 为 3.478 ± 0.077 对 3.480 ± 0.045、TPOT 29.54 ± 0.65 对 29.36 ± 0.55 ms，1024 到 1920 则由握手 assert 变为 3.432 ± 0.027；gsm8k strict-match（5-shot、n=1319）等块情形 0.8748 ± 0.0034 对 0.8748 ± 0.0025。后续表格在截断处之后，详见原文。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主体是 NIXL KV connector 在异构 TP 的 P/D  disaggregation 下的块配对几何，落在 `vllm/distributed/kv_transfer`。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "nixl",
+        "pd-disaggregation",
+        "hybrid-mla",
+        "rocm",
+        "block-size",
+        "heterogeneous-tp"
+      ],
+      "pr_number": 61002
+    },
+    {
+      "sha": "36e0ae2df2882de8027bb484da9179c10646ccee",
+      "comment": "**背景**：在 DBO（dual batch overlap）下，`DeepEPHTPrepareAndFinalize` 让 DeepEP 在 comm 流上分配 dispatch 输出、随后在 compute 流读取，combine 输入则反向跨流；caching allocator 从未被告知这些跨流读，于是另一个 microbatch 的下一次 DeepEP 调用可以复用同一块并在它被读之前覆写。配 DeepGEMM FP8 MoE（`VLLM_USE_DEEP_GEMM=1 VLLM_MOE_USE_DEEP_GEMM=1`，即默认值）时引擎在启动期于 `ep_scatter` 因非法内存访问崩溃。GitHub 搜索没有现成 issue 或 PR；#46990 曾在 ROCm 上为 DBO 下的 HT dispatch/combine 之后加 host 同步，可能同源于此隐患，#27666 与 #38451 修的是另外的 DBO 加 DeepEP HT 问题。**方法**：`vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py` 对每个跨两条流的张量调用 `record_stream`（+26/-0、1 文件），双向覆盖 DeepEP 的输出（comm 流到 compute 流）与传给 combine 的归约后专家输出（compute 流到 comm 流，后者在 main 上是防御性的，见 Details）；DeepEP HT 背后的所有 experts backend 都被覆盖。`--enable-dbo` 在 main 上默认走 Model Runner V1（除非 `VLLM_USE_V2_MODEL_RUNNER=1`），MRV2 的 opt-in DBO 用同一套 microbatch 上下文与流因而同样受益，但只跑过 MRV1。**效果**：GLM-5.3 FP8 在 main 上 2 次运行 2 次都在首个 microbatched step 崩溃；0.29.0 上既无修复又无串行化绕法（`CUDA_LAUNCH_BLOCKING`、关 caching allocator、host 同步）的 7 次运行全部如此。修复后完整 GSM8K 为 CUTLASS linears 0.927、DeepGEMM linears 0.912（DBO 关闭为 0.923）。DBO 关闭时无任何变化；打开时不引入 host 同步或额外 kernel，代价是每 MoE 层每 microbatch 至多 9 次 `record_stream`，外加块释放时一次 CUDA event（allocator 在该 event 之后才复用该块）。Details 之后的内容在截断处之后，详见原文。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题出在专家并行通信（DeepEP HT 的 dispatch/combine）与 microbatch 重叠的缓冲生命周期，而非 kernel 数值本身；sig_hint 的性能归属只反映 MoE 路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "moe",
+        "deepep",
+        "dbo",
+        "expert-parallelism",
+        "cuda-stream",
+        "memory-allocator"
+      ],
+      "pr_number": 60735
+    },
+    {
+      "sha": "e0adacc9a67a5f2b2d8ba508f7f522bc1ff83c6d",
+      "comment": "**背景**：Rust 前端的 gRPC server 把每一个结构化输出约束都降到 guidance backend（#44729），而 guidance 只解析 legacy 的 triggers / structures 形态 structural tag（#55152）；于是按 xgrammar 格式发 structural tag 做工具调用的 gRPC 客户端每个请求都收到 INTERNAL，EngineCore 内是 KeyError（缺 triggers 键）。**方法**：让 gRPC 路径像 Python 的 auto 一样统一用 xgrammar（`rust/src/server/src/grpc/convert.rs`、`rust/src/text/src/lower.rs`、`rust/src/protocol/structured_outputs.rs`）；教 xgrammar backend 自己编译 `choice`（`rust/src/protocol/structured_outputs/xgrammar.rs` 加 `vllm/v1/structured_output/backend_xgrammar.py`），产出与 Python 的 `choice_as_grammar` 相同的 EBNF，使跳过 Python 请求校验的前端可以直接发 `choice`；把 Python 的 xgrammar schema 关键字检查搬进 Rust 前端共享的请求校验；并在 `StructuredOutputsParams::validate` 拒绝包含 NUL 的正则（Python 对所有 backend 都这么做，Rust HTTP 路由一并生效）。**效果**：+343/-18、8 文件（含 `rust/src/engine-core-client` 侧协议、`rust/src/server/src/grpc/tests.rs`、`tests/v1/structured_output/test_structured_output_manager.py`）。当前形态的 gRPC structural_tag 约束能编译并真正约束输出；gRPC 全部请求选同一 backend，引擎不再取决于哪个请求先到；同时修上 xgrammar 为引擎 backend 后 Rust HTTP 的 `choice` 报 grammar is not of valid supported types；对被 xgrammar 忽略关键字的 JSON schema，在 backend 为 xgrammar 时按 Python 的消息拒绝而非静默放松（gRPC 返回 INVALID_ARGUMENT；Rust HTTP 会返回 400，不过目前尚无 HTTP 约束走这条路径）。验证在 GB200 上通过 Dynamo 的 vLLM sidecar 经 gRPC 连 `vllm-rs`、发送 xgrammar 格式的工具调用 structural tag（ai-dynamo/dynamo#16494），左右两列同一 nightly、右列加本 PR 早期版本；结果表之后的内容在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "前端（Rust gRPC / HTTP）与结构化输出 backend 的契约一致性，属 core 的 API frontend 与 structured output 面。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "grpc",
+        "structured-output",
+        "xgrammar",
+        "tool-calling",
+        "validation"
+      ],
+      "pr_number": 61892
+    },
+    {
+      "sha": "82a24bb82dd9344cce7a43195bb51a2390adf00a",
+      "comment": "**背景**：nightly 95663 上 10 个 AMD 失败（MI250 / MI300 / MI355 的 Batch Invariance、MI300 / MI355 的 LoRA、MI355 的 Spec Decode Draft Model、MI250 的 E2E Scheduling Accuracy）：凡以 `VLLM_BATCH_INVARIANT=1` 启动的引擎都在 init 死掉，`vllm/model_executor/determinism/batch_invariant.py` 第 1429 行的 `inductor_config.batch_invariant = True` 抛 AttributeError（该 torch 没有此选项）。根因是 #61118 无条件设置 `torch._inductor.config.batch_invariant`，而 ROCm CI 镜像里的 torch 尚未提供该键、torch 的 config 模块对未知键直接抛；上一个 nightly 95553（早于 #61118）这些步骤都还通过。**方法**：只在 torch 确实提供该选项时才设置它（+2/-1、1 文件），有该选项的 torch 版本行为不变；作者说明与 #60074（钉 Inductor kernel config）不是同一改动、也没有其他开放 PR 在守这里。**效果**：一处兼容性防御解掉整批 AMD 红灯。作者无 ROCm 机器、未在本地跑，交由 AMD batch-invariance 与 LoRA 步骤确认；PR 自述由 AI 起草并经提交人复核。",
+      "sig": "sig-core",
+      "sig_reason": "改的是引擎内 determinism 模块的选项写入（`vllm/model_executor/determinism`），CI 只是暴露面，与 sig_hint 一致。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "determinism",
+        "batch-invariance",
+        "torch-compat",
+        "inductor"
+      ],
+      "pr_number": 62274
+    },
+    {
+      "sha": "6540d5c8f8c73bb2dd6194e56ed002fc32a31837",
+      "comment": "**背景**：投机解码与结构化输出同时开启时，哪些 grammar mask 行被应用一度由 CPU 侧构造的 mask 到 logit 映射（`_build_grammar_mapping`）决定，worker 因此依赖 host 上的 `cu_num_logits_np` 与调度器给出的 draft 计数；在自适应验证下（例如零预算 step 之后只有 bonus token）GPU 上的实际 logit 数与 host 视图会不一致。本 PR 取代已合入的 #52436 的 CPU 侧修法（非重复实现），并与 #52436 的作者 oops-oom 共同署名。**方法**：改由 GPU 上每请求的 logit 数决定生效位置——调度器为每个结构化输出请求发出固定宽度的 `num_spec_tokens + 1` 行 mask 块；MRV2 的 kernel 对每个 grammar 请求只 launch 一次、只应用 device 侧 `cu_num_logits` 中活跃的那些位置；由此删掉 `_build_grammar_mapping` 以及 worker 对 `cu_num_logits_np` 与调度 draft 计数的依赖，batch 分片采样改为按整块切片，MRV1 把块展开成自己的 packed 布局（改动在 `vllm/v1/structured_output/__init__.py` 与 `utils.py`、`vllm/v1/worker/gpu/structured_outputs.py`、`sample/batch_shard.py`、`model_runner.py`、`warmup.py`）。**效果**：+54/-140、10 文件，净减 86 行，把跨设备与 host 的一致性交给单一 GPU 计数来源；同时移除 `tests/v1/spec_decode/test_adaptive_verification.py` 中 50 行相关用例（改为由新 kernel 测试覆盖）。单测 102 passed、1 xfailed，pre-commit 通过；GPU 用例（新 kernel 测试，以及 MRV1 与 MRV2 上 `tests/entrypoints/llm/test_struct_output_generate.py` 的 spec-decode 部分）在提交时仍待跑。PR 自述由 AI 起草、人工逐行复核。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "作者首标签即 Spec Decode，问题只在 spec token 块与自适应验证的 logit 计数上出现，修的是 mask 块到投机位置的映射；结构化输出只是宿主。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec-decode",
+        "structured-output",
+        "grammar-mask",
+        "adaptive-verification",
+        "mrv2"
+      ],
+      "pr_number": 52477
+    },
+    {
+      "sha": "ff01a6b14f329ccd4162fce309913542e2abcd5b",
+      "comment": "**背景**：beam search（`LLM.beam_search` 与 OpenAI server 的 `use_beam_search`）只把 `tokenizer.eos_token_id` 当作 beam 结束，而普通生成还会在 generation config 里额外的 eos id 条目上停止；对以其中某个额外 id 作为结束轮次 token 的 chat 模型，beam search 会在答案写完之后接着生成下一轮直到 `max_tokens`。**方法**：`vllm/entrypoints/generate/beam_search/` 的 offline、online 与 utils 把终止集合扩为 tokenizer EOS 加上 generation config 的 `eos_token_id`（除非 `ignore_eos=True`）；OpenAI server 把真正终止该 beam 的 token 报为 `stop_reason` 并像处理 tokenizer EOS 那样把它从返回文本中剔除，length-normalized 的 beam score 对其做同样的折扣。**效果**：+110/-16、5 文件（`tests/samplers/test_beam_search_online.py` 增 71 行、`test_beam_search.py` 与三个实现文件）。验证用 `zai-org/glm-edge-1.5b-chat`：其 tokenizer EOS 是 id 59246 的 endoftext 特殊 token，generation config 另加 id 59253（user 通道）与 59255（observation 通道），而模型以 59253 结束轮次；在 L4 上以 published wheel（main @ cffc0cfa3）与叠加本改动的同一 wheel 分别跑 `llm.generate`（temperature 0、max_tokens 48）对照 `llm.beam_search`（beam_width 2、max_tokens 48），并向 `/v1/chat/completions` 发 `use_beam_search` 为 true、`n` 为 2 的同一问题；输出对照记录在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改的是前端采样入口（beam search）与 OpenAI 兼容响应的 stop_reason 契约，非引擎调度或 kernel。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "frontend",
+        "beam-search",
+        "eos",
+        "sampling-params",
+        "openai-server"
+      ],
+      "pr_number": 62072
+    }
+  ]
+}
