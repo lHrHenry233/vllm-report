@@ -1,0 +1,327 @@
+{
+  "date": "2026-10-22",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-22T10:40:00+08:00",
+  "daily_summary": "19 条里最重的一块是模型侧性能：#61868 给 DeepSeek-V4.1-Flash 在 GB300 上加了一条只服务小 batch 的 latency-specialized decode（TP4 单 tray、DSpark 5 个 draft token、最多 384 行的 FULL-graph step，+9996/-137），#62101 让 Cohere2MoE 的 parallel block 走 attention/MoE 双流并把每层的 TP all-reduce 合成一次（decode TPOT 1.14-1.36 倍），#62366 把 Beam 的 TP all-reduce 与 sandwich norm、MoE top-k finalize 融进一个 AOT 编好的 MNNVL kernel，#62745 让 mHC TileLang 跳过 NaN padding 行的 Sinkhorn 并在不超过 4 token 时改用单趟配置。编译与 CUDA graph 的正确性同日出三条：#59941 把 `eager_break_during_capture` 的判定从 import 期挪到调用期（`VLLM_BATCH_INVARIANT=1` 下 FA2 会在短 prefill 产错 token），#60318 让 clone 消除避开与 graph 输入或输出别名的 clone（vLLM-Omni 的 thinker 快照 embedding 在 TP2 加编译时把音频弄坏），#57481 在 ROCm 的 graph 捕获期间临时关掉 expandable segments，使 AITER 自定义 all-reduce 改走可注册、免设备拷贝的路径。KV offload 侧 #52921 用 world group 的 MIN 全约把 CPU offload 的 block 数在 PP 与 spec decode 的不均衡 worker 间对齐、消掉越界拷贝，#59703 让 hybrid offload 的 placeholder 事件保住 cache group 分类以便与畸形的 FullAttention 事件区分。core 与工具侧 #62884 找到长期 CI 挂起的根因（libgomp 没有 fork handler，fork 前先 `omp_pause_resource_all` 把 worker join 掉），#62767 修 `load_format=\"dummy\"` 覆盖图像归一化常数，#61871 让 cross-encoder 的 `max_tokens_per_doc` 在 query 自己就吃满上限时回落常规截断而不是 HTTP 500，#55809 把服务端 queue time 与 TTFT 保留进 `vllm bench serve` 的详细结果；其余四条是 ROCm/XPU 测试与标签规则、recipe 文档、agent skill 描述与 ModelOpt FP8 权重映射。",
+  "sig_summaries": {
+    "sig-model-performance": "6 条里三条是新增或调优 kernel，三条是编译与 CUDA graph 的正确性。#61868 给 DeepSeek-V4.1-Flash 加 NVIDIA 专用 decode 路径（单 tray TP4、DSpark 5 个 draft、最多 384 行的 FULL-graph decode step，prefill 与更大 batch 回落 stock forward），由 `--additional-config` 的 `decode_backend: latency_specialized` 选择、默认 `auto` 下与上游一致，实现全在 `vllm/models/deepseek_v41/nvidia/`：含 batch 1 的一次投机 decode step 快 18.3%（5,355 到 4,375 µs）、并发 1 到 64 的 P90 交互性提升 16-24%，四个精度基准与关开关差距在 1 点内。#62366 把 Beam 的 TP all-reduce 与 FP32 norm-residual-norm 尾声、以及 TRTLLM-Gen NvFP4 的 top-k finalize 融进 `csrc/beam/allreduce_norm.cu`（MNNVL one-shot/two-shot，Lamport helper 从 FlashInfer v0.7.2 vendor 而来），经 `torch.ops._C.beam_allreduce_norm` 暴露、AOT 构建无运行时 JIT，GB200 上 178 passed、hidden 8192 从 64 token 起快 6-16%。#62101 让 Cohere2MoE 的 parallel block 在 decode 时把 MLP/MoE 放到侧流（阈值 `VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD` 默认 256）、每层只做一次 TP all-reduce 并让 `allreduce_rms` pass 把它与下一层 norm 融合，North-Mini-Code-1.0 在 2×H100 TP2 的三种量化下 TPOT 快 1.14-1.36 倍。#59941 删掉装饰器里 import 期的开关判定，使 breakable graph 的 eager break 不再依赖 import 顺序；#60318 给 `UnsafeCloneEliminationPass` 加 `would_alias_graph_io()`，避免消除后的 clone 让 graph 输出与输入或另一输出共享存储而被原地 kernel 改写；#62745 让 `mhc_pre_big_fuse_with_norm_tilelang` 在非有限 RMS 的行上提前结束 Sinkhorn（bit-exact），并对不超过 4 token、hidden 4096、算力不低于 10.0 的情况改用单趟配置，padding batch 上的 mHC 算子快 1.2-1.55 倍。",
+    "sig-large-scale-serving": "4 条里三条动分布式与 KV offload、一条同步部署知识。#52921 修 CPU offload 的 block 数错配：PP 不均衡或带 spec decode 时各 worker 自己算出的 offload block 数不同、调度器用的是另一套基于 config 的数字，offload 拷贝因此可能越界；改法是新增 `vllm/v1/simple_kv_offload/sizing.py`，worker 分配前沿 world group 的 cpu_group 对计数做 `ReduceOp.MIN`，engine 仅在启用 `SimpleCPUOffloadConnector`（含 `MultiConnector`）时查询并把结果写进 `CacheConfig` 新字段 `simple_cpu_offload_num_blocks`，调度器直接用该计数、删掉未用的 config 回落与逐 worker 的 config 透传。#57481 在 ROCm 的 `graph_capture()` 期间临时关掉 expandable segments，使捕获内分配的激活可被 `hipIpcGetMemHandle` 导出、AITER 自定义 all-reduce 不再逐次走设备到设备拷贝，无开关、按 AITER 的 `defers_capture_registration` 能力自动生效，DP 组也跑 AITER 集合通信时跳过。#59703 让 hybrid offload 的 placeholder `BlockStored` 事件带上 group 的 kind 与 sliding window、并让 group specs 跨 tracker reset 保留，消费方据此区分 recurrent-state placeholder 与畸形 FullAttention 事件（Dynamo 配套 ai-dynamo/dynamo#15535）。#62954 把 InferenceX#3837 的 B200 AgentX 状态同步回 DSv4.1-Flash recipe：补 vLLM Router 0.1.14 的 `--policy consistent_hash`、`--request-timeout-secs 14400`、`--disable-retries` 等 flag，并按该次改动删掉 TP4 与 DEP4 的 c64 点。",
+    "sig-core": "4 条里一条是平台级死锁、三条是入口与加载正确性。#62884 找到 fork 出的 EngineCore 在启动期死锁的根因：libgomp 没有 fork handler，父进程若已跑过多线程 torch CPU 算子，子进程第一个并行区就会挂住（这是 scheduled full builds 自 96139 起 `(H200 MIG 35GB) Language Models (Extended Pooling) Shard 2/4` 挂起的原因，也很可能解释 #50130 与 #50560 用 `default_torch_num_threads=1` 绕过的未知挂起）；改法是 `get_mp_context()` 在 fork 模式下先 `omp_pause_resource_all` 把空闲 worker join 掉，父进程下个并行区自行重建。#55809 把 #46768 加上的服务端逐请求计时真正保留进 `vllm bench serve` 的详细结果，新增 `server_queue_times` 与 `server_ttfts`（毫秒换算为秒、缺失记 null 并保持按请求下标对齐、全无或未开 `--save-detailed` 时整对省略），Python 与 Rust 两条客户端都支持，用于把调度等待与首 token 时间分开。#61871 修 cross-encoder 的 `max_tokens_per_doc`：`truncation=\"only_second\"` 只能缩短 document，query 自己就吃满 `max_length` 时 tokenizer 直接抛错并冒成 HTTP 500，现在只在 query 加特殊 token 仍未满上限时才下发截断参数，且 `num_special` 只在 `add_special_tokens` 为真时计入。#62767 把 `FusedMMInputNorm` 的 `weight` 与 `bias` 注册为非 persistent buffer，使 `load_format=\"dummy\"` 不再覆盖处理器派生的 rescale、mean、std 常数（Qwen3-VL 自 #51289 起用该模块）。",
+    "sig-ci": "3 条都是测试与流水线侧。#62977 把 #59332 为控制范围砍掉的三个 `_maybe_pad_weight` 用例补回 `tests/rocm/test_moe_padding.py`（即 #54966 进度表里的 4d-1）：EPLB 启用时即使形状 512 字节对齐也必须不 padding、构造外层 stride 对齐合格但内层 stride 非 1 的视图以单独证明 stride 守卫、以及模拟 RL 原地权重 reload 后断言 `w13_weight`/`w2_weight` 的存储地址不变（确认 padding 后的权重是拷回原存储而非重绑 `.data`，否则会静默破坏 CUDA graph 的地址捕获），MI355X 加 AITER v0.1.26 下该文件 10 个用例全通过。#62638 只把 XPU 上 mistral `tool_choice=none` 用例的严格相等放宽为「公共前缀不短于较短输出的一半」——streaming 与非 streaming 的 greedy 输出前约 100 字符一致、结尾因近平局 logits 的数值噪声分叉（prefix caching 已关、重跑 3/3 通过），其它平台仍要求完全相等。#62989 在 `.github/mergify.yml` 加规则，对触碰 HiSparse 路径或标题提到 HiSparse 的 PR 自动打 `hisparse` 标签（与既有 `kv-connector` 规则同形，Mergify 只对本规则合入后新开或更新的 PR 生效，跟踪于 #60072）。",
+    "sig-quantization": "1 条：#57393 给 Cosmos3-Edge 的统一 checkpoint 格式补上 ModelOpt FP8 支持——ModelOpt 原生写法会带 `.input_quantizer.`、`.weight_quantizer.`、`.output_quantizer.` 这些由 diffusers/transformers 读取的参数，而 vLLM 改读 `weight_scale`/`input_scale`，于是 `AutoWeightsLoader` 会因多余张量报错；改法是在 `cosmos3_edge.py` 的权重映射里把这三个前缀映射为 None 丢弃（+45/-0、2 文件），并加 `test_cosmos3_edge_modelopt_quantizer_weights_mapper`，量化后的 Cosmos3-Edge 用 `vllm serve` 加载不再报多余张量。",
+    "other": "1 条：#60284 消掉 `check-agent-files` 这个 pre-commit 钩子对三个 skill 的 advisory note（说它们的 description 没写什么时候该用），给 `debug-ima`、`kernel-microbenchmark`、`triton-kernel-writing` 各在 description 里补一句「Use when ...」、不动其它内容，`python tools/pre_commit/check_agent_files.py` 退出 0 且无 note（+3/-3、3 文件）。"
+  },
+  "commits": [
+    {
+      "sha": "ae43d045c4e8e76bddf41fb39bc9dcc381dc260d",
+      "comment": "**背景**：#46768 已让 OpenAI 兼容的 Chat Completions 与 Completions 响应带上服务端逐请求计时，但 `vllm bench serve` 把这些指标丢掉、只保留客户端观测到的时间，详细结果里无法把调度队列等待与首 token 生成分开。**方法**：在逐请求数组里新增 `server_queue_times`（服务端调度队列等待）与 `server_ttfts`（从被调度到产出首个 token），把毫秒换算成秒以与既有数组同单位；缺失值写 null 并保持按请求下标对齐；若所有请求都取不到任一指标、或未启用 `--save-detailed`，则整对数组省略。Python 与 Rust 两条客户端路径（后者用于 `VLLM_USE_RUST_BENCH=1`）都实现，从流式响应的最后一个 usage chunk 提取，文档区分这两个服务端指标与客户端的 `queue_times`、`ttfts`。作者说明本 PR 刻意只做 queue time 与 TTFT 两项，其余逐请求指标可在维护者要求时扩。**效果**：+324/-17、8 文件（`vllm/benchmarks/serve.py`、`vllm/benchmarks/lib/endpoint_request_func.py`、`rust/src/bench` 的 backends 与 `output/json.rs`、102 行的 `tests/benchmarks/test_endpoint_request_func_timing.py`、`docs/benchmarking/cli.md` 新增一节，说明需服务端带 `--enable-per-request-metrics` 且只有 `openai`、`vllm`、`openai-chat` 后端会填这些字段）。Test plan 覆盖两条 Chat/Completions 抽取、毫秒到秒换算与零值/不可用/下标对齐、Rust 侧等价序列化与定向测试，描述在末尾截断，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "落点是 `vllm bench serve` 与 Rust 基准客户端的结果字段（core 侧基准工具与前端），不改内核或调度实现。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "benchmark",
+        "observability",
+        "ttft",
+        "rust-bench",
+        "save-detailed"
+      ],
+      "pr_number": 55809
+    },
+    {
+      "sha": "a4aa37d1a0ed89dd6d5f37ee3071e3ddc0d85e61",
+      "comment": "**背景**：开了 `expandable_segments:True` 后 caching allocator 给出的是 VMM 支撑的指针，`hipIpcGetMemHandle` 无法导出，AITER 的自定义 all-reduce 于是把每一个被 CUDA graph 捕获的 all-reduce 都先做一次设备到设备拷贝；而喂给这些 all-reduce 的激活正是在捕获期间从 graph 私有池分配的。**方法**：在 `graph_capture()` 期间临时关掉 expandable segments，让这些缓冲可导出、AITER 走注册后的免拷贝路径；权重、KV cache 与捕获之外的分配仍保持 expandable segments。不加开关：ROCm 上只要 TP 组的 AITER 自定义 all-reduce 会注册 graph 缓冲（`AiterCustomAllreduce.registers_graph_buffers`）就自动生效，这需要 vLLM 没关掉注册（即不是 cuMem graph pool）、通信器已启用、非 gfx1250、且 AITER 带公开的 `defers_capture_registration` 类标记（ROCm/aiter#5799 引入、v0.1.26 首发，表示由 AITER 在捕获开始时决定是否注册）；DP 组也跑 AITER 集合通信时跳过，因为 DP+EP 下 MoE combine 会对捕获前分配的持久 workspace 做 reduce-scatter，注册路径导不出来。新增的 `non_expandable_allocations()`（`vllm/device_allocator/alloc_conf.py`）只翻转该字段、退出时含异常路径恢复完整字符串，沿用 `CuMemAllocator.use_memory_pool` 的读-翻-还模式。**效果**：+159/-4、5 文件（`alloc_conf.py` +16、`parallel_state.py` +23/-4、`device_communicators` 内 AITER 通信器 +14、`tests/distributed/test_rocm_aiter_custom_ar.py` +95、`tests/device_allocator/test_alloc_conf.py` +15）。vLLM 自 #62486 起把 AITER 钉在 v0.1.26，因此更早版本、未用 AITER 自定义 all-reduce、走 cuMem graph pool、gfx1250、以及本就关掉 expandable segments 的场景都不变。验证是 `pytest -v -s tests/device_allocator` 与双卡的 `test_rocm_aiter_custom_ar.py`（跑在既有 AMD CI 步骤），另有 Qwen3-0.6B TP2 decode 上 rocprofv3 kernel trace 的前后对比，明细在截断处之后，详见原文。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是 TP 自定义 all-reduce 通信器与 graph 捕获期分配器配置的交互（`vllm/distributed` 与 device communicator），AITER 只是承载。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "aiter",
+        "custom-all-reduce",
+        "cuda-graph",
+        "expandable-segments",
+        "memory-allocator"
+      ],
+      "pr_number": 57481
+    },
+    {
+      "sha": "5af272e53dec062f6fac0605ddf9bab5cc25b155",
+      "comment": "**背景**：BERT 系 cross-encoder 上 `/rerank`、`/score` 与 `LLM.score` 在设了 `max_tokens_per_doc` 且 query 单独就吃满 token 上限时返回 HTTP 500。根因是 `get_score_prompt` 用 `truncation=\"only_second\"` 编码 pair，该模式只能缩短 document，query 本身已够不到 `max_length` 时 tokenizer 直接抛 `Sequence to truncate too short to respect the provided max_length`。**方法**：在 `CrossEncoderIOProcessor` 里只有当 `len(query_tokens) + num_special` 仍小于 `effective_max_length` 时才下发 `truncation` 与 `max_length`，否则回落到不设 `max_tokens_per_doc` 时的常规截断；同时 `num_special` 改为只在 `add_special_tokens` 为真时按 pair 计入、否则取 0（+8/-3、1 文件 `vllm/entrypoints/pooling/scoring/io_processor.py`）。**效果**：`truncate_prompt_tokens` 低于 query 长度加特殊 token（含带一个空 document 的情形）从 500 变 200；超过 `max_model_len` 的长 query 且未开截断时从 500 变 400 的最大上下文错误；原本能工作的请求产出完全相同的 token——作者对 18,360 组 query 与 document 长度、两种上限的组合做了 main 与本分支的预处理对照，只有 main 上失败的 2,250 组发生变化且都不越限。`tests/entrypoints/pooling/scoring/test_io_processor_unit.py` 从 10 到 14 passed（新增 4 例中 3 例在 main 上失败），`test_cross_encoder_online.py` 20/20、`test_cross_encoder_offline.py` 6/6、`tests/models/language/pooling/test_max_tokens_per_doc.py` 20/20 在两版一致，T4 上 cross-encoder/ms-marco-MiniLM-L6-v2 实测相关 document 仍排首位。",
+      "sig": "sig-core",
+      "sig_reason": "API 前端（pooling 入口的 scoring IO 预处理）的截断契约修复，属 core 的前端面。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "pooling",
+        "rerank",
+        "cross-encoder",
+        "truncation",
+        "http-500"
+      ],
+      "pr_number": 61871
+    },
+    {
+      "sha": "e4e6bcaae60241d5519f0a21d1601eac4d7a8d94",
+      "comment": "**背景**：Beam 的 TP 路径上 all-reduce、sandwich norm 与 MoE 的 top-k finalize 各自独立成 kernel；#62074 完成了模型侧接入，本 PR 把三者融进一个预先构建的 CUDA kernel（放在 `csrc/beam/`、无运行时 JIT、模型目录里不放 CUDA 源）。只覆盖 TP，复制 token 的 EP 递延到建立在它之上的 #62073。**方法**：`csrc/beam/allreduce_norm.cu` 实现 MNNVL one-shot/two-shot all-reduce，带 Beam 的 FP32 norm-residual-norm 尾声，并可选在归约前做 MoE finalize（保留本地 BF16 舍入），以 `torch.ops._C.beam_allreduce_norm` 暴露；另有只做 two-shot 归约的 `beam_allreduce` 供大 batch 路径使用，其后再跑 Triton 边界 kernel。`csrc/mnnvl_lamport.cuh` 按原许可证头 vendor FlashInfer（v0.7.2，vLLM 所钉版本）`trtllm_mnnvl_allreduce.cuh` 中本 kernel 用到的那部分 Lamport 设备端 helper。模型侧复用既有 `FusedMoEConfig.defer_moe_finalize()`，让 TRTLLM-Gen NvFP4 的 top-k finalize 递进融合 all-reduce，不改任何共享 MoE 代码；CMakeLists 负责 AOT 构建、`ops.h` 与 `torch_bindings.cpp` 完成注册。**效果**：+1894/-9、11 文件（新 kernel 472 行、vendored helper 778 行、`vllm/models/beam/nvidia/allreduce.py` 新增 244 行及 model/moe/layernorm/attention 接线、`tests/models/test_beam_numerics.py` +229）。GB200 4 卡上 `test_beam_construction.py`、`test_beam_numerics.py`、`tests/kernels/moe/test_trtllm_nvfp4_moe.py` 共 178 passed、3 skipped（8 卡用例与两处上游 FlashInfer tile-config skip），覆盖 2 与 4 卡的 all-reduce 及 MoE finalize 数值；跨两节点 GB200（同一 MNNVL clique）以 `torchrun --nnodes=2` 跑 hidden 5120 与 8192 的 all-reduce 数值 worker 通过（batch 变动、one/two-shot、大 batch 路径、CUDA graph replay），8 卡的 MoE-finalize 用例未跑（其测试限单机）；与之前 JIT 构建同速，hidden 8192 从 64 token 起快 6-16%。涉及的 FlashInfer 版本说明在截断处之后，微基准明细详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 TP all-reduce、norm 与 MoE finalize 的 kernel 融合与加速（CUDA kernel 与融合面），Beam 只是被优化的模型。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "cuda-kernel",
+        "all-reduce",
+        "mnnvl",
+        "fused-op",
+        "moe",
+        "beam",
+        "blackwell"
+      ],
+      "pr_number": 62366
+    },
+    {
+      "sha": "a6020fc669544fbd3b1bb0aae31b050590d33fb1",
+      "comment": "**背景**：#59332 为了把范围限制在 #54966（Test padding）最初要求的覆盖面，砍掉了这几个用例，本 PR 是 #54966 进度表里 4d-1 那一行的补回。**方法**：在 `tests/rocm/test_moe_padding.py` 增加三个 `_maybe_pad_weight` 相关测试——EPLB 启用时即使形状已达 512 字节对齐也必须不 padding（EPLB 的重排算子要求权重连续）；构造一个外层 stride 看似对齐合格但内层 stride 非 1 的视图，专门证明挡住 padding 的是 stride 守卫而非仅对齐；以及模拟 RL 的原地权重 reload（同一个 `RoutedExperts` 层、只换新值）后断言 `w13_weight`/`w2_weight` 的存储地址不变，即 `process_weights_after_loading` 是把 padding 后的权重拷回既有存储而不是重绑 `.data`（后者会静默破坏 CUDA graph 的地址捕获），并同时检查 reload 后的输出反映新权重。**效果**：+133/-0、1 文件；MI355X（gfx950）配 AITER v0.1.26 下该文件全部 10 个用例（7 旧 + 3 新）通过，`pre-commit run --files` 干净。",
+      "sig": "sig-ci",
+      "sig_reason": "只补 ROCm 侧测试覆盖（含 RL reload 的稳定性断言），不改生产实现。",
+      "tags": [
+        "test",
+        "low-risk",
+        "rocm",
+        "moe-padding",
+        "eplb",
+        "rl-weight-reload",
+        "cuda-graph"
+      ],
+      "pr_number": 62977
+    },
+    {
+      "sha": "30aded62d46dfcf52c815925a8acec5a8bebddc6",
+      "comment": "**背景**：pipeline parallelism 不均衡或带 speculative decoding 时，各 worker 自行算出的 CPU offload block 数并不相同，而调度器用的是另一套基于 config 的数字，于是 offload 拷贝可能越界。**方法**：新增 `vllm/v1/simple_kv_offload/sizing.py`，其中 `sync_num_offload_blocks_across_workers()` 在 world size 大于 1 时把 `num_offload_blocks` 沿 world group 的 cpu_group 做 `ReduceOp.MIN` 全约、按对齐后的最小值分配并在发生变化时记一条 info 日志（未初始化进程组或单 worker 时原值返回）；engine 只在启用了 `SimpleCPUOffloadConnector` 的配置下（含被 `MultiConnector` 包裹的情形）查询该对齐计数，并要求 worker 结果有效；计数写入 `CacheConfig` 新增的 `simple_cpu_offload_num_blocks`（与 `num_gpu_blocks`、`num_cpu_blocks` 同列派生计数器）；调度器直接使用该计数，删掉原先未用到的 config 回落与逐 worker 的 config 透传。涉及 `vllm/v1/executor/abstract.py`、`gpu_worker.py`、`vllm/v1/engine/core.py`、`simple_cpu_offload_connector.py` 与 `manager.py`、`worker.py`。**效果**：+284/-17、12 文件。合并 main（f143f65d7c74）并 cherry-pick Nixl CI 修复后，Python 3.12 纯 CPU 下 `tests/config/test_config_utils.py`、`simple_kv_offload/test_scheduler.py`、`test_worker.py`、`kv_connector/unit/test_simple_cpu_offload_connector.py`、`worker/test_spec_decode_embed_sharing_pp.py` 共 144 passed、18 skipped（CPU offload 的 worker 模块与 17 个依赖 CUDA/ROCm 的 embed-sharing 用例被跳过，含三个 worker 同步用例，AMD GPU 用例待 CI 验）；六个针对性回归覆盖 RPC 门控、`MultiConnector` 与缺失 worker 结果（后者在加断言前会失败）。此前 ROCm 冒烟中 Kimi-K3 TP4×PP2 的 workers 50/46 与调度器 50 对齐为处处 46、两 pass 生成一致，更多行在截断处之后，详见原文。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是 CPU KV offload 池在多 worker 间的大小一致性（KV connector 与分层 offload），跨 executor/engine/scheduler 只是实现路径。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "kv-offload",
+        "cpu-offload",
+        "pipeline-parallel",
+        "spec-decode",
+        "distributed-sync",
+        "correctness"
+      ],
+      "pr_number": 52921
+    },
+    {
+      "sha": "d0787e48394b214f78694fce3520a8c11eca045c",
+      "comment": "**背景**：agentic 服务跑的 decode batch 很小，本 PR 为 DeepSeek-V4.1-Flash 增加一条 NVIDIA 专用 decode 路径，支持单 GB300 tray 的 TP4、DSpark 投机解码（5 个 draft token）、以及最多 384 行（64 请求 × 6 token）的 FULL-graph decode step；prefill、混合 batch 与更大 batch 回落到 stock forward。集成方式沿用 #61867（模型自带一个 decode executor 接管 FULL-graph decode step），栈式后续 #61869 把 DSpark draft 模型也放到同一 executor，二者都走 RFC #59665 的 fast-track，相关的是 #57448（DeepSeek-V4.1 跟踪）与 #59725（Cake kernels）。**方法**：以 `--additional-config` 里的 `decode_backend: latency_specialized` 选入（与 #61867 同一开关），默认 `auto` 下模型行为与上游 main 完全一致；实现全部位于 `vllm/models/deepseek_v41/nvidia/` 之下——`specialized_decode/` 内分 attention（sparse MLA、indexer 与 indexer K 存储、candidate topk、aux projections、MXFP8、step）、boundary（all_reduce、publishing GEMM）、moe（CuTe DSL 的 routed expert GEMM 与 route kernel、routed expert front）、logits（lm_head）、engram 预取、runtime（decode、metadata graphs、model_state、warmup），并带一份该目录的 AGENTS.md 说明约定；目录外只加测试与一个 CI 步骤（`.buildkite/test_areas/models_basic.yaml` +26），`model.py`、`model_state.py`、`ops/o_proj.py`、`ops/cute_dsl/all_reduce_mhc.py`、`vl_model.py` 做接线。**效果**：+9996/-137、42 文件（新增 kernel/layer/数值测试约 2,522 行）。同一构建在开关两侧对照：含 draft 的一次投机 decode step 在 batch 1 快 18.3%（5,355 到 4,375 µs）、batch 8 快 13.7%、batch 32 快 11.3%；InferenceX AgentX trace 上并发 1 到 64 每档的 P90 交互性提升 16-24%，每 GPU 吞吐 +1-6%、TTFT 不变；GSM8K、GPQA-Diamond、AIME25、RULER NIAH 与关开关的模型差距在 1 点内（GSM8K 三档 0.973/0.972/0.973 对 0.974/0.970/0.975），DSpark 接受长度不变。完整验证矩阵在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "同 #61867 的先例：这是 per-model 的 decode 性能冲刺与专用 kernel 实现（SIG Model Performance 的 per-model sprint 面），DSpark 只是被承载的投机方案。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "gb300",
+        "blackwell",
+        "cute-dsl",
+        "decode-executor",
+        "spec-decode",
+        "opt-in",
+        "deepseek-v4.1"
+      ],
+      "pr_number": 61868
+    },
+    {
+      "sha": "0746329d2abe3546a1fd805fba44b1838cf23b29",
+      "comment": "**背景**：HiSparse 的 PR 一直靠人工打标签，仓库已有针对 `kv-connector` 的同类 Mergify 规则。**方法**：在 `.github/mergify.yml` 加一条规则，对触碰 HiSparse 文件（所有 HiSparse 路径都含 hisparse）或标题提到 HiSparse 的 PR 自动应用新建的 `hisparse` 标签；Mergify 只评估本规则合入之后新开或更新的 PR，存量 HiSparse PR 仍需手工补标（跟踪于 #60072）。**效果**：+12/-0、1 文件；`python tools/pre_commit/check_label_rules.py` 通过，说明规则的文件模式能匹配到现有文件。",
+      "sig": "sig-ci",
+      "sig_reason": "纯 CI 元数据自动化（Mergify 标签规则），不触碰代码路径。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "mergify",
+        "labeling",
+        "hisparse"
+      ],
+      "pr_number": 62989
+    },
+    {
+      "sha": "0eea5aca8451b25bf3419cd9460125a3132d3169",
+      "comment": "**背景**：修复 #59940。`@eager_break_during_capture` 在被装饰模块被 import 的那一刻就决定要不要包 wrapper，而 `VLLM_BATCH_INVARIANT=1` 时 breakable graph 的开关是在 `VllmConfig` 里更晚才打开的（#57586）；于是任何在该点之前发生的 `attention.py` import 都会让 `unified_attention_with_output` 保持未包装，FA2 随后在短 prefill 上产出错误的 token。**方法**：删掉装饰器开头 `if not is_breakable_cudagraph_enabled(): return fn` 这两行，让它始终返回 wrapper、把该设置改为在调用时读取，从而与 import 顺序无关；开关为关时行为不变（wrapper 在没有 breakable capture 进行时直接调用原函数）。一处改动覆盖当前与未来全部 33 个使用点（含 #46372、#57881 带来的），不引入新的 import。**效果**：+97/-7、2 文件（`vllm/compilation/breakable_cudagraph.py` 与 `tests/v1/cudagraph/test_breakable_cudagraph.py`）。环境 `uv venv --python 3.12` 加 `VLLM_USE_PRECOMPILED=1`，纯 CPU 验证：`test_decorator_breaks_when_enabled_after_decoration` 与以子进程跑真实算子的 `test_attention_op_breaks_when_imported_before_enable` 从 FAIL 变 pass，`test_decorator_passthrough_returns_fn_result` 与 `fullgraph=True` 下的 `test_decorated_op_traces_without_graph_break` 两侧均 pass，整个文件从 2 failed、11 passed、13 skipped 变 13 passed、13 skipped；`tests/test_config.py`、`tests/test_ray_env_utils.py` 与 pre-commit 通过。",
+      "sig": "sig-model-performance",
+      "sig_reason": "落点是 breakable CUDA graph 的编译路径与 attention 算子包装（torch.compile 与 cudagraph 面）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "cuda-graph",
+        "breakable-graph",
+        "torch-compile",
+        "batch-invariance",
+        "import-order"
+      ],
+      "pr_number": 59941
+    },
+    {
+      "sha": "57d9bf768e0e3e2153acc3b01ae3fda3b7393ded",
+      "comment": "**背景**：GLM-5.3-Flash（hidden 4096、hc_mult 4）的低 batch decode 里两个 mHC TileLang kernel 有可乘之机，而 CUDA graph 的 padding 行是以 NaN 进入 `mhc_pre_big_fuse_with_norm_tilelang` 的（根因即在此）。**方法**：(1) 该 kernel 在某行 RMS 非有限时跳过剩余的 Sinkhorn 迭代，对任意输入 bit-exact；(2) `mhc_fused_post_pre_split_config` 在 token 数不超过 4、`hidden_size` 为 4096 且 CUDA 设备算力不低于 10.0（该配置在此调优）时改用单趟配置（tile_n 2、16 splits、256 线程），SM90、更老的 GPU 与 ROCm 的 TileLang 回落保持既有配置。#61461 是同一函数在 SM90（H20）上的调优，本 PR 面向 Blackwell 与 SM107 的 hidden 4096，两处改动在两者上都提速。**效果**：+65/-17、2 文件（`vllm/model_executor/kernels/mhc/tilelang_kernels.py` 与 `tests/kernels/mhc`）。每个子层边界调用一次、一次 GLM-5.3-Flash decode step 约 89 次的 fused post + pre 在干净行上于 GB300 与 RTX PRO 6000 的 1-3 token 时 1.08-1.19x、4 token 时 0.99-1.05x、5 token 起不变；当 decode batch 小于其 CUDA graph 尺寸时，padding batch 上的 mHC 算子快 1.2-1.55x（每次约省 3 µs）、干净行不受影响；SM107 上两处也都更快且数值相同。数值上第一处对全部输入 bit-exact，第二处只重排一个 fp32 分块求和（post/comb 至多差 2.4e-7，kernel A/B 里 `layer_input` bit 相同），GLM-5.3-Flash NVFP4 服务上 GSM8K（5-shot greedy、1,319 题）为 91.2% 对基线 91.8%、落在基线 1.0 点的 run-to-run 波动内。`pytest tests/kernels/mhc` 在 GB300 与 RTX PRO 6000 上以分支的 mHC 文件覆盖 nightly 镜像的方式运行，其余验证细节在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "TileLang kernel 的低 batch 调优与数值影响面，属 kernel 性能优化。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "tilelang",
+        "mhc",
+        "kernel",
+        "cuda-graph-padding",
+        "blackwell",
+        "low-batch-decode"
+      ],
+      "pr_number": 62745
+    },
+    {
+      "sha": "d29702fd75531ea5dec046a478101f66f390aa5d",
+      "comment": "**背景**：编译期的 clone 消除此前不检查指向 graph 输入与输出的别名，于是一旦对某个没有任何写入的输入做快照、由原地生效的 kernel（例如 TP 大于 1 时的 fused allreduce 与 rms norm）消费、再作为编译边界之外的输出返回给后续处理，快照就可能与被改写的存储共用同一块内存。vLLM 现有 compile 边界下这么做模型不多，但 vLLM-Omni 的 thinker 就快照 embedding、clone 后交给 talker（见 vllm-project/vllm-omni#8532），在 TP=2 加编译时因为 clone 正落在编译边界内侧、fused allreduce 与 rms norm 原地跑，音频被弄坏。**方法**：在 `vllm/compilation/passes/ir/clone_elimination.py` 新增 `would_alias_graph_io()`，用 `torch._inductor.fx_utils.get_node_storage` 比较 clone 与其 source 的存储和 graph 输出节点、placeholder 节点的存储集合：当该 clone 会从 graph 返回、且其 source 与某个 graph 输入或另一个输出别名（在 clone 无写入的前提下）时跳过消除，存储无法判定时按别名处理；同时把 pass docstring 从「尚未考虑别名」改为「只处理 graph 输出的别名」，并保留原有的 donated-input 消除分支与 debug 日志。**效果**：+114/-1、3 文件（生产改动 26 行，另加 piecewise 的 `tests/compile/fullgraph/test_clone_elimination.py` +56 与 `tests/compile/passes/ir/test_clone_cleanup.py` +33 两个回归用例）。PR 描述未给性能数字，属正确性修复；影响面为返回 clone 且与 graph I/O 别名的场景，作者认为当前 vLLM 内不多见、主要动机来自 vLLM-Omni。",
+      "sig": "sig-model-performance",
+      "sig_reason": "落点是 Inductor clone 消除 pass 的图级别名判定（torch.compile 优化正确性），非多模态实现。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "torch-compile",
+        "clone-elimination",
+        "aliasing",
+        "graph-io",
+        "tensor-parallel",
+        "correctness"
+      ],
+      "pr_number": 60318
+    },
+    {
+      "sha": "0d34366b14e5eef6b1f3c7b799e71cab155ce44a",
+      "comment": "**背景**：Cohere2MoE 的层是 parallel block——attention 与 MLP/MoE 读同一份 normed 输入、输出相加。**方法**：三处改动都收在 `vllm/model_executor/models/cohere2_moe.py` 加一个环境变量。(1) attention/MoE 双流，CUDA 上默认开启，由新增的 `VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD`（默认 256）限定批大小：decode 时把 MLP/MoE 放到侧 CUDA 流与 attention 重叠，更大的 batch 与 piecewise CUDA graph（prefill 与混合 batch）仍 inline 跑，设为 0 可完全关掉；(2) 每层只做一次 TP all-reduce，attention 与 MLP 的输出合起来归约而不是各自一次——TP 大于 1 时的双流正是依赖这点，层的唯一集合通信排在 join 之后，侧流上不会出现与主流并行的 all-reduce；(3) 改用 vLLM 的融合 add + RMSNorm，使既有 `allreduce_rms` pass 能把那次 all-reduce 与下一层的 norm 融合。#61508（`swiglu_limit`）改的是 MLP/MoE 构造函数、与本 PR 不重叠。**效果**：+785/-52、4 文件（`cohere2_moe.py` +337/-52、489 行新并行 block 用例、`vllm/envs.py` +8、models_basic CI 列表微调）。在 2×H100 80GB、TP2、`--max-model-len 8192`、base 4f49b55c1f 下，CohereLabs/North-Mini-Code-1.0 的 bf16、FP8、W4A16 三个 checkpoint 在并发 1-64 上 decode TPOT 快 1.14-1.36 倍（`vllm bench serve` 随机数据集 1024 入 / 512 出、`--ignore-eos`），几乎全部收益来自双流；关掉双流时仅靠单次 all-reduce 与 `allreduce_rms` 融合仍有至多 1.05 倍，该 pass 在每个编译子图从 `Replaced 0 patterns` 变 `Replaced 1 patterns`；gsm8k 在噪声内，EAGLE 与 Eagle3 draft 的接受率不变，所有双流运行在 `VLLM_GPU_SYNC_CHECK=error` 下通过（无新增 GPU 到 CPU 同步）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "双流重叠、单次 TP all-reduce 与融合 norm 都是模型侧 decode 性能优化，落点在模型实现与编译 pass 的配合。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "dual-stream",
+        "moe",
+        "tensor-parallel",
+        "all-reduce",
+        "fused-rmsnorm",
+        "cohere2moe",
+        "decode"
+      ],
+      "pr_number": 62101
+    },
+    {
+      "sha": "aa4ec2093fe963e77adf26ddd7004dcdb2838722",
+      "comment": "**背景**：#62541 的后续，把 SemiAnalysisAI/InferenceX#3837（B200 vLLM AgentX、DeepSeek-V4.1-Flash）的最新状态同步回 `recipes/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml`，只动 guide 文本、不改 override 与命令构建器。**方法**：补上 B200 的 DEP2/DEP4 lane 在 vLLM Router 0.1.14 下实际使用的 flag——`--policy consistent_hash`、`--request-timeout-secs 14400`、`--disable-retries`、`--intra-node-data-parallel-size` 后接 DP 值、`--worker-urls`，flag 名、可选值与默认（`cache_aware`、1800 s）都对着 0.1.14 的 wheel 核过，Prometheus 的 host 与 port 作为遥测不写进文档；同时按 #3837 删掉 TP4 与 DEP4 的 c64 点（TP4 的列表与表格、DEP4 的文本不再提 c64，TP4 c32 仍是 `--max-num-seqs 64`）。**效果**：+20/-7、1 文件；`validate-source --source vllm` 对当前 `vllm-project/recipes` 渲染器通过，YAML 可解析、`date_updated` 已更新。备注：#3837 目前在 TP4 c32 的 `max-num-seqs` 上过不了 verifier（实际 128 对文档的 64），作者判定属 InferenceX 侧修复、不影响本 PR。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "记录的是 B200 多 lane 部署与 Router（多节点路由）配置知识，与 #62541、#62761 等 recipe 画像同类。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "b200",
+        "router",
+        "agentx",
+        "deepseek-v4.1"
+      ],
+      "pr_number": 62954
+    },
+    {
+      "sha": "fc9b7e654643844c1fd17fd54fcd86be86f67e2b",
+      "comment": "**背景**：`tests/tool_use/mistral/test_mistral_tool_calls.py::test_tool_call_none_with_tools[ministral-3b]` 在 XPU 上间歇失败——streaming 与非 streaming 的 greedy 输出前约 100 个字符一致、结尾才分叉（一侧是 for you.、另一侧接着说要去查华氏温度）。prefix caching 在该用例里本就关掉，这是近平局 logits 上的数值噪声而非 tool parser 问题，同一用例重跑 3/3 通过。**方法**：只在 XPU 上把流式与非流式输出的严格相等断言放宽为「公共前缀不短于较短输出的二分之一」，其它平台保持严格相等，并同步 `.buildkite/intel_jobs/entrypoints_intel.yaml`。作者确认没有其它开启中的 PR 触碰该测试。**效果**：+11/-2、2 文件；XPU（B60）上该用例 2 passed，`ruff check` 与 `ruff format` 通过。",
+      "sig": "sig-ci",
+      "sig_reason": "只为消掉 XPU 上的 flaky 断言（并调 Intel CI 作业文件），不改被测行为。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "test",
+        "flaky-test",
+        "xpu",
+        "tool-call",
+        "streaming"
+      ],
+      "pr_number": 62638
+    },
+    {
+      "sha": "90c4a1a73eecea0428ee4303ad96c9fdeaac3f80",
+      "comment": "**背景**：以 `load_format=\"dummy\"` 启动引擎时，处理器派生的图像归一化常数会被 dummy 初始化覆盖——`FusedMMInputNorm` 用 buffer 编码 `weight = rescale_factor / image_std` 与 `bias = -image_mean / image_std`，而默认注册的 buffer 是 persistent 的，dummy 权重化会把它们当作参数重写；Qwen3-VL 路径自 #51289 起使用该归一化模块。作者检索 dummy normalization、`FusedMMInputNorm`、`mm_input_norm` 未发现既有 issue 或开启中的 PR。**方法**：把 `weight` 与 `bias` 改为 `register_buffer(..., persistent=False)`，使 dummy 初始化不再触碰它们，从而保留处理器给出的 rescale、mean、std 变换；并在既有归一化测试套件里加一个直接打 `DummyModelLoader` 的回归，校验 buffer 值不变以及对全部 uint8 像素值归一化正确。**效果**：+33/-3、2 文件（`vllm/model_executor/layers/fusion/mm_input_norm.py` 与 `tests/model_executor/layers/test_mm_input_norm.py`）。CUDA GPU、Python 3.12、PyTorch 2.13.0+cu132 下：新回归在修复前失败（三个 scale 值都被覆盖），修复后整个图像归一化套件 30 passed；Qwen3-VL-4B-Instruct 开设备侧归一化的 BF16 图像 PPL 为 11.970688 对参考 11.916607（差 0.453829%，在 1% 容差内，用真实 checkpoint）；mypy 与 test tethering 等适用 pre-commit 通过。作者注明完整的 trainer 到 engine 权重同步未覆盖，回归由既有的 Model Executor CI 套件承接。",
+      "sig": "sig-core",
+      "sig_reason": "主旨是 `load_format=\"dummy\"` 的模型加载语义（core 的 model loading），多模态归一化只是受害模块。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-loading",
+        "dummy-weights",
+        "multimodal",
+        "image-normalization",
+        "buffer"
+      ],
+      "pr_number": 62767
+    },
+    {
+      "sha": "550c1cbb8b0a366f1bb2b5aea560a1d8e70f04cb",
+      "comment": "**背景**：混合模型的 KV offload 事件流里，recurrent-state 的 placeholder 事件丢掉了 cache group 的分类信息，下游消费者无法把它与畸形的 FullAttention 事件区分开。**方法**：`OffloadingEventsTracker` 的构造函数接收可选的 `group_specs` 并持有（注释强调这份静态分类描述的是事件形状、不是驻留状态，reset 后仍保留、也不断言前缀驻留）；构造 placeholder 的 `BlockStored` 时补上 `kv_cache_spec_kind` 与 `kv_cache_spec_sliding_window`，且只在 self-describing 契约开启时附带（legacy placeholder 仍只带 group_idx 与 hash 以保持兼容）；scheduler 侧让 group specs 跨 tracker reset 保留，包括 store 之前就发生移除的情形。不发明 token id、也不伪造非零 block size，FullAttention 的 payload 构造与未知 group 的行为都不变。**效果**：+54/-3、4 文件（`kv_connector/v1/offloading/events.py` +20/-2、`scheduler.py` +8、`tests/v1/kv_connector/unit/offloading_connector/test_events.py` +28 与 scheduler 用例一处）。CPU 验证为 30 个事件测试加 1 个 scheduler 回归（`partial_tail_store_uses_attention_and_recurrent_cow_sources`，在未打补丁的 main 上失败）通过，四个依赖离线模型配置的测试被 deselect，ruff 与空白检查通过。更早一次 vLLM 与 Dynamo 配对的冒烟中 12 条请求完成、四条首次使用的接收方各拿到 32,000 个 cached token 且无 quarantine 或重启，但那是 rebase 之前的运行，本 PR 只声明 CPU 验证、不含 failover 或性能结论；Dynamo 侧配套 ai-dynamo/dynamo#15535。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "KV connector 与分层 offload 的事件契约（KV events），面向跨系统消费方。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "kv-events",
+        "hybrid-cache",
+        "self-describing",
+        "recurrent-state"
+      ],
+      "pr_number": 59703
+    },
+    {
+      "sha": "40210d8317bbad8d05124b260e75677daf33e091",
+      "comment": "**背景**：如果启动 EngineCore 的进程已经跑过多线程的 torch CPU 算子，被 fork 出的 EngineCore 可能在启动期死锁——根因是 libgomp 没有 fork handler，子进程继承不到可用的 OpenMP 运行时。这正是 scheduled full builds 自 build 96139（另见 96247）以来 `(H200 MIG 35GB) Language Models (Extended Pooling) Shard 2/4` 挂住的原因，也很可能解释了 #50130、#50560 以及若干 `tests/plugins_tests` offline runner 用 `default_torch_num_threads=1` 绕过的未知挂起。**方法**：`get_mp_context()` 在 `VLLM_WORKER_MULTIPROC_METHOD` 为 fork 时调用新增的 `_release_libgomp_threads()`——用 `find_loaded_libraries(\"libgomp\")` 找到已加载的 libgomp，逐个以 ctypes 调 `omp_pause_resource_all(2)`（OpenMP 5.0 的 `omp_pause_resource_t` 硬暂停值），把空闲 worker 线程 join 掉，子进程因此从全新的 OpenMP 线程池起步、父进程在下一个并行区自行重建；找不到库、无该符号或非 libgomp 运行时静默跳过。顺带把 `decorate_logs` 里仅为取当前进程名的 `get_mp_context().current_process().name` 改成 `multiprocessing.current_process().name`，避免这条纯读名字的调用触发暂停。**效果**：+55/-5、2 文件。GB300（aarch64）单卡、torch 2.13.0+cu132 及其自带 `torch/lib/libgomp.so.1`、未开 kernrec 下：`test_bge_m3.py` 后接 `test_colbert.py::TestColbertSharedEngine`（`automatic_shard` 现在这样分组）从挂到 900 s 超时（py-spy 显示 EngineCore 打印 `Using V2 Model Runner` 之后停在 libgomp）变 36 passed in 3m35s；新增的 `tests/utils_/test_system_utils.py::test_forked_child_can_use_openmp_after_parent_did` 从 60 s join 超时失败变为通过、整个文件约 5 s 跑完。`spawn` 模式、非 Linux 平台与其它 OpenMP 运行时行为不变。",
+      "sig": "sig-core",
+      "sig_reason": "落点是 `vllm/utils/system_utils.py` 与引擎子进程的 fork 语义（core 引擎进程模型），修 CI 挂起只是发现渠道。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "multiprocessing",
+        "fork",
+        "libgomp",
+        "openmp",
+        "deadlock",
+        "engine-core"
+      ],
+      "pr_number": 62884
+    },
+    {
+      "sha": "4a3ee9a0f6a2958f2712ceb3c9f60fe48cd764b3",
+      "comment": "**背景**：#48952 之后，Cosmos3-Edge（`Cosmos3EdgeConditionalGeneration`）的统一 checkpoint 格式仍缺 ModelOpt FP8 支持——ModelOpt 原生产出的 checkpoint 会带 `.input_quantizer.`、`.weight_quantizer.`、`.output_quantizer.` 这些供 diffusers 与 transformers 读取的参数，而 vLLM 改读 `weight_scale` 与 `input_scale`，于是 `AutoWeightsLoader` 会因这些多余张量报错。**方法**：在 `vllm/model_executor/models/cosmos3_edge.py` 的权重映射里把这三个前缀显式映射为 None 丢弃（带注释说明这是 ModelOpt 原生方言），并在 `tests/models/multimodal/test_mapping.py` 加 mapper 单测。**效果**：+45/-0、2 文件；`test_cosmos3_edge_modelopt_quantizer_weights_mapper` 在更新映射后通过，`vllm serve` 加载量化后的 Cosmos3-Edge 不再抱怨多余张量。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是 ModelOpt FP8 checkpoint 的量化权重映射与加载（SIG Quantization 明确覆盖 ModelOpt 集成），Cosmos3-Edge 只是承载模型，故推翻 sig-omni 提示。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "modelopt",
+        "fp8",
+        "weight-mapping",
+        "quantized-checkpoint",
+        "cosmos3-edge"
+      ],
+      "pr_number": 57393
+    },
+    {
+      "sha": "fc84883989269c6d7cfd1281b1c35af584ad95d8",
+      "comment": "**背景**：`check-agent-files` 这个 pre-commit 钩子虽然通过，但对三个 skill 打出 advisory note，说它们的 description 没写什么时候该用（`debug-ima`、`kernel-microbenchmark`、`triton-kernel-writing`）。**方法**：各在该 skill 的 description 里补一句以 Use when 开头的适用场景，不改其它内容。**效果**：+3/-3、3 文件；`python tools/pre_commit/check_agent_files.py` 退出 0 且不再输出 note。",
+      "sig": "other",
+      "sig_reason": "只是 `.agents/skills` 元数据文案，属仓库自有的 agent 工具杂物，不归任何功能 SIG。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "agent-skills",
+        "pre-commit",
+        "docs"
+      ],
+      "pr_number": 60284
+    }
+  ]
+}
