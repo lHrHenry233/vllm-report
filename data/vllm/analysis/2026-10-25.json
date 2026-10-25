@@ -1,0 +1,179 @@
+{
+  "date": "2026-10-25",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-10-25T16:26:00+08:00",
+  "daily_summary": "轻量的一天（11 条），主线集中在 RL 权重换入换出的链路上：#63460 把 dense 与 sparse 两个 NCCL trainer 各自复制的初始化握手（side thread 提交 worker init RPC、同步开 trainer endpoint、再取回 future 的异常）抽成 `nccl_common.py` 的 `run_trainer_rendezvous()` 与 `build_worker_init_payload()`，并补上并发/错误传播/子类钩子的用例；#63457 沿 #30679 把同目录里与后端无关的 `torch.cuda.*` 调用换成 `torch.accelerator.*` 与 `torch.Event`，但作者自述这是 draft——pytest 因 Windows 缺 uvloop 连 conftest 都没加载，没跑过任何 GPU 传输测试。 kernel 与 worker 侧的性能有两条硬数据：#62698 把 MRV2 的 `_apply_write_kernel` 从「一次 staged write 一个 program、内部按 1024 元素循环」改成「每个 chunk 一个 program」，GB200 上 1×128K staged write 76.32 到 2.46 µs（31 倍）、1×855K 443.42 到 3.71 µs（120 倍），DEP decode 里 admit 请求的 rank 从落后中位 252 µs 变成与无 admission 时同量级；#62102 给 `concat_and_cache_mla` 与融合 norm-rope kernel 加 skip_scale（FP8 缓存且 k_scale 为 1.0 时不再 load scale 也不做除法），标题称 GLM-5.3 在 B300 上 E2E TPOT 提升 1.2%~3.0%、AIME25 分数不变。 配置层的两条都关乎启动即失败：#63496 把只在 Step5 模型构造里生效的「LoRA 配 deep_gemm_mega_moe 报错」上移为 `LoRAConfig.verify_with_kernel_config()`，覆盖全部 MegaMoE 后端与 `aiter_mega_moe`；#58466 摘掉 `VllmConfig` 里 batch-sharded sampling 与 adaptive verification 的互斥 blocker，靠预算 binding 时把 admitted draft 数异步 D2H 给 host 组 shard plan（代价是 sample() 多一次 host 等待，DeepSeek-V4-Flash 并发 1 约 0.05 ms/step）。 工程面还有 #51974 把 `profiler_kwargs` 从 HTTP `/start_profile` 一路打通到 worker 的 `TorchProfilerWrapper`、#63423 只实现 warning 阶段的 LMFE 结构化输出后端弃用（v0.35.0 移除），以及三条依赖与 CI 的小动作（DeepGEMM pin 前进、FlashInfer 0.7.2.post1、recipes 预览改为 push 触发）。",
+  "sig_summaries": {
+    "sig-rl": "2 条都在权重传输引擎的初始化与设备抽象上：#63460 把 dense `NCCLTrainerWeightTransferEngine` 与 `SparseNCCLTrainerWeightTransferEngine` 重复的 trainer 握手收敛到 `nccl_common.py` 的 `run_trainer_rendezvous()`（`ThreadPoolExecutor(max_workers=1)` 提交 worker init、trainer 侧同步开 endpoint、再 `future.result()` 让推理侧错误照常抛出）与 `build_worker_init_payload()`（dense 显式传自己 packed 三元组、sparse 保留 unpacked 默认），dense 另把 endpoint 创建收进 `_open_trainer_endpoint` 实例钩子，payload 字段、非 sender 提前返回、communicator 赋值、executor 等待全部不变，发送/接收/rank 计算/shutdown 未动（+165/-55、4 文件，新增 rendezvous 并发与双侧错误传播、packed 参数化、仅 sender 派发钩子的用例；作者只做 Windows CPU 隔离验证，59 passed、8 skipped）；#63457 把同目录 6 个文件里与后端无关的 `torch.cuda.is_available` / `synchronize` / `current_stream` / `set_device` 换成 `torch.accelerator.*` 与 `torch.Event`（含 sharded-RDT 的 slot 读完成事件与量化依赖），保留 NCCL 流接口与 CUDA IPC 行为，但自述为 draft、未跑任何 GPU 测试与评测。",
+    "sig-model-performance": "3 条：两处写入路径的 kernel 并行度/冗余计算加一条 DeepGEMM pin。#62698 让 MRV2 的 `_apply_write_kernel` 按 1024 元素 chunk 开 program（host 侧用 `_staged_write_max_len` 算 grid），长 prompt 的 `all_token_ids` staged write 不再挤在一个 SM 上：GB200 微基准 1×8K 3.1 倍、1×32K 9.6 倍、1×128K 31.0 倍（76.32 到 2.46 µs）、1×855K 119.5 倍（443.42 到 3.71 µs），decode step 与 block table 的小写入不退化，DEP32 BS64 里 98 步有 90 步 admit rank 最晚到第一个 MoE、落后中位 252 µs，改后 DEP8 BS64 有 admission 时仅 73 对 63 µs；顺带在既无 prefix caching 又无 metrics collector 时去掉 `BlockPool.get_new_blocks` 的 per-block 检查（4000 blocks 616 到 528 µs）。#62102 给 `concat_and_cache_mla_kernel` 加 `skip_scale` 模板参数（非 kAuto 时直接以 1.0 做 `fp8::scaled_convert`，不再 load `*scale`），由 `MLAAttention` 仅在 FP8 系 kv_cache_dtype 且 `_k_scale_float == 1.0` 时开启，同一 constexpr 也进 Triton 的 `_fused_norm_rope_kernel`，C++/torch_bindings/_custom_ops 与各调用点跟着补参数，标题称 B300 上 GLM-5.3 TP4+MTP5 的 E2E TPOT 提升 1.2%~3.0%、AIME25 与 main 同为 0.8333。#63253 把 `_DEEPGEMM_UPSTREAM_TAG` 从 727f847082 前进到 082003075694，注释补上新带来的 `fp4_fp4_mega_moe` 与 Muse Spark Open 需要的 fused post-expert RMSNorm（DeepGEMM#39）以及 MX MegaMoE alignment 修复（DeepGEMM#43），ABI 口径不变。",
+    "sig-core": "3 条都是配置层与入口层：#63496 在 `LoRAConfig` 新增 `verify_with_kernel_config()`，命中 `MEGA_MOE_BACKENDS`（`NATIVE_MEGA_MOE_BACKENDS` 的 deep_gemm_mega_moe 加 FlashInfer 的 MoE EP megakernel 变体）或 `aiter_mega_moe` 时直接抛 `ValueError`，由 `VllmConfig` 在既有 `verify_with_model_config` 之前调用，并删掉 Step5 NVIDIA 模型里那段只护一个模型、只认一个后端的重复检查（+11/-7、3 文件，无新增测试）。#51974（合并后的增量实测只新增 `profiler_kwargs` 一条字段，父提交里 `profile_prefix` / `delay_iterations` / `max_iterations` 与请求体解析已存在）把 `StartProfileRequest.profiler_kwargs` 经 `EngineClient` / `EngineCoreClient` 的 Inproc、SyncMP、AsyncMP 三条路径、`EngineCore.profile`、`Executor.profile`、worker 与 `create_worker_profiler` 全链路透到 `TorchProfilerWrapper`，后者拆出 `_base_profiler_kwargs` 与会话级覆盖并新增 `WorkerProfiler.set_profiler_kwargs()`（会话 active 时不动、重建时保留 `on_trace_ready`），使 `record_shapes` / `with_stack` 这类昂贵选项以及 TPU/XPU 插件参数可在不重启服务的前提下逐会话打开（+105/-17、17 文件，含 profiling 文档的 curl 示例）。#63423 实现弃用的 warning 阶段：`StructuredOutputsConfig` 校验时对 `lm-format-enforcer` 走 `logger.warning_once` 带上 v0.35.0 与迁移链接、backend docstring 同步标注、feature 文档补迁移说明，选择逻辑与解码行为不变。",
+    "sig-spec-decode": "1 条：#58466 摘掉 `VllmConfig` 里「batch-sharded sampling 不支持 adaptive verification」的 15 行 blocker。根因是批分片用 host 侧逐请求 logits 数 `cu_num_logits_np` 定 `all_to_all_single` 的 split 与 buffer，而 adaptive verification 在 device 上决定 draft 预算切分，预算 binding 后 host 只有 scheduled 上界、device 的 `cu_num_logits` 才是 admitted 值，shard plan 与实际行错位。改法是 `AdaptiveVerificationManager` 新增 `copy_admitted_drafts_to_host`（仅在 batch sharder 存在时打开），预算 binding 时用专用 copy stream 把 capacities 异步 D2H 到 pinned int32 buffer 并 record blocking event，包成 `AdmittedDraftCounts` 经 `reallocate_drafts` 的第四个返回值进 `InputBatch.num_admitted_draft_tokens`；`BatchSharder.shard_sampler_inputs` 先 `wait()` 再按 `diff(cu_num_logits_np) - num_draft_tokens_per_req + admitted` 组 plan，使 lm_head GEMM、all-to-all 与 sampler 只跑真正被 verify 的行，不 binding 时不拷贝，budget 为 0 时每 rank 跑与复制路径相同的 sampler。代价是 `sample()` 里多一次 host 等待（只阻塞 CPU、base model forward 已排在其后，但限制了 CPU run-ahead，DeepSeek-V4-Flash 并发 1 约 0.05 ms/step，forward 越长占比越小）；替代方案是把每 rank 段 pad 到 scheduled counts，省掉等待却对 padding 行也跑一遍。",
+    "sig-ci": "3 条：一条 workflows、两条 pin。#63259 新增 `.github/workflows/recipes-preview.yml`（+69、1 文件、单个 dispatch job），在 `pull_request_target` 的 opened/synchronize/reopened/closed 且路径限 `recipes/**` 时发 `repository_dispatch: preview-pr` 带 PR 号、push 到 main 触及 `recipes/**` 时发 `recipes-updated` 让 recipes 仓库立刻跑 `bump-sources`，取代 GitHub 会晚数小时的定时轮询；job 的 `recipes-preview` environment URL 即预览地址以便 PR 出现 View deployment 按钮。安全性上该 workflow 从不 checkout 或执行 PR 代码，唯一外传的是经 `^[0-9]+$` 校验的 PR 号，PR 可控字符串（标题、分支名）不进 shell，token 是只在 recipes 仓库安装、`contents: write` 权限的 GitHub App 短时 installation token（`actions/create-github-app-token` pin v3.2.0，密钥限在该 environment）。#63466 把 `requirements/cuda.txt` 的 flashinfer-python 从 0.7.2 提到 0.7.2.post1（+1/-1、1 文件），相邻的 torch 2.11.0 家族、apache-tvm-ffi、tilelang pin 不变，描述是空模板。"
+  },
+  "commits": [
+    {
+      "sha": "c9dbc92630bc837ec666f68dab02853fa095c8ab",
+      "comment": "**背景**：dense 的 `NCCLTrainerWeightTransferEngine` 与 `SparseNCCLTrainerWeightTransferEngine` 各自复制了同一套 trainer 初始化握手——先用 `ThreadPoolExecutor(max_workers=1)` 把 worker 侧 `init_weight_transfer_engine(payload)` 甩到 side thread（推理 worker 会阻塞在这里等 NCCL rendezvous，两侧必须同时进），同时在当前线程以 rank 0 打开 trainer endpoint，再 `future.result()` 把推理侧的初始化错误带回来；worker 的 init info（`rank_offset=1` 等字段）也各拼一遍。**方法**：在 `vllm/distributed/weight_transfer/nccl_common.py` 新增两个共享件——`run_trainer_rendezvous(*, init_worker, init_trainer)` 包住上述线程与等待顺序，`build_worker_init_payload(init_info, *, packed=False, packed_buffer_size_bytes=DEFAULT_PACKED_BUFFER_SIZE_BYTES, packed_num_buffers=DEFAULT_PACKED_NUM_BUFFERS)` 统一构造并序列化（dense 的 `_build_worker_init_payload` classmethod 显式传自己 init_info 里的 packed 三元组，sparse 保留 unpacked 默认），dense 另把 endpoint 创建收进实例钩子 `_open_trainer_endpoint()`（sparse 走 `setattr` 的 lambda）。payload 字段与默认值、非 sender 的提前返回、communicator 赋值、异常传播、executor 退出等待都不变，发送/接收/rank 计算/shutdown 未动。测试新增 `test_nccl_trainer_rendezvous_runs_concurrently_and_waits_for_worker`（断言 worker 在另一线程、trainer 在主线程且完成时 worker 未结束）、`failure_side` 为 worker/trainer 两向的错误传播用例（`exc_info.value is error` 且 worker 已退出）、`packed` True/False 参数化的 dense payload 用例、以及 `rank` 0/1 参数化的「子类钩子只在 sender 上派发」（`_build_worker_init_payload` 改端口与 `_open_trainer_endpoint` 覆盖 group 的调用顺序断言）。**效果**：+165/-55、4 文件，去掉两份重复实现并保留可覆写的 engine 初始化钩子。作者称在合入上游 `main`（`cba669d45d`）后于 Windows / Python 3.12 / PyTorch 2.13.0+cpu 用本地未跟踪的 runner 跑 `test_weight_transfer.py` 与 `test_weight_transfer_nccl_uid.py` 的 nccl 用例得 59 passed、8 skipped、83 deselected（8 个 skip 是该 CPU-only 主机上的既有 GPU 用例），并明确这是隔离的 CPU 验证、不是完整套件跑通；该 runner 用 `--noconftest` 直接加载真实 leaf 模块以绕开无关的模型加载初始化，不替换引擎实现或测试函数。复现脚本在截断处之后，详见原文。",
+      "sig": "sig-rl",
+      "sig_reason": "标题带 [RL]，改的是 RL trainer 与推理 worker 之间的 NCCL 权重传输引擎初始化握手（tests/distributed/weight_transfer），与 #62555、#51520 一族同属权重换入换出链路，而非通用并行/服务面。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "weight-transfer",
+        "rl",
+        "nccl",
+        "rendezvous",
+        "tests"
+      ],
+      "pr_number": 63460
+    },
+    {
+      "sha": "57ab2f35ac6e7207bd71cf6cad17b31705f03cd3",
+      "comment": "**背景**：`vllm/distributed/weight_transfer` 里大量与后端无关的操作仍写死 CUDA API——可用性判断、选设备、同步、取当前流；#30679 之后 vLLM 已有统一加速器 API 的既有用法，本 PR 把该目录补齐。**方法**：17 处一对一替换（已用 `git show` 核实）——`ipc_engine.py` 在 `all_gather_object` 加 barrier 之后改用 `torch.accelerator.synchronize()`；`nccl_engine.py` 的等待改成 `torch.accelerator.is_available()` 加 `torch.accelerator.current_stream().synchronize()`；`packed_tensor.py` 的 `packed_nccl_broadcast_consumer` 用 `torch.accelerator.current_stream()` 取 caller stream，`packed_ipc_producer` 两处排空拷贝改用 `torch.accelerator.current_stream().synchronize()`；`sharded_rdt_engine.py` 的 `_slot_read_done` 从 `torch.cuda.Event` 换成 `torch.Event`（注释同步），proc worker 改用 `torch.accelerator.set_device_index(self.device.index)`；`sharded_rdt_trainer.py`、`sparse_nccl_engine.py` 同类替换。保留传给 CUDA 专属通信接口的 NCCL 流接口、CUDA IPC 行为以及流级同步边界。**效果**：+17/-17、6 文件，纯 API 迁移，不声明任何输出质量、性能或新后端支持的结论。作者自述这是 draft：Windows 加 PyTorch 2.13.0+cpu 上 `ruff-check` / `ruff-format` 与 `check_torch_cuda.py`、`check_spdx_header.py`、`check_init_lazy_imports.py`、`check_forbidden_imports.py`、AST 语法检查、`git diff --check` 通过；但想跑的 `test_packed_tensor.py`、`test_sharded_rdt_plan.py`、`test_sharded_rdt_trainer.py`、`test_sharded_rdt_producer.py` 因该环境缺 `uvloop` 而在加载仓库 conftest 时就失败、测试根本没执行，完整 pre-commit 又被缓存权限与 Git Bash 的 `NtCreateDirectoryObject` 失败挡住、mypy hook 无法初始化（commit hooks 在跑完可用检查后被绕过，含 DCO sign-off）；未做 GPU 传输测试与模型评测，仍待人工逐行 review 与硬件验证。已有统一 API 用法的证据链接指向上游 `7a64fb8fc9`，其后的清单在截断处之后，详见原文。",
+      "sig": "sig-rl",
+      "sig_reason": "标题虽是 [Hardware]，改动全部落在 RL 权重传输引擎（weight_transfer 六个文件）的后端无关调用上，与同日 #63460 同链路，属权重换入换出而非硬件适配新后端。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "weight-transfer",
+        "hardware-abstraction",
+        "portability",
+        "draft"
+      ],
+      "pr_number": 63457
+    },
+    {
+      "sha": "d4d647b2b52d5e15ee1427de0effecd474430972",
+      "comment": "**背景**：PR 描述是空模板（Overview、Claims、Validation、Details 全空，checklist 也未勾选），改动以 diff 为准（已用 `git show` 核实）——需要把树内构建所用的 DeepGEMM fork pin 前进一个提交。**方法**：单文件 `cmake/external_projects/deepgemm.cmake`，`_DEEPGEMM_UPSTREAM_TAG` 从 `727f847082d2e7946f70dc02b94949db206310d3` 改为 `0820030756945b2daec208e8e8255268360f337d`，并把注释里已随附能力的清单续写上新增部分：在原有 SM120 port、SM90 paged-MQA 的 kv_block=32/next_n=4 port、可配置 SwiGLU alpha/beta、FP8/FP4 Mega MoE 的 SiTU、NVFP4 Mega MoE、BF16/FP8/NVFP4 Mega MoE 的 swiglustep 与 FP8 einsum 输出的 F8_128x4 SFs（vllm-project/DeepGEMM#40）之外，加上 `fp4_fp4_mega_moe` 与 Muse Spark Open 需要的 fused post-expert RMSNorm（vllm-project/DeepGEMM#39）、以及 MX MegaMoE 的 alignment 修复（vllm-project/DeepGEMM#43）；ABI 口径不变，仍是 PyTorch 2.11 stable ABI 加 CPython 3.10 limited API。**效果**：+5/-2、1 文件，只动外部依赖的构建 pin，没有 vLLM Python 侧改动；新 kernel 的实际收益、验证方式与跑过的测试在描述里全是空的，故性能结论无法从 PR 得到，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "pin 前进的目的写在注释里：取 MegaMoE 的 fp4_fp4 变体、fused post-expert RMSNorm 与 MX 对齐修复，服务的是 MoE kernel 能力与性能，而非 CI 基础设施本身。",
+      "tags": [
+        "dependency",
+        "low-risk",
+        "build",
+        "deepgemm",
+        "moe",
+        "megakernel"
+      ],
+      "pr_number": 63253
+    },
+    {
+      "sha": "8e11a8a49e11b2f0825be7b3c2434bcf23d7f87b",
+      "comment": "**背景**：MegaMoE 的 megakernel MoE 后端不支持 LoRA，但这条约束此前只写在 Step5 的 NVIDIA 模型构造里（`vllm/models/step5/nvidia/model.py` 判 `lora_config is not None` 且 `kernel_config.moe_backend == \"deep_gemm_mega_moe\"` 就抛 `ValueError`），既只护得住这一个模型，也只认 DeepGEMM 那一个后端。**方法**（已用 `git show` 核实，PR 描述是空模板）：`vllm/config/lora.py` 新增 `LoRAConfig.verify_with_kernel_config(kernel_config)`，当 `moe_backend` 命中 `MEGA_MOE_BACKENDS`（由 `NATIVE_MEGA_MOE_BACKENDS` 的 `deep_gemm_mega_moe` 与 FlashInfer 的 MoE EP megakernel 变体合成）或等于 `aiter_mega_moe` 时抛 `ValueError`，文案为 LoRA is not supported with moe_backend=…、请关闭 LoRA 或改选支持 LoRA 的 MoE backend；`vllm/config/vllm.py` 在 `self.lora_config is not None` 分支里、既有 `verify_with_model_config` 之前调用它，并删掉模型侧那段重复检查。**效果**：+11/-7、3 文件（lora.py +10、vllm.py +1、step5 model.py -7），把拒绝时机从模型构造提前到配置校验阶段，覆盖全部 MegaMoE 后端而不再只有 DeepGEMM 一个，报错口径统一到一处；本 PR 未附带新测试，描述里的动机与验证段落是空的，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 `LoRAConfig` 与 `VllmConfig` 的校验时机与覆盖面（配置层拒绝），模型代码只是被清掉重复检查，主旨不在 MoE kernel 本身。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "config-validation",
+        "lora",
+        "moe",
+        "megakernel"
+      ],
+      "pr_number": 63496
+    },
+    {
+      "sha": "fc2b6ab45ed3e498b52d74fd880a8b40a65ba3a7",
+      "comment": "**背景**：MRV2（`vllm/v1/worker/gpu`）的 `StagedWriteTensor` / `FusedStagedWriter` 在 `_apply_write_kernel` 上以 grid `(n,)` 启动——一次 staged write 一个 program，program 内部再对 1024 元素分块循环，所以把一个刚被 admit 的长 prompt 写进它的 `all_token_ids` 行只用到一个 SM；另外 `BlockPool.get_new_blocks` 即使既没开 prefix caching 也没有 metrics collector，仍要做 per-block 检查。**方法**：host 侧在 `stage_write` 时记录单次写入的最大元素数 `_staged_write_max_len`（用 `cu_len - prev_len` 更新，`stage_write_elem` 记 1），launch 改为 `_apply_write_kernel[(n, _num_write_chunks(self._staged_write_max_len))]`，即每个 1024 元素 chunk 一个 program（`BLOCK_SIZE` 提为模块级 `_WRITE_BLOCK_SIZE = 1024`）；同时在无 prefix caching 且无 metrics collector 时走 `get_new_blocks` 的免检查路径。新增 `test_block_tables_fused_write_spans_multiple_chunks`：一个 2500 元素（跨多 chunk）的 fused write 经 `apply_staged_writes()` 与 `torch.accelerator.synchronize()` 后与 host 列表逐元素相等，并在既有 fuses-kv-groups 用例里断言 `_staged_write_max_len == 0` 的初始状态。**效果**：+45/-10、2 文件。GB200 上 FlashInfer CUPTI 微基准（int32，先把新旧 kernel 输出比相等再计时）：1×8K 7.04 到 2.24 µs（3.1x）、1×32K 20.94 到 2.18（9.6x）、1×128K 76.32 到 2.46（31.0x）、1×855K 443.42 到 3.71（119.5x）、1×128K 加 63×1 token 混合 75.20 到 5.94（12.7x），decode step 的 256×1 与 block table 的 256×8 从 2.82/2.78 到 2.30/2.32（1.2x，小写入不退化）。服务侧：DEP decode 每个 admission 都在 admit 的那个 rank 上、且紧贴其 forward 之前跑这次拷贝，使它成为整 step 的 straggler——DeepSeek V4.1 Flash、P/D decode 实例、DEP32 BS64、128K prompt 时 98 步里有 90 步它最晚到达第一个 MoE、比中位 rank 落后 252 µs（无 admission 的步是 46 µs）；作者称其内部同 kernel 分支上本改动把「有 admission 时最后 rank 落后中位」从约 200 µs 降到约 10 µs 量级（DEP8 BS64：73 µs 对 63 µs）。`BlockPool` 的 `get_new_blocks` 加 `free_blocks` 在 4000 blocks、`enable_caching=False`、无 metrics、NUMA pin 到 GB200 Grace 的进程内 CPU 微基准上从 616 到 528 µs。BlockPool 段与更多上下文在截断处之后，详见原文。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 staged write Triton kernel 的并行度与 BlockPool 的 CPU 开销，收益是 µs 级时延与 DEP straggler 收敛，不是 worker 功能正确性。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "triton-kernel",
+        "mrv2",
+        "staged-write",
+        "block-pool",
+        "dep"
+      ],
+      "pr_number": 62698
+    },
+    {
+      "sha": "71a82756040a31849623e720e039a83857b4b562",
+      "comment": "**背景**：recipes 站点（vllm-project/recipes）靠定时轮询感知 vLLM 仓库里 `recipes/` 的变化，而 GitHub 的 schedule 常常晚几个小时才触发，导致配方 PR 预览滞后、recipes.vllm.ai 合并后迟迟不同步。**方法**：新增 `.github/workflows/recipes-preview.yml`（+69、1 文件），单个 `dispatch` job 两类事件——`pull_request_target` 在 opened、synchronize、reopened、closed 且路径限 `recipes/**` 时发 `repository_dispatch: preview-pr` 带 PR 号（接收侧 vllm-project/recipes#1169 等两分钟、更新的 push 会取消等待，然后重建该 PR 的预览分支、PR 关闭时删除）；push 到 `main` 且触及 `recipes/**` 时发 `recipes-updated`，让 recipes 立刻跑 `bump-sources`。job 的 `recipes-preview` environment URL 就是该 PR 的预览地址，于是 PR 上出现 View deployment 按钮，预览页 banner 标明渲染的是哪个 commit。安全口径：workflow 从不 checkout 或执行 PR 代码，唯一外传的是经 `^[0-9]+$` 校验的 PR 号，标题与分支名等 PR 可控字符串一律不进 shell 插值（与 vllm-project.github.io 的 `vercel-preview.yml` 同模型）；token 是只装在 vllm-project/recipes、权限 `contents: write` 的 GitHub App 短时 installation token，由 pin 在 v3.2.0 的 `actions/create-github-app-token` 铸造，密钥放在 `recipes-preview` environment 并受限；预览侧渲染用 js-yaml 的 safe load、react-markdown 不开 raw HTML、JSON-LD 做转义。**效果**：每个配方 PR 都能像 Read the Docs 之于文档 PR 一样拿到预览，push 后几分钟内更新、合并后站点即时同步，不再依赖会迟到的轮询；作者未加作者信任检查，理由是 debounce 加「仅在 `recipes/` 变化时重建」已能约束 Vercel 用量。admin 侧配置已完成、可以合并；labels 与预览链接的做法见 #63248，Security 段末尾在截断处之后，详见原文。",
+      "sig": "sig-ci",
+      "sig_reason": "全部改动是一个 GitHub Actions workflow 的触发方式与令牌/权限设计，服务于 recipes 预览与同步流水线，不碰推理代码。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "github-actions",
+        "recipes",
+        "docs-site"
+      ],
+      "pr_number": 63259
+    },
+    {
+      "sha": "4e591657157a021cab997f911d67f50c0d18a71e",
+      "comment": "**背景**：作者希望把结构化输出后端的维护收敛到 XGrammar 与 Guidance（并明确不断言上游 LMFE 项目已停止维护）；`tests/entrypoints/llm/test_struct_output_generate.py` 里既有的 LMFE 生成用例已因上游对不完整 JSON 的支持问题被 skip。提案节奏是 v0.33.0 出 warning、v0.34.0 显式 opt-in、v0.35.0 移除，本 PR 只实现 warning 阶段。**方法**：`vllm/config/structured_outputs.py` 在 `StructuredOutputsConfig` 的 model validator 里对 `backend == \"lm-format-enforcer\"` 走 `logger.warning_once`，文案给出移除版本 v0.35.0、建议改用 auto / xgrammar / guidance，并带上 `docs.vllm.ai` 上 `features/structured_outputs/#migrating-from-lm-format-enforcer` 的迁移链接；backend 字段的 docstring 同步标注弃用。`docs/features/structured_outputs.md`（+21）补迁移说明与 online/offline 两种改法，与 CLI/config 参考一起解释 `auto`、`xgrammar`、`guidance`。既有的 backend 选择逻辑、依赖与解码行为全部不变。**效果**：+35/-1、2 文件，只加一条每进程一次的配置期 warning 与文档。验证：`pre-commit run --files vllm/config/structured_outputs.py docs/features/structured_outputs.md` 全部 applicable hook（含 mypy）通过；经 `EngineArgs.add_cli_args` 到 `from_cli_args` 再到 `create_structured_outputs_config` 的 CLI smoke check 确认 LMFE 仍被接受、warning 含 v0.35.0 与迁移指引、重复配置不重复告警、其他 backend 不告警、compilation hash 不变；`pytest tests/v1/structured_output/test_validation.py tests/engine/test_arg_utils.py -q` 183 passed（14 个上游 Torch deprecation warning）在 35.51 s。未跑模型评测——改动只打日志与改文档，不触碰 token 过滤、backend 选择与生成，因此不声明换 backend 的输出等价性或性能结论；本地文档可发现性 review 通过，线上 docs-preview 与分支发现待发布。Details 段末尾在截断处之后，详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "落点是 `StructuredOutputsConfig` 的校验告警与 feature 文档的后端迁移口径，属引擎配置与文档面，不改采样或后端实现。",
+      "tags": [
+        "deprecation",
+        "low-risk",
+        "structured-outputs",
+        "config",
+        "docs"
+      ],
+      "pr_number": 63423
+    },
+    {
+      "sha": "7050ef881ff0835f6890a47db1859a24c65481d6",
+      "comment": "**背景**：`--enable-batch-sharded-sampling` 与 adaptive verification 此前在 `VllmConfig` 里被硬性拦住（本 PR 删掉那 15 行 blocker，理由是「it does not yet work with adaptive verification, which decides the per-request logits counts on the GPU, where the CPU-side shard plan cannot see them」）。批分片按 host 侧的逐请求 logits 数 `cu_num_logits_np` 来决定 `all_to_all_single` 的 split 与 buffer 大小，而 adaptive verification 把 draft 预算的逐请求切分放在 device 上决定：预算一旦 binding，`cu_num_logits_np` 只剩 scheduled counts（上界），device 的 `cu_num_logits` 才是 admitted counts，host 组出的 shard plan 与 device 实际摆放的行不再对得上。**方法**：`AdaptiveVerificationManager` 新增 `copy_admitted_drafts_to_host`（由 `GPUModelRunner` 仅在 `self.batch_sharder is not None` 时传入），开启时预分配 `max_num_reqs` 大小的 pinned int32 host buffer 与一个 blocking `torch.cuda.Event`；`reallocate_drafts` 在 `0 < draft_budget < int(scheduled_drafts.sum())` 时让 copy stream 先 `wait_stream(current_stream)`，在该 stream 上把 `capacities` 非阻塞拷到 pinned buffer 并 record event，把新增的第四个返回值包成 `AdmittedDraftCounts(cpu, event)`（预算不 binding 时返回 None，host counts 本就精确、什么都不拷）。该对象经 `InputBatch.num_admitted_draft_tokens` 传到 `BatchSharder.shard_sampler_inputs`：先 `wait()`（在 `gpu_sync_allowed()` 上下文里 `event.synchronize()` 再 `numpy()`）取精确 admitted 数，用 `diff(cu_num_logits_np) - num_draft_tokens_per_req + admitted` 得到逐请求 logits 数并据此组 plan，于是 `compute_logits_local` 的 lm_head GEMM、all-to-all 与 sampler 只跑真正被验证的行；原先直接取 `int(cu_num_logits_np[-1])` 的写法被移除。另外本地 draft 数改为跟随 admitted 预算，因此 budget 为 0 时每个 rank 跑的是与复制（非分片）路径完全相同的 sampler。**效果**：+160/-25、8 文件（`spec_decode/adaptive_verification.py` +45、`sample/batch_shard.py` +40、`model_runner.py` +16、`input_batch.py` +7、`config/vllm.py` -15，测试侧 `tests/v1/worker/test_gpu_batch_shard.py` +56、`tests/v1/sample/test_dry.py` 与 `test_gpu_model_runner_v2.py` 小幅跟进），解锁两者组合。Tradeoff 被明说：替代做法是保留 host 的 scheduled counts 并把每个 rank 的段 pad 到该上界，省掉 host 等待但对 padding 行同样要跑 GEMM、all-to-all 与 sampler；本 PR 选择在 `sample()` 里等 admitted counts——只阻塞 CPU（base model forward 本就排在它后面），但限制了 CPU run-ahead（CPU 在 GPU 真正开始第 N 步之前无法 launch 第 N 步的采样），DeepSeek-V4-Flash 并发 1 下约 0.05 ms/step，且 forward 越长占比越小。作者给的实测数字与更多用例在截断处之后，详见原文。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "主旨是让 adaptive verification（投机解码的逐请求 draft 预算机制）能在 batch-sharded sampling 下工作：删掉的 blocker 在 speculative config 的互斥校验里，新增的异步 D2H 与 shard plan 修正都围绕 admitted draft 数，与该机制此前的 #52228 同族。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "spec-decode",
+        "adaptive-verification",
+        "batch-sharded-sampling",
+        "tp"
+      ],
+      "pr_number": 58466
+    },
+    {
+      "sha": "56e4e42868b4652c66cb009928ddcee859b0d3c9",
+      "comment": "**背景**：FP8 的 MLA KV cache 写入路径一律先从 device 读一个 per-tensor `scale` 再做 `fp8::scaled_convert`，即使该 scale 恒等于 1.0，这次读取与除法也要付代价；PR 描述只写了 Skip scale calculation for concat_and_cache_mla 与测试命令，动机细节以 diff 为准（已用 `git show` 核实）。**方法**：`csrc/cache_kernels.cu` 给 `concat_and_cache_mla_kernel` 加 `bool skip_scale` 模板参数，`kv_dt` 非 `kAuto` 且 skip_scale 时走 `fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], 1.0f)`、不再 `*scale`；原 `CALL_CONCAT_AND_CACHE_MLA` 宏拆成 `LAUNCH_CONCAT_AND_CACHE_MLA` 加一层按 `skip_scale` 二选一的分支（并在文件末尾 `#undef` 两个宏），`concat_and_cache_mla` 的 C++ 签名与 `csrc/ops.h`、`csrc/torch_bindings.cpp`、`vllm/_custom_ops.py` 一起补该参数。`vllm/model_executor/layers/attention/mla_attention.py` 只在 `kv_cache_dtype in (\"fp8\", \"fp8_e4m3\", \"fp8_e5m2\") and self._k_scale_float == 1.0` 时置 True；同思路继续进 Triton 的 `_fused_norm_rope_kernel`——新增 `SKIP_MLA_SCALE: tl.constexpr`，FP8 缓存分支里 scale 直接取 1.0（省一次 `tl.load(mla_cache_scale_ptr)`，`kv_c_fp8` 只做 dtype 转换），`vllm/models/deepseek_v32/common/kernels.py` 的 `fused_norm_rope` 加 `skip_scale: bool = False` 形参，`deepseek_v32/amd/rocm.py`、`deepseek_v32/attention.py`、`dots3_note/nvidia/attention.py`、`v1/attention/backend.py`、`backends/mla/amx_mla.py` 与 `cpu_mla.py` 各调用点跟着补齐参数。**效果**：+53/-14、13 文件；标题声明在 Blackwell B300 上 `zai-org/GLM-5.3`（TP4、fastsafetensors、prefix caching、`--max-num-seqs 48`、MTP `num_speculative_tokens=5`）取得 1.2%~3.0% 的 E2E TPOT 提升；AIME25 的 exact_match 为 0.8333±0.0692、与 main 完全一致（无精度损失）。`vllm bench serve`（random in 2 / out 1024、并发 1、32 prompts、temperature 0、ignore-eos、seed 256）本 PR 侧记录 32 successful / 0 failed、输出吞吐 297.03 tok/s；main 的对照数字与被截断的后续表在原文里，详见原文。`tests/kernels/test_fused_deepseek_v32_norm_rope.py` 随签名更新。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 KV cache 写入 kernel 去掉恒等 scale 的 load 与除法带来的 TPOT 收益（CUDA 与 Triton 两侧同时改），不是 MLA 的正确性或新模型接入。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "kv-cache",
+        "fp8",
+        "mla",
+        "kernel",
+        "glm"
+      ],
+      "pr_number": 62102
+    },
+    {
+      "sha": "dd5e754494b48900748044dbd5eaba49d5637841",
+      "comment": "**背景**：profiler 的选项此前在服务器启动时由 `--profiler-config` 静态绑死，想按会话打开昂贵的 torch.profiler 开关（`record_shapes`、`with_stack`、`profile_memory`、`with_flops`、`with_modules`）或下游硬件插件（TPU / XPU）自己的实验性 trace 级别就得重启；父提交里 `/start_profile` 已能接 `profile_prefix`、`delay_iterations`、`max_iterations` 三个字段，本 PR 把请求体继续扩成任意 profiler kwargs 并打通全链路（标题写的是 profile_prefix payload，实现落在其后的动态参数上，已用 `git show dd5e754494^` 核实父提交状态）。**方法**：`StartProfileRequest` 加 `profiler_kwargs: dict[str, Any] | None`（`extra=\"ignore\", strict=True` 不变），端点仍以 `model_dump(exclude_none=True)` 做 `start_profile(**overrides)`，不带这些字段的客户端保持零参调用；`EngineClient.start_profile`、`LLM.start_profile`（连同 docstring）、`EngineCoreClient` 抽象基类与其 InprocClient、SyncMPClient（`call_utility`）、AsyncMPClient（`call_utility_async`）三条 IPC 路径、`llm_engine` / `async_llm` / `core.py` 的 `profile`、`Executor.profile`（`kwargs` 类型放宽为 `dict[str, Any]` 并把 `profiler_kwargs` 一并传下去）、`gpu_worker` 与 `create_worker_profiler` 全部新增该参数。`TorchProfilerWrapper` 把原来的单一 `_profiler_kwargs` 拆成 `_base_profiler_kwargs`（由 `ProfilerConfig` 推出的会话可重建基线）与实例上的会话级覆盖，并给 `WorkerProfiler` 加 `set_profiler_kwargs()`：会话 active 时直接 return，重建时保留现有 `on_trace_ready` 再 update 传入的 kwargs。**效果**：+105/-17、17 文件，无需重启即可逐次会话覆盖原生与硬件插件的 profiler 选项；`docs/contributing/profiling.md` 的 curl 示例补上 `profiler_kwargs`（`record_shapes`、`with_stack`），`docs/serving/offline_inference.md` 与 `docs/serving/online_serving/README.md` 同步；测试更新覆盖 `tests/entrypoints/serve/test_profile_api_router.py`、`tests/v1/engine/test_async_llm.py`（+25 区段）、`test_llm_engine.py`（+15）与 `tests/v1/worker/test_gpu_profiler.py`（+13）。PR 描述的 Proposal 与实现清单在第 2 点（Engine Core 与多进程 IPC 转发）之后被截断，后端插件侧的具体约定详见原文。",
+      "sig": "sig-core",
+      "sig_reason": "改动贯穿入口 API、EngineClient/IPC、executor 与 worker profiler 的通用管线，目的是可观测性易用，不涉及并行策略或模型性能。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "profiling",
+        "entrypoints",
+        "ipc",
+        "docs"
+      ],
+      "pr_number": 51974
+    },
+    {
+      "sha": "e7473bf6862289f0647d1f4b01498288b181e063",
+      "comment": "**背景**：PR 描述是空模板（Overview、Claims、Validation、Details 全空，checklist 未勾选），改动以 diff 为准（已用 `git show` 核实）。**方法**：`requirements/cuda.txt` 单行把 `flashinfer-python==0.7.2` 提到 `==0.7.2.post1`，相邻的 torch 2.11.0 家族、`torchcodec >= 0.14`、`PyNvVideoCodec==2.0.4`、`apache-tvm-ffi==0.1.11`、`tilelang==0.1.12` 等 pin 均不变。**效果**：+1/-1、1 文件的依赖版本前进；升级要修的具体问题与验证结果在描述里没有写，无法据此判断收益，详见原文。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 requirements/cuda.txt 的一行 pin、无代码与 kernel 改动，与 #63080 一类依赖升级同归构建/依赖管理；描述未说明为新特性。",
+      "tags": [
+        "dependency",
+        "low-risk",
+        "flashinfer",
+        "build"
+      ],
+      "pr_number": 63466
+    }
+  ]
+}

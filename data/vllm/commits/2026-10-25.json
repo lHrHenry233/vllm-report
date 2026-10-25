@@ -1,0 +1,622 @@
+{
+  "date": "2026-10-25",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "c9dbc92630bc837ec666f68dab02853fa095c8ab",
+      "author": {
+        "name": "Ronald",
+        "email": "ronaldautomobile@163.com"
+      },
+      "date": "2026-10-25T11:11:08+08:00",
+      "message": "[Refactor][RL] Share NCCL trainer rendezvous initialization (#63460)\n\nSigned-off-by: Ronald1995 <ronaldautomobile@163.com>",
+      "parents": [
+        "57ab2f35ac6e7207bd71cf6cad17b31705f03cd3"
+      ],
+      "stats": {
+        "total_additions": 165,
+        "total_deletions": 55,
+        "files_changed": 4
+      },
+      "files": [
+        {
+          "filename": "tests/distributed/test_weight_transfer.py",
+          "status": "modified",
+          "additions": 101,
+          "deletions": 11,
+          "patch": "@@ -49,6 +49,7 @@ from vllm.distributed.weight_transfer.ipc_engine import (\n     IPCWeightTransferInitInfo,\n     IPCWeightTransferUpdateInfo,\n )\n+from vllm.distributed.weight_transfer.nccl_common import run_trainer_rendezvous\n from vllm.distributed.weight_transfer.nccl_engine import (\n     NCCLTrainerInitInfo,\n     NCCLTrainerWeightTransferEngine,\n@@ -1669,16 +1670,63 @@ def test_ipc_trainer_init_ships_packed_to_worker():\n     assert client.last_init_info == {\"packed\": True}\n \n \n-def test_nccl_trainer_init_ships_worker_init_info(monkeypatch):\n+def test_nccl_trainer_rendezvous_runs_concurrently_and_waits_for_worker():\n+    worker_started = threading.Event()\n+    trainer_started = threading.Event()\n+    worker_finished = threading.Event()\n+    trainer_thread = threading.get_ident()\n+\n+    def init_worker():\n+        assert threading.get_ident() != trainer_thread\n+        worker_started.set()\n+        assert trainer_started.wait(timeout=5)\n+        worker_finished.set()\n+\n+    def init_trainer():\n+        try:\n+            assert threading.get_ident() == trainer_thread\n+            assert worker_started.wait(timeout=5)\n+            assert not worker_finished.is_set()\n+        finally:\n+            trainer_started.set()\n+\n+    run_trainer_rendezvous(init_worker=init_worker, init_trainer=init_trainer)\n+    assert worker_finished.is_set()\n+\n+\n+@pytest.mark.parametrize(\"failure_side\", [\"worker\", \"trainer\"])\n+def test_nccl_trainer_rendezvous_propagates_errors_after_worker_exits(failure_side):\n+    trainer_started = threading.Event()\n+    worker_finished = threading.Event()\n+    error = RuntimeError(f\"{failure_side} initialization failed\")\n+\n+    def init_worker():\n+        assert trainer_started.wait(timeout=5)\n+        worker_finished.set()\n+        if failure_side == \"worker\":\n+            raise error\n+\n+    def init_trainer():\n+        trainer_started.set()\n+        if failure_side == \"trainer\":\n+            raise error\n+\n+    with pytest.raises(RuntimeError) as exc_info:\n+        run_trainer_rendezvous(init_worker=init_worker, init_trainer=init_trainer)\n+    assert exc_info.value is error\n+    assert worker_finished.is_set()\n+\n+\n+@pytest.mark.parametrize(\"packed\", [False, True])\n+def test_nccl_trainer_init_ships_worker_init_info(monkeypatch, packed):\n     \"\"\"The sender's trainer_init drives the inference-side init handshake with\n     the worker-shaped init info (rank_offset=1) while opening its own endpoint,\n     and propagates the must-agree wire params to the worker.\"\"\"\n     import vllm.distributed.weight_transfer.nccl_engine as nccl_engine_mod\n \n     # Bypass the real NCCL rendezvous.\n-    monkeypatch.setattr(\n-        nccl_engine_mod, \"open_trainer_endpoint\", lambda info: MagicMock()\n-    )\n+    group = object()\n+    monkeypatch.setattr(nccl_engine_mod, \"open_trainer_endpoint\", lambda info: group)\n \n     client = RecordingClient()\n     engine = WeightTransferTrainerFactory.trainer_init(\n@@ -1687,7 +1735,7 @@ def test_nccl_trainer_init_ships_worker_init_info(monkeypatch):\n             master_port=29500,\n             world_size=3,\n             rank=0,\n-            packed=True,\n+            packed=packed,\n             packed_buffer_size_bytes=1024,\n             packed_num_buffers=3,\n         ),\n@@ -1697,19 +1745,60 @@ def test_nccl_trainer_init_ships_worker_init_info(monkeypatch):\n \n     assert isinstance(engine, NCCLTrainerWeightTransferEngine)\n     assert engine.is_sender is True\n-    assert engine.packed is True\n+    assert engine.packed is packed\n+    assert engine.model_update_group is group\n     assert client.order == [\"init\"]\n     assert client.last_init_info == {\n         \"master_address\": \"127.0.0.1\",\n         \"master_port\": 29500,\n         \"rank_offset\": 1,\n         \"world_size\": 3,\n-        \"packed\": True,\n+        \"packed\": packed,\n         \"packed_buffer_size_bytes\": 1024,\n         \"packed_num_buffers\": 3,\n     }\n \n \n+@pytest.mark.parametrize(\"rank\", [0, 1])\n+def test_nccl_trainer_init_dispatches_subclass_hooks_only_on_sender(rank):\n+    group = object()\n+    calls = []\n+\n+    class Trainer(NCCLTrainerWeightTransferEngine):\n+        @classmethod\n+        def _build_worker_init_payload(cls, init_info):\n+            calls.append((\"payload\", cls, init_info))\n+            payload = super()._build_worker_init_payload(init_info)\n+            payload[\"master_port\"] += 1\n+            return payload\n+\n+        def _open_trainer_endpoint(self, init_info):\n+            calls.append((\"endpoint\", self, init_info))\n+            self.model_update_group = group\n+\n+    init_info = NCCLTrainerInitInfo(\n+        master_address=\"127.0.0.1\", master_port=29500, world_size=3, rank=rank\n+    )\n+    client = RecordingClient()\n+    engine = Trainer.trainer_init(\n+        init_info, client=client, source=ModuleSource(_module_with())\n+    )\n+\n+    assert type(engine) is Trainer\n+    if rank == 0:\n+        assert calls == [\n+            (\"payload\", Trainer, init_info),\n+            (\"endpoint\", engine, init_info),\n+        ]\n+        assert client.last_init_info is not None\n+        assert client.last_init_info[\"master_port\"] == 29501\n+        assert engine.model_update_group is group\n+    else:\n+        assert calls == []\n+        assert client.order == []\n+        assert engine.model_update_group is None\n+\n+\n def test_nccl_worker_learns_wire_params_from_init_handshake(monkeypatch):\n     \"\"\"The worker engine reads packed + buffer geometry from the\n     trainer-supplied init info at the handshake, not from the config or the\n@@ -2011,12 +2100,12 @@ def _sparse_patch(device: str = \"cpu\") -> SparseWeightPatch:\n \n \n def test_sparse_nccl_trainer_init_ships_worker_init_info(monkeypatch):\n-    \"\"\"The sender's trainer_init drives the init handshake with the\n-    worker-shaped init info; sparse ships no packed wire params, so the worker\n-    keeps its unpacked defaults. Sparse takes no `source`.\"\"\"\n+    \"\"\"The sender's trainer_init sends worker-shaped init info with\n+    `packed=False` and default buffer settings. Sparse takes no `source`.\"\"\"\n     import vllm.distributed.weight_transfer.sparse_nccl_engine as sparse_mod\n \n-    monkeypatch.setattr(sparse_mod, \"open_trainer_endpoint\", lambda info: MagicMock())\n+    group = object()\n+    monkeypatch.setattr(sparse_mod, \"open_trainer_endpoint\", lambda info: group)\n \n     client = RecordingClient()\n     engine = WeightTransferTrainerFactory.trainer_init(\n@@ -2030,6 +2119,7 @@ def test_sparse_nccl_trainer_init_ships_worker_init_info(monkeypatch):\n     )\n \n     assert isinstance(engine, SparseNCCLTrainerWeightTransferEngine)\n+    assert engine.model_update_group is group\n     assert client.order == [\"init\"]\n     assert client.last_init_info == {\n         \"master_address\": \"127.0.0.1\","
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/nccl_common.py",
+          "status": "modified",
+          "additions": 34,
+          "deletions": 1,
+          "patch": "@@ -9,6 +9,8 @@ sparse engine does not have to subclass the dense one.\n \"\"\"\n \n import socket\n+from collections.abc import Callable\n+from concurrent.futures import ThreadPoolExecutor\n from dataclasses import asdict, dataclass, field\n from typing import TYPE_CHECKING, Protocol\n \n@@ -125,8 +127,39 @@ def worker_init_payload(init_info: NCCLWeightTransferInitInfo) -> dict:\n     return {key: value for key, value in asdict(init_info).items() if value is not None}\n \n \n+def build_worker_init_payload(\n+    init_info: \"NCCLRendezvous\",\n+    *,\n+    packed: bool = False,\n+    packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,\n+    packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,\n+) -> dict:\n+    # Workers sit at rank_offset 1, after the single trainer sender rank 0.\n+    worker_init_info = NCCLWeightTransferInitInfo(\n+        master_address=init_info.master_address,\n+        master_port=init_info.master_port,\n+        rank_offset=1,\n+        world_size=init_info.world_size,\n+        packed=packed,\n+        packed_buffer_size_bytes=packed_buffer_size_bytes,\n+        packed_num_buffers=packed_num_buffers,\n+    )\n+    return worker_init_payload(worker_init_info)\n+\n+\n+def run_trainer_rendezvous(\n+    *, init_worker: Callable[[], None], init_trainer: Callable[[], None]\n+) -> None:\n+    # Workers and trainer must enter the rendezvous concurrently, so run the\n+    # worker initialization RPC in a thread while opening the trainer endpoint.\n+    with ThreadPoolExecutor(max_workers=1) as executor:\n+        future = executor.submit(init_worker)\n+        init_trainer()\n+        future.result()\n+\n+\n class NCCLRendezvous(Protocol):\n-    \"\"\"The TCP rendezvous fields `trainer_init` needs.\n+    \"\"\"The TCP rendezvous fields used by trainer initialization helpers.\n \n     Structural so each backend can keep its own trainer init info next to its\n     engine (dense `NCCLTrainerInitInfo`, `SparseNCCLTrainerInitInfo`) without"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/nccl_engine.py",
+          "status": "modified",
+          "additions": 18,
+          "deletions": 21,
+          "patch": "@@ -25,7 +25,8 @@ from vllm.distributed.weight_transfer.base import (\n )\n from vllm.distributed.weight_transfer.nccl_common import (\n     NCCLWeightTransferInitInfo,\n-    worker_init_payload,\n+    build_worker_init_payload,\n+    run_trainer_rendezvous,\n     worker_init_process_group,\n )\n from vllm.distributed.weight_transfer.nccl_common import (\n@@ -280,6 +281,18 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni\n         # Metadata the worker already holds; an unchanged round sends none.\n         self._sent_meta: list[ParamMeta] | None = None\n \n+    @classmethod\n+    def _build_worker_init_payload(cls, init_info: NCCLTrainerInitInfo) -> dict:\n+        return build_worker_init_payload(\n+            init_info,\n+            packed=init_info.packed,\n+            packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,\n+            packed_num_buffers=init_info.packed_num_buffers,\n+        )\n+\n+    def _open_trainer_endpoint(self, init_info: NCCLTrainerInitInfo) -> None:\n+        self.model_update_group = open_trainer_endpoint(init_info)\n+\n     @classmethod\n     def trainer_init(\n         cls,\n@@ -304,28 +317,12 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni\n             # trainer-side gather during send_weights.\n             return engine\n \n-        # Workers sit at rank_offset 1, after the single trainer sender rank 0.\n-        worker_init_info = NCCLWeightTransferInitInfo(\n-            master_address=init_info.master_address,\n-            master_port=init_info.master_port,\n-            rank_offset=1,\n-            world_size=init_info.world_size,\n-            packed=init_info.packed,\n-            packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,\n-            packed_num_buffers=init_info.packed_num_buffers,\n+        payload = cls._build_worker_init_payload(init_info)\n+        run_trainer_rendezvous(\n+            init_worker=lambda: engine.client.init_weight_transfer_engine(payload),\n+            init_trainer=lambda: engine._open_trainer_endpoint(init_info),\n         )\n \n-        # The inference workers block inside init_weight_transfer_engine waiting\n-        # for the NCCL rendezvous, so we kick that off on a side thread while we\n-        # open the trainer endpoint (rank 0); both sides must rendezvous together.\n-        with ThreadPoolExecutor(max_workers=1) as exe:\n-            future = exe.submit(\n-                engine.client.init_weight_transfer_engine,\n-                worker_init_payload(worker_init_info),\n-            )\n-            engine.model_update_group = open_trainer_endpoint(init_info)\n-            future.result()  # surface any inference-side init error\n-\n         return engine\n \n     def send_weights(self) -> None:"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/sparse_nccl_engine.py",
+          "status": "modified",
+          "additions": 12,
+          "deletions": 22,
+          "patch": "@@ -30,7 +30,8 @@ from vllm.distributed.weight_transfer.base import (\n )\n from vllm.distributed.weight_transfer.nccl_common import (\n     NCCLWeightTransferInitInfo,\n-    worker_init_payload,\n+    build_worker_init_payload,\n+    run_trainer_rendezvous,\n     worker_init_process_group,\n )\n from vllm.distributed.weight_transfer.nccl_common import (\n@@ -229,6 +230,10 @@ class SparseNCCLTrainerWeightTransferEngine(\n         super().__init__(client=client, source=source, is_sender=is_sender)\n         self.model_update_group: PyNcclCommunicator | None = None\n \n+    @classmethod\n+    def _build_worker_init_payload(cls, init_info: SparseNCCLTrainerInitInfo) -> dict:\n+        return build_worker_init_payload(init_info)\n+\n     @classmethod\n     def trainer_init(\n         cls,\n@@ -241,29 +246,14 @@ class SparseNCCLTrainerWeightTransferEngine(\n         if not engine.is_sender:\n             return engine\n \n-        # Workers sit at rank_offset 1, after the single trainer sender rank 0.\n-        # Sparse transfers are never packed, so the worker keeps the unpacked\n-        # defaults on its init info.\n-        worker_init_info = NCCLWeightTransferInitInfo(\n-            master_address=init_info.master_address,\n-            master_port=init_info.master_port,\n-            rank_offset=1,\n-            world_size=init_info.world_size,\n+        payload = cls._build_worker_init_payload(init_info)\n+        run_trainer_rendezvous(\n+            init_worker=lambda: engine.client.init_weight_transfer_engine(payload),\n+            init_trainer=lambda: setattr(\n+                engine, \"model_update_group\", open_trainer_endpoint(init_info)\n+            ),\n         )\n \n-        # The inference workers block inside init_weight_transfer_engine waiting\n-        # for the NCCL rendezvous, so we kick that off on a side thread while we\n-        # open the trainer endpoint (rank 0); both sides must rendezvous together.\n-        with ThreadPoolExecutor(max_workers=1) as exe:\n-            future = exe.submit(\n-                engine.client.init_weight_transfer_engine,\n-                worker_init_payload(worker_init_info),\n-            )\n-            # Open the trainer endpoint as NCCL rank 0 on the current device\n-            # (the init info satisfies the helper's rendezvous protocol).\n-            engine.model_update_group = open_trainer_endpoint(init_info)\n-            future.result()  # surface any inference-side init error\n-\n         return engine\n \n     def send_weights(self, patches: Iterable[SparseWeightPatch] | None = None) -> None:\n"
+        }
+      ]
+    },
+    {
+      "sha": "57ab2f35ac6e7207bd71cf6cad17b31705f03cd3",
+      "author": {
+        "name": "Ronald",
+        "email": "ronaldautomobile@163.com"
+      },
+      "date": "2026-10-25T11:08:23+08:00",
+      "message": "[Hardware] Use accelerator APIs in weight transfer (#63457)\n\nSigned-off-by: Ronald1995 <ronaldautomobile@163.com>",
+      "parents": [
+        "d4d647b2b52d5e15ee1427de0effecd474430972"
+      ],
+      "stats": {
+        "total_additions": 17,
+        "total_deletions": 17,
+        "files_changed": 6
+      },
+      "files": [
+        {
+          "filename": "vllm/distributed/weight_transfer/ipc_engine.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -349,7 +349,7 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI\n         gathered: list[list[dict[str, tuple]] | None] = [None] * world_size\n         torch.distributed.all_gather_object(gathered, handles)\n         torch.distributed.barrier()\n-        torch.cuda.synchronize()\n+        torch.accelerator.synchronize()\n \n         if self.is_sender:\n             merged: list[dict[str, tuple]] = []"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/nccl_engine.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -469,8 +469,8 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni\n         only add a dependency on the default process group that this backend\n         otherwise does not have.\n         \"\"\"\n-        if torch.cuda.is_available():\n-            torch.cuda.current_stream().synchronize()\n+        if torch.accelerator.is_available():\n+            torch.accelerator.current_stream().synchronize()\n \n     def shutdown(self) -> None:\n         if self.model_update_group is not None:"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/packed_tensor.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -227,7 +227,7 @@ def packed_nccl_broadcast_consumer(\n         [] for _ in range(num_buffers)\n     ]\n     packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]\n-    caller_stream = torch.cuda.current_stream()\n+    caller_stream = torch.accelerator.current_stream()\n     prev_received: torch.Event | None = None\n \n     def receive_and_load(buffer_idx: int) -> None:\n@@ -351,7 +351,7 @@ def packed_ipc_producer(\n \n         if total_bytes and total_bytes + flat.numel() > buffer_size_bytes:\n             # Drain queued copies so the consumer sees a fully-written buffer.\n-            torch.cuda.current_stream().synchronize()\n+            torch.accelerator.current_stream().synchronize()\n             yield PackedIpcChunk(\n                 names=names,\n                 shapes=shapes,\n@@ -372,7 +372,7 @@ def packed_ipc_producer(\n         total_bytes += flat.numel()\n \n     if total_bytes:\n-        torch.cuda.current_stream().synchronize()\n+        torch.accelerator.current_stream().synchronize()\n         yield PackedIpcChunk(\n             names=names,\n             shapes=shapes,"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/sharded_rdt_engine.py",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 8,
+          "patch": "@@ -348,7 +348,7 @@ class ShardedRDTWeightTransferEngine(\n         # measurably slows the sync.\n         self._ring_depth = 1\n         self._dest_buffers: list[dict[torch.dtype, torch.Tensor]] = [{}]\n-        self._slot_read_done: list[Any] = []  # one torch.cuda.Event per slot\n+        self._slot_read_done: list[Any] = []  # one torch.Event per slot\n         # Generation counters guarding the events (see _ensure_proc_worker).\n         self._slot_queued: list[int] = []\n         self._slot_done: list[int] = []\n@@ -982,7 +982,7 @@ class ShardedRDTWeightTransferEngine(\n         import queue\n         import threading\n \n-        self._slot_read_done = [torch.cuda.Event() for _ in range(self._ring_depth)]\n+        self._slot_read_done = [torch.Event() for _ in range(self._ring_depth)]\n         # Generation handshake for the events above: the RPC thread counts items\n         # queued per slot, this thread counts records, and a pull may synchronize()\n         # only once done[slot] has caught up with queued[slot]. Without it the\n@@ -1014,7 +1014,7 @@ class ShardedRDTWeightTransferEngine(\n         raises is recorded in ``_proc_error`` and re-raised on the RPC thread /\n         at drain, so a failed sync fails loudly rather than corrupting silently.\n         \"\"\"\n-        torch.cuda.set_device(self.device)\n+        torch.accelerator.set_device_index(self.device.index)\n         q = self._proc_queue\n         assert q is not None\n         while True:\n@@ -1311,7 +1311,7 @@ class ShardedRDTWeightTransferEngine(\n         results = item.results\n         chunk = item.chunk\n         with (\n-            torch.cuda.device(self.device),\n+            torch.accelerator.device_index(self.device.index),\n             torch.cuda.stream(self._proc_stream),\n             torch.device(self.device),\n         ):\n@@ -1356,14 +1356,14 @@ class ShardedRDTWeightTransferEngine(\n             # Running it in order here stalls the RPC thread's slot handshake by\n             # ~0.5-0.75s/iter, since every group's quant delays the next publish.\n             if chunk.quant:\n-                ready = torch.cuda.Event()\n+                ready = torch.Event()\n                 ready.record(self._proc_stream)\n                 if self._quant_queue is None:\n                     self._run_quant(chunk.quant, ready)\n                 else:\n                     self._quant_queue.put((chunk.quant, ready))\n \n-    def _run_quant(self, layers: \"list[Any]\", ready: \"torch.cuda.Event\") -> None:\n+    def _run_quant(self, layers: \"list[Any]\", ready: \"torch.Event\") -> None:\n         \"\"\"Quant/kernel-copy/reset the given COMPLETED leaf modules, exactly as\n         _layerwise_process. Runs on the quant thread's own stream, ordered after\n         the modules' scatters via ``ready``; touches only the scattered params\n@@ -1381,7 +1381,7 @@ class ShardedRDTWeightTransferEngine(\n         stream = self._quant_stream or self._proc_stream\n         assert stream is not None  # created in _ensure_proc_worker before use\n         with (\n-            torch.cuda.device(self.device),\n+            torch.accelerator.device_index(self.device.index),\n             torch.cuda.stream(stream),\n             torch.device(self.device),\n         ):\n@@ -1403,7 +1403,7 @@ class ShardedRDTWeightTransferEngine(\n     def _quant_worker_loop(self) -> None:\n         \"\"\"Dedicated quant thread: drains (completed_modules, scatter-done event)\n         batches. Errors surface via _proc_error like the scatter thread's.\"\"\"\n-        torch.cuda.set_device(self.device)\n+        torch.accelerator.set_device_index(self.device.index)\n         q = self._quant_queue\n         assert q is not None\n         while True:"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/sharded_rdt_trainer.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -926,7 +926,7 @@ class ShardedRDTTrainerWeightTransferEngine(\n         # nothing orders the two. Without this sync it packs bytes the copy has\n         # not written yet -- silent corruption, and only for ring-packed tensors.\n         if slot.is_cuda:\n-            torch.cuda.current_stream(slot.device).synchronize()\n+            torch.accelerator.current_stream(slot.device).synchronize()\n         return {sid: reduce_args}, views, refs\n \n     def _publish_async(self, group_idx: int, entries):"
+        },
+        {
+          "filename": "vllm/distributed/weight_transfer/sparse_nccl_engine.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -368,8 +368,8 @@ class SparseNCCLTrainerWeightTransferEngine(\n         than relying on same-stream ordering. See\n         `NCCLTrainerWeightTransferEngine._post_send_sync` for why there is no\n         cross-rank barrier.\"\"\"\n-        if torch.cuda.is_available():\n-            torch.cuda.current_stream().synchronize()\n+        if torch.accelerator.is_available():\n+            torch.accelerator.current_stream().synchronize()\n \n     def shutdown(self) -> None:\n         if self.model_update_group is not None:\n"
+        }
+      ]
+    },
+    {
+      "sha": "d4d647b2b52d5e15ee1427de0effecd474430972",
+      "author": {
+        "name": "Jee Jee Li",
+        "email": "pandaleefree@gmail.com"
+      },
+      "date": "2026-10-25T10:58:43+08:00",
+      "message": "[Kernel] Update DeepGEMM commit (#63253)\n\nSigned-off-by: Jee Jee Li <jeejeelee@inferact.ai>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "8e11a8a49e11b2f0825be7b3c2434bcf23d7f87b"
+      ],
+      "stats": {
+        "total_additions": 5,
+        "total_deletions": 2,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "cmake/external_projects/deepgemm.cmake",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 2,
+          "patch": "@@ -32,9 +32,12 @@ else()\n   # plus the SM120 port, the SM90 paged-MQA kv_block=32/next_n=4 port,\n   # configurable SwiGLU alpha/beta, SiTU for FP8/FP4 Mega MoE, and NVFP4\n   # Mega MoE, plus swiglustep for BF16/FP8/NVFP4 Mega MoE and F8_128x4\n-  # SFs for the FP8 einsum output (vllm-project/DeepGEMM#40).\n+  # SFs for the FP8 einsum output (vllm-project/DeepGEMM#40), plus\n+  # fp4_fp4_mega_moe and fused post-expert RMSNorm for Muse Spark Open\n+  # (vllm-project/DeepGEMM#39), and the MX MegaMoE alignment fix\n+  # (vllm-project/DeepGEMM#43).\n   # Uses the PyTorch 2.11 stable ABI and CPython 3.10 limited API.\n-  set(_DEEPGEMM_UPSTREAM_TAG \"727f847082d2e7946f70dc02b94949db206310d3\")\n+  set(_DEEPGEMM_UPSTREAM_TAG \"0820030756945b2daec208e8e8255268360f337d\")\n \n   set(_deepgemm_fc_root \"${FETCHCONTENT_BASE_DIR}\")\n   if(NOT _deepgemm_fc_root)\n"
+        }
+      ]
+    },
+    {
+      "sha": "8e11a8a49e11b2f0825be7b3c2434bcf23d7f87b",
+      "author": {
+        "name": "Jee Jee Li",
+        "email": "pandaleefree@gmail.com"
+      },
+      "date": "2026-10-25T10:57:33+08:00",
+      "message": "[LoRA] Reject incompatible MegaMoE backends during config validation (#63496)\n\nSigned-off-by: Jee Jee Li <jeejeelee@inferact.ai>",
+      "parents": [
+        "fc2b6ab45ed3e498b52d74fd880a8b40a65ba3a7"
+      ],
+      "stats": {
+        "total_additions": 11,
+        "total_deletions": 7,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "vllm/config/lora.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 0,
+          "patch": "@@ -8,6 +8,7 @@ import torch\n from pydantic import ConfigDict, Field, model_validator\n \n from vllm import envs\n+from vllm.config.kernel import MEGA_MOE_BACKENDS, KernelConfig\n from vllm.config.utils import config\n from vllm.logger import init_logger\n from vllm.platforms import current_platform\n@@ -134,6 +135,15 @@ class LoRAConfig:\n             envs.VLLM_LORA_ENABLE_DUAL_STREAM = False\n         return self\n \n+    def verify_with_kernel_config(self, kernel_config: KernelConfig) -> None:\n+        \"\"\"Reject MegaMoE backends, which do not support LoRA.\"\"\"\n+        moe_backend = kernel_config.moe_backend\n+        if moe_backend in MEGA_MOE_BACKENDS or moe_backend == \"aiter_mega_moe\":\n+            raise ValueError(\n+                f\"LoRA is not supported with moe_backend={moe_backend!r}. \"\n+                \"Disable LoRA or select a MoE backend that supports LoRA.\"\n+            )\n+\n     def verify_with_model_config(self, model_config: ModelConfig):\n         # Speculative decoding drafters don't run LoRA adapters.\n         if model_config.runner_type != \"draft\" and not model_config.is_lora_supported:"
+        },
+        {
+          "filename": "vllm/config/vllm.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -1572,6 +1572,7 @@ class VllmConfig:\n                     \"supported for MLA models.\"\n                 )\n         if self.lora_config is not None:\n+            self.lora_config.verify_with_kernel_config(self.kernel_config)\n             self.lora_config.verify_with_model_config(self.model_config)\n \n         if ("
+        },
+        {
+          "filename": "vllm/models/step5/nvidia/model.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 7,
+          "patch": "@@ -2342,13 +2342,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):\n         prefix: str = \"\",\n     ):\n         super().__init__()\n-        if (\n-            vllm_config.lora_config is not None\n-            and vllm_config.kernel_config.moe_backend == \"deep_gemm_mega_moe\"\n-        ):\n-            raise ValueError(\n-                \"Step5 LoRA is not supported with moe_backend='deep_gemm_mega_moe'\"\n-            )\n         self.vllm_config = vllm_config\n         model_config = vllm_config.model_config\n         config = model_config.hf_config\n"
+        }
+      ]
+    },
+    {
+      "sha": "fc2b6ab45ed3e498b52d74fd880a8b40a65ba3a7",
+      "author": {
+        "name": "Juntian Liu",
+        "email": "Juntianl777@gmail.com"
+      },
+      "date": "2026-10-25T10:57:07+08:00",
+      "message": "[Perf][MRV2] Parallelize staged writes across 1024-element chunks (#62698)\n\nSigned-off-by: Juntian Liu <Juntianl777@gmail.com>\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>",
+      "parents": [
+        "71a82756040a31849623e720e039a83857b4b562"
+      ],
+      "stats": {
+        "total_additions": 45,
+        "total_deletions": 10,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/worker/test_gpu_block_table.py",
+          "status": "modified",
+          "additions": 20,
+          "deletions": 0,
+          "patch": "@@ -79,6 +79,7 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):\n         assert not block_table._staged_write_starts\n         assert not block_table._staged_write_contents\n         assert not block_table._staged_write_cu_lens\n+        assert block_table._staged_write_max_len == 0\n \n     block_tables.append_block_ids(\n         req_index=0,\n@@ -105,6 +106,25 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):\n     assert block_tables.num_blocks.np[2, 0] == 1\n \n \n+def test_block_tables_fused_write_spans_multiple_chunks():\n+    \"\"\"A fused write longer than one 1024-element chunk is fully copied.\"\"\"\n+    device = torch.device(\"cuda\")\n+    block_tables = BlockTables(\n+        block_sizes=[16, 32],\n+        max_num_reqs=2,\n+        max_num_batched_tokens=16,\n+        max_num_blocks_per_group=[4, 4096],\n+        device=device,\n+    )\n+    long_ids = list(range(1, 2501))\n+    block_tables.append_block_ids(0, ([7], long_ids), overwrite=True)\n+    block_tables.apply_staged_writes()\n+    torch.accelerator.synchronize()\n+\n+    assert block_tables.block_tables[0].gpu[0, :1].tolist() == [7]\n+    assert block_tables.block_tables[1].gpu[0, :2500].tolist() == long_ids\n+\n+\n def test_block_tables_apply_staged_writes_single_group():\n     device = torch.device(\"cuda\")\n     block_tables = BlockTables("
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/buffer_utils.py",
+          "status": "modified",
+          "additions": 25,
+          "deletions": 10,
+          "patch": "@@ -20,6 +20,9 @@ logger = init_logger(__name__)\n # concurrent in-flight steps (engine batch_queue_size).\n _DEFAULT_MAX_CONCURRENCY = 2\n \n+# Elements copied per program in `_apply_write_kernel`.\n+_WRITE_BLOCK_SIZE = 1024\n+\n \n def set_default_max_concurrency(n: int) -> None:\n     global _DEFAULT_MAX_CONCURRENCY\n@@ -166,6 +169,7 @@ class StagedWriteTensor:\n         self._staged_write_starts: list[int] = []\n         self._staged_write_contents: list[int | float] = []\n         self._staged_write_cu_lens: list[int] = []\n+        self._staged_write_max_len = 0\n \n         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)\n \n@@ -183,8 +187,11 @@ class StagedWriteTensor:\n             return\n         self._staged_write_indices.append(index)\n         self._staged_write_starts.append(start)\n+        prev_len = len(self._staged_write_contents)\n         self._staged_write_contents.extend(x)\n-        self._staged_write_cu_lens.append(len(self._staged_write_contents))\n+        cu_len = len(self._staged_write_contents)\n+        self._staged_write_cu_lens.append(cu_len)\n+        self._staged_write_max_len = max(self._staged_write_max_len, cu_len - prev_len)\n \n     def stage_write_elem(self, index: int, x: int) -> None:\n         assert index >= 0\n@@ -192,6 +199,7 @@ class StagedWriteTensor:\n         self._staged_write_starts.append(0)\n         self._staged_write_contents.append(x)\n         self._staged_write_cu_lens.append(len(self._staged_write_contents))\n+        self._staged_write_max_len = max(self._staged_write_max_len, 1)\n \n     def apply_write(self) -> None:\n         n = len(self._staged_write_indices)\n@@ -212,7 +220,7 @@ class StagedWriteTensor:\n             )\n \n         # Write diffs to the GPU buffer\n-        _apply_write_kernel[(n,)](\n+        _apply_write_kernel[(n, _num_write_chunks(self._staged_write_max_len))](\n             self.gpu,\n             self.gpu.stride(0),\n             indices_uva,\n@@ -220,7 +228,7 @@ class StagedWriteTensor:\n             write_contents,\n             cu_lens_uva,\n             None,\n-            BLOCK_SIZE=1024,\n+            BLOCK_SIZE=_WRITE_BLOCK_SIZE,\n             MULTI_GROUP=False,\n         )\n         # Clear the staged writes\n@@ -231,6 +239,7 @@ class StagedWriteTensor:\n         self._staged_write_starts.clear()\n         self._staged_write_contents.clear()\n         self._staged_write_cu_lens.clear()\n+        self._staged_write_max_len = 0\n \n \n class FusedStagedWriter:\n@@ -260,6 +269,7 @@ class FusedStagedWriter:\n         starts: list[int] = []\n         contents: list[int | float] = []\n         cu_lens: list[int] = []\n+        max_len = 0\n \n         for group_id, t in enumerate(tensors):\n             n = len(t._staged_write_indices)\n@@ -272,6 +282,7 @@ class FusedStagedWriter:\n             content_base = len(contents)\n             contents.extend(t._staged_write_contents)\n             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)\n+            max_len = max(max_len, t._staged_write_max_len)\n \n         if not group_ids:\n             return\n@@ -282,7 +293,7 @@ class FusedStagedWriter:\n         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)\n         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)\n \n-        _apply_write_kernel[(len(group_ids),)](\n+        _apply_write_kernel[(len(group_ids), _num_write_chunks(max_len))](\n             output_ptrs,\n             output_strides,\n             indices_uva,\n@@ -290,13 +301,18 @@ class FusedStagedWriter:\n             contents_gpu,\n             cu_lens_uva,\n             group_ids_uva,\n-            BLOCK_SIZE=1024,\n+            BLOCK_SIZE=_WRITE_BLOCK_SIZE,\n             MULTI_GROUP=True,\n         )\n         for t in tensors:\n             t.clear_staged_writes()\n \n \n+def _num_write_chunks(max_len: int) -> int:\n+    # One program per _WRITE_BLOCK_SIZE-element chunk.\n+    return max(triton.cdiv(max_len, _WRITE_BLOCK_SIZE), 1)\n+\n+\n @triton.jit\n def _apply_write_kernel(\n     output_ptr,  # MULTI_GROUP: ptr-to-ptrs [num_groups]; else: data ptr\n@@ -328,11 +344,10 @@ def _apply_write_kernel(\n         row_stride = output_stride\n     row_ptr += row_idx * row_stride + start_idx\n \n-    for i in range(0, content_len, BLOCK_SIZE):\n-        block = i + tl.arange(0, BLOCK_SIZE)\n-        mask = block < content_len\n-        content = tl.load(write_contents_ptr + cu_start + block, mask=mask)\n-        tl.store(row_ptr + block, content, mask=mask)\n+    block = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n+    mask = block < content_len\n+    content = tl.load(write_contents_ptr + cu_start + block, mask=mask)\n+    tl.store(row_ptr + block, content, mask=mask)\n \n \n @triton.jit\n"
+        }
+      ]
+    },
+    {
+      "sha": "71a82756040a31849623e720e039a83857b4b562",
+      "author": {
+        "name": "Roy Wang",
+        "email": "jasonailu87@gmail.com"
+      },
+      "date": "2026-10-25T10:18:12+08:00",
+      "message": "[CI] Trigger recipe previews and the recipes.vllm.ai sync on push (#63259)\n\nSigned-off-by: esmeetu <jasonailu87@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "4e591657157a021cab997f911d67f50c0d18a71e"
+      ],
+      "stats": {
+        "total_additions": 69,
+        "total_deletions": 0,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": ".github/workflows/recipes-preview.yml",
+          "status": "added",
+          "additions": 69,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,69 @@\n+name: Recipes Preview\n+\n+# Tells vllm-project/recipes when recipes/ changes, instead of waiting for its\n+# scheduled polling, which GitHub runs hours late:\n+#   - a recipe PR is opened, pushed or reopened: rebuild its preview branch\n+#     `preview/vllm-pr-<N>`, which Vercel deploys at the environment URL below\n+#     (recipes debounces bursts of pushes);\n+#   - a recipe PR is closed: delete that branch;\n+#   - recipe changes reach main: sync recipes.vllm.ai (`recipes-updated`).\n+#\n+# Runs on pull_request_target so fork PRs can reach the dispatch token. This\n+# is safe only because no step checks out or runs PR code, and only the PR\n+# number leaves this workflow. Keep it that way. The token comes from a GitHub\n+# App installed only on vllm-project/recipes with contents: write; its key\n+# lives in the `recipes-preview` environment, which only main may use.\n+\n+on:\n+  pull_request_target:\n+    types: [opened, synchronize, reopened, closed]\n+    paths:\n+      - 'recipes/**'\n+  push:\n+    branches: [main]\n+    paths:\n+      - 'recipes/**'\n+\n+permissions:\n+  contents: read\n+\n+concurrency:\n+  group: recipes-preview-${{ github.event.pull_request.number || github.ref }}\n+  cancel-in-progress: true\n+\n+jobs:\n+  dispatch:\n+    if: github.repository == 'vllm-project/vllm'\n+    runs-on: ubuntu-latest\n+    timeout-minutes: 5\n+    environment:\n+      name: recipes-preview\n+      url: >-\n+        ${{ github.event_name == 'push' && 'https://recipes.vllm.ai' ||\n+        (github.event.action != 'closed' &&\n+        format('https://vllm-recipes-git-preview-vllm-pr-{0}-inferact-inc.vercel.app', github.event.pull_request.number) ||\n+        '') }}\n+    steps:\n+      - name: Create a token for vllm-project/recipes\n+        id: token\n+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n+        with:\n+          app-id: ${{ vars.RECIPES_APP_ID }}\n+          private-key: ${{ secrets.RECIPES_APP_PRIVATE_KEY }}\n+          owner: vllm-project\n+          repositories: recipes\n+          permission-contents: write\n+\n+      - name: Dispatch to vllm-project/recipes\n+        env:\n+          GH_TOKEN: ${{ steps.token.outputs.token }}\n+          EVENT: ${{ github.event_name }}\n+          PR: ${{ github.event.pull_request.number }}\n+        run: |\n+          if [ \"$EVENT\" = push ]; then\n+            gh api repos/vllm-project/recipes/dispatches -f event_type=recipes-updated\n+            exit 0\n+          fi\n+          [[ \"$PR\" =~ ^[0-9]+$ ]] || { echo \"Invalid PR number: $PR\"; exit 1; }\n+          gh api repos/vllm-project/recipes/dispatches \\\n+            -f event_type=preview-pr -F \"client_payload[pr]=${PR}\"\n"
+        }
+      ]
+    },
+    {
+      "sha": "4e591657157a021cab997f911d67f50c0d18a71e",
+      "author": {
+        "name": "Woosuk Kwon",
+        "email": "woosuk@inferact.ai"
+      },
+      "date": "2026-10-25T06:19:14+08:00",
+      "message": "[Deprecation] Deprecate LM Format Enforcer structured outputs backend (#63423)\n\nSigned-off-by: Woosuk Kwon <woosuk@inferact.ai>\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "7050ef881ff0835f6890a47db1859a24c65481d6"
+      ],
+      "stats": {
+        "total_additions": 35,
+        "total_deletions": 1,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "docs/features/structured_outputs.md",
+          "status": "modified",
+          "additions": 21,
+          "deletions": 0,
+          "patch": "@@ -17,6 +17,27 @@ available to generate structured outputs.\n     - `structural_tag` -> `{\"structured_outputs\": {\"structural_tag\": ...}}` or `StructuredOutputsParams(structural_tag=...)`\n     - `guided_decoding_backend` -> Remove this field from your request\n \n+## Migrating from LM Format Enforcer\n+\n+!!! warning\n+    The `lm-format-enforcer` structured outputs backend is deprecated starting\n+    in v0.33.0. It remains usable with a warning in v0.33.0, will require an\n+    explicit opt-in in v0.34.0, and will be removed in v0.35.0.\n+\n+For online serving, replace\n+`--structured-outputs-config.backend lm-format-enforcer` with\n+`--structured-outputs-config.backend auto`, or remove the option to use the\n+default. For offline inference, replace\n+`structured_outputs_config={\"backend\": \"lm-format-enforcer\"}` with\n+`structured_outputs_config={\"backend\": \"auto\"}` when constructing `LLM`.\n+You can also explicitly select `xgrammar` or `guidance`.\n+\n+Validate your existing JSON schemas, regex patterns, and generated outputs with\n+the replacement backend before migrating. Backend support and formatting can\n+differ: in particular, LM Format Enforcer uses Python-style regex syntax, while\n+XGrammar and Guidance use Rust-style regex syntax. Changing backends can change\n+which tokens are allowed and therefore the generated output.\n+\n ## Online Serving (OpenAI API)\n \n You can generate structured outputs using the OpenAI's [Completions](https://platform.openai.com/docs/api-reference/completions) and [Chat](https://platform.openai.com/docs/api-reference/chat) API."
+        },
+        {
+          "filename": "vllm/config/structured_outputs.py",
+          "status": "modified",
+          "additions": 14,
+          "deletions": 1,
+          "patch": "@@ -6,8 +6,11 @@ from typing import Any, Literal, Self\n from pydantic import model_validator\n \n from vllm.config.utils import config\n+from vllm.logger import init_logger\n from vllm.utils.hashing import safe_hash\n \n+logger = init_logger(__name__)\n+\n StructuredOutputsBackend = Literal[\n     \"auto\", \"xgrammar\", \"guidance\", \"outlines\", \"lm-format-enforcer\"\n ]\n@@ -21,7 +24,9 @@ class StructuredOutputsConfig:\n     \"\"\"Which engine will be used for structured outputs (e.g. JSON schema,\n     regex, etc) by default. With \"auto\", we will make opinionated choices\n     based on request contents and what the backend libraries currently support,\n-    so the behavior is subject to change in each release.\"\"\"\n+    so the behavior is subject to change in each release.\n+    The \"lm-format-enforcer\" backend is deprecated and will be removed in\n+    v0.35.0. Use \"auto\", \"xgrammar\", or \"guidance\" instead.\"\"\"\n     disable_any_whitespace: bool = False\n     \"\"\"If `True`, json output will always be compact without any whitespace.\n     If `False`, the model may generate whitespace between JSON fields,\n@@ -69,4 +74,12 @@ class StructuredOutputsConfig:\n                 \"disable_additional_properties is only supported \"\n                 \"for the guidance backend.\"\n             )\n+        if self.backend == \"lm-format-enforcer\":\n+            logger.warning_once(\n+                \"The lm-format-enforcer structured outputs backend is deprecated \"\n+                \"and will be removed in v0.35.0. Use auto, xgrammar, or guidance \"\n+                \"instead. See https://docs.vllm.ai/en/latest/features/\"\n+                \"structured_outputs/#migrating-from-lm-format-enforcer \"\n+                \"for migration guidance.\"\n+            )\n         return self\n"
+        }
+      ]
+    },
+    {
+      "sha": "7050ef881ff0835f6890a47db1859a24c65481d6",
+      "author": {
+        "name": "Giancarlo Delfin",
+        "email": "32987265+TheEpicDolphin@users.noreply.github.com"
+      },
+      "date": "2026-10-25T04:35:17+08:00",
+      "message": "[Sampling] Add adaptive verification support to batch-sharded sampling (#58466)",
+      "parents": [
+        "56e4e42868b4652c66cb009928ddcee859b0d3c9"
+      ],
+      "stats": {
+        "total_additions": 160,
+        "total_deletions": 25,
+        "files_changed": 8
+      },
+      "files": [
+        {
+          "filename": "tests/v1/sample/test_dry.py",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 1,
+          "patch": "@@ -608,7 +608,10 @@ def test_v2_batch_sharded_sampling_matches_unsharded(monkeypatch):\n             group = SimpleNamespace(rank_in_group=rank, world_size=tp_size)\n             with mock.patch.object(batch_shard, \"get_tp_group\", return_value=group):\n                 sharder = batch_shard.BatchSharder(\n-                    max_num_reqs=8, max_num_logits_per_req=1, device=DEVICE\n+                    max_num_reqs=8,\n+                    max_num_logits_per_req=1,\n+                    device=DEVICE,\n+                    adaptive_verification_enabled=False,\n                 )\n             local, _, _, _ = sharder.shard_sampler_inputs(batch, None)\n             owned = [int(req_id.split(\"-\")[1]) for req_id in local.req_ids]"
+        },
+        {
+          "filename": "tests/v1/worker/test_gpu_batch_shard.py",
+          "status": "modified",
+          "additions": 55,
+          "deletions": 1,
+          "patch": "@@ -7,6 +7,7 @@ sub-batch, the all-to-all send/recv layout, and the padded result gather must\n compose to a bit-exact round trip of the replicated computation.\n \"\"\"\n \n+from dataclasses import replace\n from types import SimpleNamespace\n from unittest import mock\n \n@@ -110,7 +111,12 @@ def _make_batch(\n     )\n \n \n-def _shard_all_ranks(batch: InputBatch, max_num_reqs: int, tp_size: int):\n+def _shard_all_ranks(\n+    batch: InputBatch,\n+    max_num_reqs: int,\n+    tp_size: int,\n+    adaptive_verification_enabled: bool = False,\n+):\n     \"\"\"Simulate every TP rank by faking get_tp_group() per BatchSharder.\"\"\"\n     results = []\n     for rank in range(tp_size):\n@@ -120,6 +126,7 @@ def _shard_all_ranks(batch: InputBatch, max_num_reqs: int, tp_size: int):\n                 max_num_reqs=max_num_reqs,\n                 max_num_logits_per_req=8,\n                 device=torch.device(DEVICE),\n+                adaptive_verification_enabled=adaptive_verification_enabled,\n             )\n         local_batch, sorted_logits_indices, _, metadata = sharder.shard_sampler_inputs(\n             batch, None\n@@ -128,6 +135,53 @@ def _shard_all_ranks(batch: InputBatch, max_num_reqs: int, tp_size: int):\n     return results\n \n \n+@requires_gpu\n+@pytest.mark.parametrize(\"tp_size\", [2, 4])\n+@pytest.mark.parametrize(\"seed\", [0, 1])\n+def test_admitted_counts_give_unpadded_plan(tp_size: int, seed: int):\n+    \"\"\"With the admitted draft counts on the host, an adaptive verification\n+    batch shards exactly like a batch scheduled with only the admitted drafts.\"\"\"\n+    rng = np.random.default_rng(seed)\n+    max_num_reqs = 64\n+    admitted = _make_batch(rng, num_reqs=23, max_num_reqs=max_num_reqs, max_spec=3)\n+    assert admitted.num_draft_tokens_per_req is not None\n+    admitted_drafts = admitted.num_draft_tokens_per_req\n+    # The host only sees the scheduled counts, an upper bound on the admitted ones.\n+    scheduled_drafts = admitted_drafts + rng.integers(0, 3, size=23).astype(np.int32)\n+    scheduled_cu = np.zeros(24, dtype=np.int32)\n+    np.cumsum(1 + scheduled_drafts, out=scheduled_cu[1:])\n+    av_batch = replace(\n+        admitted,\n+        cu_num_logits_np=scheduled_cu,\n+        num_draft_tokens_per_req=scheduled_drafts,\n+        num_admitted_draft_tokens=SimpleNamespace(wait=lambda: admitted_drafts),\n+    )\n+\n+    expected = _shard_all_ranks(admitted, max_num_reqs, tp_size)\n+    actual = _shard_all_ranks(\n+        av_batch, max_num_reqs, tp_size, adaptive_verification_enabled=True\n+    )\n+    for (exp_local, exp_sorted, exp_meta), (local, sorted_idx, meta) in zip(\n+        expected, actual\n+    ):\n+        assert meta.num_logits_per_rank == exp_meta.num_logits_per_rank\n+        assert meta.num_local_logits == exp_meta.num_local_logits\n+        assert _np(sorted_idx).tolist() == _np(exp_sorted).tolist()\n+        assert (local.cu_num_logits_np == exp_local.cu_num_logits_np).all()\n+        assert (\n+            _np(local.cu_num_logits).tolist() == _np(exp_local.cu_num_logits).tolist()\n+        )\n+        assert (\n+            _np(local.logits_indices).tolist() == _np(exp_local.logits_indices).tolist()\n+        )\n+        assert (\n+            _np(local.expanded_idx_mapping).tolist()\n+            == _np(exp_local.expanded_idx_mapping).tolist()\n+        )\n+        assert local.num_draft_tokens == exp_local.num_draft_tokens\n+        assert meta.max_num_logits_per_req == exp_meta.max_num_logits_per_req\n+\n+\n def _owned_batch_indices(local_batch: InputBatch) -> np.ndarray:\n     return np.array([int(r.split(\"-\")[1]) for r in local_batch.req_ids], dtype=np.int64)\n "
+        },
+        {
+          "filename": "tests/v1/worker/test_gpu_model_runner_v2.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -94,6 +94,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):\n         num_new_sampled_tokens_per_step=1,\n     )\n     runner.speculator = None\n+    runner.batch_sharder = None\n     runner.req_states = []\n     runner.input_buffers = SimpleNamespace(query_start_loc=None)\n     runner.vocab_size = 1"
+        },
+        {
+          "filename": "vllm/config/vllm.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 15,
+          "patch": "@@ -3193,21 +3193,6 @@ class VllmConfig:\n                 \"not forward sampling masks\"\n             )\n \n-        if (\n-            self.speculative_config is not None\n-            and self.speculative_config.enable_adaptive_verification\n-        ):\n-            # Adaptive verification picks the per-request draft split on the GPU,\n-            # so cu_num_logits_np is only an upper bound, while the shard plan is\n-            # built from that CPU array. The two disagree once the budget binds.\n-            # TODO(TheEpicDolphin): Support adaptive verification with batch-sharded\n-            # sampling.\n-            blockers.append(\n-                \"it does not yet work with adaptive verification, which decides \"\n-                \"the per-request logits counts on the GPU, where the CPU-side \"\n-                \"shard plan cannot see them\"\n-            )\n-\n         if blockers:\n             raise ValueError(\n                 \"Batch-sharded sampling was explicitly enabled via \""
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/input_batch.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 0,
+          "patch": "@@ -15,6 +15,9 @@ if TYPE_CHECKING:\n     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata\n     from vllm.v1.worker.gpu.block_table import BlockTables\n     from vllm.v1.worker.gpu.pcp_manager import PCPBatchMetadata\n+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (\n+        AdmittedDraftCounts,\n+    )\n \n \n class InputBuffers:\n@@ -124,6 +127,10 @@ class InputBatch:\n     # None if there are no prefills.\n     prefill_runs_as_decode_np: np.ndarray | None = None\n \n+    # [num_reqs] admitted draft counts in flight to the host. Set only under\n+    # adaptive verification with batch-sharded sampling, when the budget binds.\n+    num_admitted_draft_tokens: \"AdmittedDraftCounts | None\" = None\n+\n     @classmethod\n     def make_dummy(\n         cls,"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/model_runner.py",
+          "status": "modified",
+          "additions": 13,
+          "deletions": 3,
+          "patch": "@@ -450,6 +450,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n                     max_num_reqs=self.max_num_reqs,\n                     max_num_logits_per_req=self.decode_query_len,\n                     device=self.device,\n+                    adaptive_verification_enabled=(\n+                        self.speculative_config is not None\n+                        and self.speculative_config.enable_adaptive_verification\n+                    ),\n                 )\n                 logger.info(\"Batch-sharded sampling enabled.\")\n             else:\n@@ -711,6 +715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             vllm_config=self.vllm_config,\n             target_layer_names=target_attn_layer_names,\n             additional_attn_cg_support=additional_attn_cg_support,\n+            copy_admitted_drafts_to_host=self.batch_sharder is not None,\n         )\n \n         self.block_tables = BlockTables(\n@@ -1434,6 +1439,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         # compact_batch's budget is only primed when drafts are scheduled.\n         adaptive_verification = self.adaptive_verification if draft_tokens else None\n         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np\n+        num_admitted_draft_tokens = None\n         if adaptive_verification is not None:\n             # num_scheduled_tokens represents the draft budget evenly distributed across\n             # all verification requests, `reallocate_drafts` will unevenly assign the\n@@ -1458,9 +1464,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         query_start_loc = self.input_buffers.query_start_loc\n         async_tensor_h2d(query_start_loc_np, out=query_start_loc)\n         if adaptive_verification is not None:\n-            cu_num_logits, query_start_loc, total_num_draft_tokens = (\n-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)\n-            )\n+            (\n+                cu_num_logits,\n+                query_start_loc,\n+                total_num_draft_tokens,\n+                num_admitted_draft_tokens,\n+            ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)\n             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens\n         if num_draft_tokens_per_req is not None:\n             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(\n@@ -1545,6 +1554,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             num_tokens_after_padding=num_tokens_after_padding,\n             num_draft_tokens=total_num_draft_tokens,\n             num_draft_tokens_per_req=num_draft_tokens_per_req,\n+            num_admitted_draft_tokens=num_admitted_draft_tokens,\n             query_start_loc=query_start_loc,\n             query_start_loc_np=query_start_loc_np,\n             seq_lens=seq_lens,"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/sample/batch_shard.py",
+          "status": "modified",
+          "additions": 36,
+          "deletions": 4,
+          "patch": "@@ -45,6 +45,7 @@ class BatchShardMetadata:\n     # tensor. Derived from the global cu_num_logits, so each rank agrees\n     # ont he gather shapes, including empty shards.\n     max_num_logits_per_req: int\n+    adaptive_verification_enabled: bool\n \n \n @triton.jit(\n@@ -150,11 +151,13 @@ class BatchSharder:\n         max_num_reqs: int,\n         max_num_logits_per_req: int,\n         device: torch.device,\n+        adaptive_verification_enabled: bool,\n     ):\n         tp_group = get_tp_group()\n         self.tp_rank = tp_group.rank_in_group\n         self.tp_size = tp_group.world_size\n         self.device = device\n+        self.adaptive_verification_enabled = adaptive_verification_enabled\n         self._padded_num_reqs = triton.next_power_of_2(max_num_reqs)\n         self._padded_num_logits_per_req = triton.next_power_of_2(max_num_logits_per_req)\n         self._num_warps = max(1, min(8, self._padded_num_reqs // 128))\n@@ -175,7 +178,6 @@ class BatchSharder:\n         tp_rank = self.tp_rank\n         tp_size = self.tp_size\n         num_reqs = input_batch.idx_mapping_np.shape[0]\n-        num_logits = int(input_batch.cu_num_logits_np[-1])\n \n         # Deterministically assign requests to ranks, round-robin over slot\n         # indices so ownership stays balanced when the slot allocator fills\n@@ -187,9 +189,23 @@ class BatchSharder:\n         num_local_reqs = local_req_indices_np.shape[0]\n         num_reqs_per_rank_np = np.bincount(req_owner_np, minlength=tp_size)\n         max_num_reqs_per_rank = int(num_reqs_per_rank_np.max()) if num_reqs else 1\n+        # Get the number of logits per request on the host.\n+        num_logits_per_req_np = np.diff(input_batch.cu_num_logits_np)\n+        num_admitted_draft_tokens_np = None\n+        if input_batch.num_admitted_draft_tokens is not None:\n+            # Under adaptive verification, cu_num_logits_np holds the scheduled counts.\n+            # When the budget binds, the admitted counts are copied to the host so the\n+            # plan matches the device layout.\n+            assert input_batch.num_draft_tokens_per_req is not None\n+            num_admitted_draft_tokens_np = input_batch.num_admitted_draft_tokens.wait()\n+            num_logits_per_req_np = (\n+                num_logits_per_req_np\n+                - input_batch.num_draft_tokens_per_req\n+                + num_admitted_draft_tokens_np\n+            )\n+        num_logits = int(num_logits_per_req_np.sum())\n         # Derive the number of logits owned by each rank, as well as the\n         # local rank.\n-        num_logits_per_req_np = np.diff(input_batch.cu_num_logits_np)\n         num_logits_per_rank_np = np.bincount(\n             req_owner_np, weights=num_logits_per_req_np, minlength=tp_size\n         ).astype(np.int64)\n@@ -254,7 +270,15 @@ class BatchSharder:\n             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req[\n                 local_req_indices_np\n             ]\n-            num_draft_tokens = int(num_draft_tokens_per_req.sum())\n+            if num_admitted_draft_tokens_np is not None:\n+                # Under adaptive verification num_draft_tokens_per_req holds the\n+                # scheduled counts. Follow the admitted counts so every rank picks\n+                # the same sampler as the replicated path, including a budget of 0.\n+                num_draft_tokens = int(\n+                    num_admitted_draft_tokens_np[local_req_indices_np].sum()\n+                )\n+            elif input_batch.num_draft_tokens > 0:\n+                num_draft_tokens = int(num_draft_tokens_per_req.sum())\n \n         local_req_ids = [input_batch.req_ids[i] for i in local_req_indices_np.tolist()]\n         local_batch = replace(\n@@ -284,6 +308,7 @@ class BatchSharder:\n             max_num_reqs_per_rank=max_num_reqs_per_rank,\n             gathered_src_indices=gathered_src_indices,\n             max_num_logits_per_req=max_num_logits_per_req,\n+            adaptive_verification_enabled=self.adaptive_verification_enabled,\n         )\n         return local_batch, sorted_logits_indices, local_grammar_output, metadata\n \n@@ -580,7 +605,14 @@ def _gather_logprobs_tensors(\n         logprobs=logprobs,\n         selected_token_ranks=selected_token_ranks,\n         cu_num_generated_tokens=(\n-            global_batch.cu_num_logits_np.tolist() if num_logits != num_reqs else None\n+            None\n+            if metadata.adaptive_verification_enabled or num_logits == num_reqs\n+            else global_batch.cu_num_logits_np.tolist()\n+        ),\n+        cu_num_generated_tokens_tensor=(\n+            global_batch.cu_num_logits.clone()\n+            if metadata.adaptive_verification_enabled\n+            else None\n         ),\n     )\n "
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "status": "modified",
+          "additions": 44,
+          "deletions": 1,
+          "patch": "@@ -128,6 +128,19 @@ def build_cost_tables_from_curves(\n     return draft_table, verify_table\n \n \n+class AdmittedDraftCounts:\n+    \"\"\"Per-request admitted draft counts, in flight to the host.\"\"\"\n+\n+    def __init__(self, cpu: torch.Tensor, event: torch.cuda.Event):\n+        self._cpu = cpu\n+        self._event = event\n+\n+    def wait(self) -> np.ndarray:\n+        with gpu_sync_allowed():\n+            self._event.synchronize()\n+        return self._cpu.numpy()\n+\n+\n class AdaptiveVerificationManager:\n     def __init__(\n         self,\n@@ -135,6 +148,7 @@ class AdaptiveVerificationManager:\n         query_start_loc: torch.Tensor,\n         num_bonus_tokens: int,\n         max_total_logits: int,\n+        copy_admitted_drafts_to_host: bool = False,\n     ):\n         self.req_states = req_states\n         self.num_speculative_steps = req_states.num_speculative_steps\n@@ -164,6 +178,15 @@ class AdaptiveVerificationManager:\n         self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])\n         self._cu_num_logits = torch.empty_like(query_start_loc)\n \n+        # Batch-sharded sampling sizes its all-to-all from host counts, so it\n+        # needs the admitted split on the host.\n+        self._copy_admitted_drafts_to_host = copy_admitted_drafts_to_host\n+        if copy_admitted_drafts_to_host:\n+            self._admitted_drafts_cpu = torch.empty(\n+                max_num_reqs, dtype=torch.int32, pin_memory=True\n+            )\n+            self._admitted_drafts_event = torch.cuda.Event(blocking=True)\n+\n         # Two D2H slots preserve stale inputs for budget selection.\n         self._stale_confidences = [\n             CpuGpuBuffer(\n@@ -391,7 +414,10 @@ class AdaptiveVerificationManager:\n \n     def reallocate_drafts(\n         self, req_ids: list[str], idx_mapping: torch.Tensor\n-    ) -> tuple[torch.Tensor, torch.Tensor, int]:\n+    ) -> tuple[torch.Tensor, torch.Tensor, int, AdmittedDraftCounts | None]:\n+        \"\"\"The admitted draft counts are None unless copy_admitted_drafts_to_host\n+        is set and the budget binds; otherwise the host counts are already exact.\n+        \"\"\"\n         batch_budget, self._batch_budget = self._batch_budget, None\n         assert batch_budget is not None\n         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget\n@@ -440,10 +466,25 @@ class AdaptiveVerificationManager:\n             out=self.query_start_loc[1 : num_reqs + 1],\n         )\n         self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)\n+\n+        admitted_drafts = None\n+        if self._copy_admitted_drafts_to_host and (\n+            0 < draft_budget < int(scheduled_drafts.sum())\n+        ):\n+            admitted_cpu = self._admitted_drafts_cpu[:num_reqs]\n+            current_stream = torch.cuda.current_stream(self.req_states.device)\n+            self._copy_stream.wait_stream(current_stream)\n+            with stream(self._copy_stream, current_stream):\n+                admitted_cpu.copy_(capacities, non_blocking=True)\n+                self._admitted_drafts_event.record()\n+            admitted_drafts = AdmittedDraftCounts(\n+                admitted_cpu, self._admitted_drafts_event\n+            )\n         return (\n             self._cu_num_logits[: num_reqs + 1],\n             self.query_start_loc,\n             draft_budget,\n+            admitted_drafts,\n         )\n \n \n@@ -458,6 +499,7 @@ def maybe_create_adaptive_verification_manager(\n     vllm_config: \"VllmConfig\",\n     target_layer_names: set[str] | None = None,\n     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,\n+    copy_admitted_drafts_to_host: bool = False,\n ) -> AdaptiveVerificationManager | None:\n     if not enable_adaptive_verification:\n         return None\n@@ -506,4 +548,5 @@ def maybe_create_adaptive_verification_manager(\n         query_start_loc,\n         num_bonus_tokens,\n         max_total_logits=max_total_logits,\n+        copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,\n     )\n"
+        }
+      ]
+    },
+    {
+      "sha": "56e4e42868b4652c66cb009928ddcee859b0d3c9",
+      "author": {
+        "name": "Wentao Ye",
+        "email": "44945378+yewentao256@users.noreply.github.com"
+      },
+      "date": "2026-10-25T04:26:19+08:00",
+      "message": "[GLM 5.3 Perf] Skip scale calculation for `concat_and_cache_mla`, 1.2% ~ 3.0% E2E TPOT improvement (#62102)",
+      "parents": [
+        "dd5e754494b48900748044dbd5eaba49d5637841"
+      ],
+      "stats": {
+        "total_additions": 53,
+        "total_deletions": 14,
+        "files_changed": 13
+      },
+      "files": [
+        {
+          "filename": "csrc/cache_kernels.cu",
+          "status": "modified",
+          "additions": 19,
+          "deletions": 4,
+          "patch": "@@ -420,7 +420,8 @@ __global__ void reshape_and_cache_flash_kernel(\n   }\n }\n \n-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>\n+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,\n+          bool skip_scale>\n __global__ void concat_and_cache_mla_kernel(\n     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]\n     const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]\n@@ -453,6 +454,9 @@ __global__ void concat_and_cache_mla_kernel(\n           block_idx * block_stride + block_offset * entry_stride + i + offset;\n       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {\n         dst[dst_idx] = src[src_idx];\n+      } else if constexpr (skip_scale) {\n+        dst[dst_idx] =\n+            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], 1.0f);\n       } else {\n         dst[dst_idx] =\n             fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);\n@@ -910,8 +914,8 @@ void reshape_and_cache_flash(\n // KV_T is the data type of key and value tensors.\n // CACHE_T is the stored data type of kv-cache.\n // KV_DTYPE is the real data type of kv-cache.\n-#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)                    \\\n-  vllm::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>                  \\\n+#define LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, SKIP_SCALE)      \\\n+  vllm::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE, SKIP_SCALE>      \\\n       <<<grid, block, 0, stream>>>(                                           \\\n           reinterpret_cast<KV_T*>(kv_c.data_ptr()),                           \\\n           reinterpret_cast<KV_T*>(k_pe.data_ptr()),                           \\\n@@ -920,6 +924,13 @@ void reshape_and_cache_flash(\n           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \\\n           reinterpret_cast<const float*>(scale.data_ptr()));\n \n+#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)      \\\n+  if (skip_scale) {                                             \\\n+    LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, true)  \\\n+  } else {                                                      \\\n+    LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, false) \\\n+  }\n+\n // KV_T is the data type of key and value tensors.\n // CACHE_T is the stored data type of kv-cache.\n #define CALL_CONCAT_AND_CACHE_DS_MLA(KV_T, CACHE_T, KV_DTYPE)                 \\\n@@ -938,7 +949,8 @@ void concat_and_cache_mla(\n     torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, (kv_lora_rank\n                                       // + pe_dim)]\n     torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]\n-    const std::string& kv_cache_dtype, torch::stable::Tensor& scale) {\n+    const std::string& kv_cache_dtype, torch::stable::Tensor& scale,\n+    bool skip_scale) {\n   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from\n   // slot_mapping.size(0) because of padding for CUDA graphs.\n   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because\n@@ -1030,6 +1042,9 @@ void concat_and_cache_mla(\n   }\n }\n \n+#undef CALL_CONCAT_AND_CACHE_MLA\n+#undef LAUNCH_CONCAT_AND_CACHE_MLA\n+\n void concat_and_cache_mla_grouped(\n     torch::stable::Tensor& kv_c,  // [num_layers, num_tokens, kv_lora_rank]\n     torch::stable::Tensor& k_pe,  // [num_layers, num_tokens, pe_dim]"
+        },
+        {
+          "filename": "csrc/ops.h",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -712,7 +712,7 @@ void concat_and_cache_mla(torch::stable::Tensor& kv_c,\n                           torch::stable::Tensor& kv_cache,\n                           torch::stable::Tensor& slot_mapping,\n                           const std::string& kv_cache_dtype,\n-                          torch::stable::Tensor& scale);\n+                          torch::stable::Tensor& scale, bool skip_scale);\n \n void concat_and_cache_mla_grouped(\n     torch::stable::Tensor& kv_c, torch::stable::Tensor& k_pe,"
+        },
+        {
+          "filename": "csrc/torch_bindings.cpp",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -1021,7 +1021,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {\n       \"                     Tensor! kv_cache,\"\n       \"                     Tensor slot_mapping,\"\n       \"                     str kv_cache_dtype,\"\n-      \"                     Tensor scale) -> ()\");\n+      \"                     Tensor scale,\"\n+      \"                     bool skip_scale=False) -> ()\");\n \n   // Grouped concat_and_cache_mla across all layers. Each layer's cache base\n   // pointer and optional plain-FP8 scale are read from device tensors."
+        },
+        {
+          "filename": "tests/kernels/test_fused_deepseek_v32_norm_rope.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 1,
+          "patch": "@@ -196,9 +196,14 @@ def test_fused_norm_rope(\n     bs = max_pos  # single block covering all tokens\n     mla_dim = cfg.kv_lora + cfg.rope_dim\n     mla_fp8 = mla_dtype == \"fp8\"\n+    unit_scale = (\n+        mla_fp8 and cfg == MODEL_CONFIGS[0] and num_tokens == 4 and index_interleave\n+    )\n     if mla_fp8:\n         mla_cache = torch.zeros(1, bs, mla_dim, device=dev, dtype=torch.uint8)\n-        mla_k_scale = torch.tensor([0.3], device=dev, dtype=torch.float32)\n+        mla_k_scale = torch.tensor(\n+            [1.0 if unit_scale else 0.3], device=dev, dtype=torch.float32\n+        )\n     else:\n         mla_cache = torch.zeros(1, bs, mla_dim, device=dev, dtype=torch.bfloat16)\n         mla_k_scale = None\n@@ -228,6 +233,7 @@ def test_fused_norm_rope(\n         mla_kv_cache=mla_cache,\n         mla_kv_cache_dtype=mla_dtype,\n         mla_k_scale=mla_k_scale,\n+        skip_scale=unit_scale,\n         has_indexer=True,\n         index_rope_interleave=index_interleave,\n     )"
+        },
+        {
+          "filename": "vllm/_custom_ops.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -2915,9 +2915,10 @@ def concat_and_cache_mla(\n     slot_mapping: torch.Tensor,\n     kv_cache_dtype: str,\n     scale: torch.Tensor,\n+    skip_scale: bool = False,\n ) -> None:\n     torch.ops._C_cache_ops.concat_and_cache_mla(\n-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale\n+        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale\n     )\n \n "
+        },
+        {
+          "filename": "vllm/model_executor/layers/attention/mla_attention.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -815,6 +815,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):\n             slot_mapping,\n             kv_cache_dtype,\n             k_scale,\n+            kv_cache_dtype in (\"fp8\", \"fp8_e4m3\", \"fp8_e5m2\")\n+            and self._k_scale_float == 1.0,\n         )\n \n     def prepare_kv_cache_update("
+        },
+        {
+          "filename": "vllm/models/deepseek_v32/amd/rocm.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -244,6 +244,7 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):\n             mla_kv_cache=mla_kv_cache,\n             mla_kv_cache_dtype=self.kv_cache_dtype,\n             mla_k_scale=mla_k_scale,\n+            skip_scale=self._k_scale_float == 1.0,\n             has_indexer=has_indexer,\n             index_rope_interleave=self._index_rope_interleave,\n             kv_c_out=kv_c_out,"
+        },
+        {
+          "filename": "vllm/models/deepseek_v32/attention.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -398,6 +398,7 @@ class DeepseekV32Attention(MLAAttention):\n             mla_kv_cache=mla_kv_cache,\n             mla_kv_cache_dtype=self.kv_cache_dtype,\n             mla_k_scale=mla_k_scale,\n+            skip_scale=self._k_scale_float == 1.0,\n             has_indexer=has_indexer,\n             index_rope_interleave=self._index_rope_interleave,\n             kv_c_out=kv_c_out,\n@@ -546,6 +547,8 @@ class DeepseekV32Attention(MLAAttention):\n                 cache_slot_mapping,\n                 self.kv_cache_dtype,\n                 self._k_scale,\n+                self._k_scale_float == 1.0\n+                and self.kv_cache_dtype in (\"fp8\", \"fp8_e4m3\", \"fp8_e5m2\"),\n             )\n \n         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]"
+        },
+        {
+          "filename": "vllm/models/deepseek_v32/common/kernels.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 6,
+          "patch": "@@ -179,6 +179,7 @@ def _fused_norm_rope_kernel(\n     mla_cache_entry_stride,\n     MLA_CACHE_BLOCK_SIZE: tl.constexpr,\n     MLA_CACHE_FP8: tl.constexpr,\n+    SKIP_MLA_SCALE: tl.constexpr,\n     mla_cache_scale_ptr,\n     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).\n     # mla_cache_ptr is the fp8 (1-byte) view, so the block/entry strides above\n@@ -389,18 +390,19 @@ def _fused_norm_rope_kernel(\n             )\n             # kv_c_normed (KV_DIM elements)\n             if MLA_CACHE_FP8:\n-                scale = tl.load(mla_cache_scale_ptr)\n-                kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)\n+                scale = 1.0\n+                if not SKIP_MLA_SCALE:\n+                    scale = tl.load(mla_cache_scale_ptr)\n+                    kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)\n+                else:\n+                    kv_c_fp8 = kv_c.to(tl.float32).to(fp8_dtype)\n                 tl.store(dst + kv_block, kv_c_fp8)\n             else:\n                 tl.store(dst + kv_block, kv_c)\n             # k_pe_roped (from registers, interleaved layout)\n             if MLA_CACHE_FP8:\n                 tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(fp8_dtype))\n-                tl.store(\n-                    dst + KV_DIM + dim_off * 2 + 1,\n-                    (r2 / scale).to(fp8_dtype),\n-                )\n+                tl.store(dst + KV_DIM + dim_off * 2 + 1, (r2 / scale).to(fp8_dtype))\n             else:\n                 tl.store(dst + KV_DIM + dim_off * 2, r1)\n                 tl.store(dst + KV_DIM + dim_off * 2 + 1, r2)\n@@ -543,6 +545,7 @@ def fused_norm_rope(\n     kv_c_out: torch.Tensor | None = None,\n     k_pe_out: torch.Tensor | None = None,\n     index_k_out: torch.Tensor | None = None,\n+    skip_scale: bool = False,\n ) -> torch.Tensor:\n     assert positions.ndim == 1\n     assert q_c.ndim == 2\n@@ -719,6 +722,7 @@ def fused_norm_rope(\n         mla_entry_stride,\n         mla_block_size,\n         mla_cache_fp8,\n+        mla_cache_fp8 and skip_scale,\n         mla_k_scale,\n         mla_ds_scale_view,\n         mla_ds_rope_view,"
+        },
+        {
+          "filename": "vllm/models/dots3_note/nvidia/attention.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -723,6 +723,7 @@ class Dots3NotePaddedSparseImpl(FlashAttnMLASparseImpl):\n         slot_mapping: torch.Tensor,\n         kv_cache_dtype: str,\n         k_scale: torch.Tensor,\n+        skip_scale: bool = False,\n     ) -> None:\n         super().do_kv_cache_update(\n             kv_c_normed,\n@@ -731,6 +732,7 @@ class Dots3NotePaddedSparseImpl(FlashAttnMLASparseImpl):\n             slot_mapping,\n             kv_cache_dtype,\n             k_scale,\n+            skip_scale=skip_scale,\n         )\n \n     def forward_mha(  # type: ignore[override]"
+        },
+        {
+          "filename": "vllm/v1/attention/backend.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -1113,6 +1113,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):\n         slot_mapping: torch.Tensor,\n         kv_cache_dtype: str,\n         k_scale: torch.Tensor,\n+        skip_scale: bool = False,\n     ) -> None:\n         if kv_cache.numel() == 0:\n             return\n@@ -1125,6 +1126,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):\n             slot_mapping.flatten(),\n             kv_cache_dtype=kv_cache_dtype,\n             scale=k_scale,\n+            skip_scale=skip_scale,\n         )\n \n "
+        },
+        {
+          "filename": "vllm/v1/attention/backends/mla/amx_mla.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -311,6 +311,7 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):\n         slot_mapping: torch.Tensor,\n         kv_cache_dtype: str,\n         k_scale: torch.Tensor,\n+        skip_scale: bool = False,\n     ) -> None:\n         # Overrides the default (CUDA-only concat_and_cache_mla).\n         if kv_cache.numel() == 0:"
+        },
+        {
+          "filename": "vllm/v1/attention/backends/mla/cpu_mla.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -200,6 +200,7 @@ class CPUMLAImpl(MLACommonImpl[MLACommonMetadata]):\n         slot_mapping: torch.Tensor,\n         kv_cache_dtype: str,\n         k_scale: torch.Tensor,\n+        skip_scale: bool = False,\n     ) -> None:\n         if kv_cache.numel() == 0:\n             return\n"
+        }
+      ]
+    },
+    {
+      "sha": "dd5e754494b48900748044dbd5eaba49d5637841",
+      "author": {
+        "name": "Rushabh Lalwani",
+        "email": "59822428+rushabh-46@users.noreply.github.com"
+      },
+      "date": "2026-10-25T04:22:11+08:00",
+      "message": "[Profiling] Add support for profile_prefix payload in HTTP /start_profile endpoint (#51974)\n\nSigned-off-by: Rushabh Lalwani <rlalwani@google.com>\nCo-authored-by: Rushabh Lalwani <rlalwani@google.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "e7473bf6862289f0647d1f4b01498288b181e063"
+      ],
+      "stats": {
+        "total_additions": 105,
+        "total_deletions": 17,
+        "files_changed": 17
+      },
+      "files": [
+        {
+          "filename": "docs/contributing/profiling.md",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 1,
+          "patch": "@@ -109,7 +109,11 @@ curl -X POST http://localhost:8000/start_profile \\\n     -d '{\n         \"profile_prefix\": \"sharegpt_run_1\",\n         \"delay_iterations\": 5000,\n-        \"max_iterations\": 20\n+        \"max_iterations\": 20,\n+        \"profiler_kwargs\": {\n+            \"record_shapes\": true,\n+            \"with_stack\": true\n+        }\n     }'\n ```\n "
+        },
+        {
+          "filename": "docs/serving/offline_inference.md",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -36,7 +36,7 @@ For further details on pooling models, please refer to [this page](../models/poo\n \n For further details on profiling, please refer to [this page](../contributing/profiling.md).\n \n-- `LLM.start_profile` - Starts profiling with an optional custom trace prefix.\n+- `LLM.start_profile` - Starts profiling with an optional custom trace prefix (`profile_prefix`) and optional profiler keyword arguments (`profiler_kwargs`).\n - `LLM.stop_profile` - Stops the ongoing profiling session.\n \n ## Sleep Mode APIs"
+        },
+        {
+          "filename": "docs/serving/online_serving/README.md",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -116,7 +116,7 @@ LoRA dynamic loading & unloading is enabled in the API server. This should ONLY\n \n For further details on profiling vLLM, please refer to [this page](../../contributing/profiling.md).\n \n-- `/start_profile` - Start PyTorch profiler\n+- `/start_profile` - Start PyTorch profiler (accepts an optional JSON body with `profiler_kwargs` to pass keyword arguments to the underlying profiler)\n - `/stop_profile` - Stop PyTorch profiler\n \n ### SageMaker APIs"
+        },
+        {
+          "filename": "tests/entrypoints/serve/test_profile_api_router.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -58,6 +58,7 @@ def test_start_profile_forwards_session_overrides(\n             \"profile_prefix\": \"sharegpt_run-1\",\n             \"delay_iterations\": 5000,\n             \"max_iterations\": 20,\n+            \"profiler_kwargs\": {\"record_shapes\": True},\n         },\n     )\n \n@@ -66,6 +67,7 @@ def test_start_profile_forwards_session_overrides(\n         profile_prefix=\"sharegpt_run-1\",\n         delay_iterations=5000,\n         max_iterations=20,\n+        profiler_kwargs={\"record_shapes\": True},\n     )\n \n \n@@ -75,6 +77,7 @@ def test_start_profile_forwards_session_overrides(\n         {\"profile_prefix\": 1},\n         {\"delay_iterations\": \"1\"},\n         {\"max_iterations\": \"20\"},\n+        {\"profiler_kwargs\": \"invalid\"},\n     ],\n )\n def test_start_profile_rejects_wrongly_typed_overrides("
+        },
+        {
+          "filename": "tests/v1/engine/test_async_llm.py",
+          "status": "modified",
+          "additions": 16,
+          "deletions": 9,
+          "patch": "@@ -157,7 +157,7 @@ def test_cuda_profiler_requests_reach_engine_core(monkeypatch: pytest.MonkeyPatc\n \n     assert engine.profiler is None\n     engine_core.profile_async.assert_has_awaits(\n-        [call(True, None, None, None), call(False)]\n+        [call(True, None, None, None, profiler_kwargs=None), call(False)]\n     )\n \n \n@@ -200,6 +200,7 @@ def test_profile_forwards_overrides_rejects_duplicate_and_allows_restart(\n             \"session\",\n             delay_iterations=5,\n             max_iterations=2,\n+            profiler_kwargs={\"record_shapes\": True},\n         )\n         with pytest.raises(ProfilerAlreadyActiveError) as exc_info:\n             await engine.start_profile(\"duplicate\")\n@@ -212,9 +213,15 @@ def test_profile_forwards_overrides_rejects_duplicate_and_allows_restart(\n \n     engine_core.profile_async.assert_has_awaits(\n         [\n-            call(True, \"session\", 5, 2),\n+            call(\n+                True,\n+                \"session\",\n+                5,\n+                2,\n+                profiler_kwargs={\"record_shapes\": True},\n+            ),\n             call(False),\n-            call(True, \"next-session\", None, None),\n+            call(True, \"next-session\", None, None, profiler_kwargs=None),\n             call(False),\n         ]\n     )\n@@ -239,7 +246,7 @@ def test_stop_profile_waits_for_inflight_start(monkeypatch: pytest.MonkeyPatch):\n         start_rpc_entered = asyncio.Event()\n         release_start_rpc = asyncio.Event()\n \n-        async def profile_async(is_start, *args):\n+        async def profile_async(is_start, *args, **kwargs):\n             if is_start:\n                 start_rpc_entered.set()\n                 await release_start_rpc.wait()\n@@ -284,7 +291,7 @@ def test_interrupted_engine_profile_start_skips_frontend_profiler(\n     async def profile():\n         start_rpc_entered = asyncio.Event()\n \n-        async def profile_async(is_start, *args):\n+        async def profile_async(is_start, *args, **kwargs):\n             if not is_start:\n                 return\n             start_rpc_entered.set()\n@@ -368,7 +375,7 @@ def test_stop_after_cancelled_frontend_start_stops_frontend_profiler(\n     assert frontend_profiler._running is False\n     assert engine._profile_session_active is False\n     assert engine_core.profile_async.await_args_list == [\n-        call(True, None, None, None),\n+        call(True, None, None, None, profiler_kwargs=None),\n         call(False),\n     ]\n \n@@ -409,10 +416,10 @@ def test_multi_client_profile_uses_idempotent_engine_requests(\n \n     engine_core.profile_async.assert_has_awaits(\n         [\n-            call(True, None, None, None),\n-            call(True, None, None, None),\n+            call(True, None, None, None, profiler_kwargs=None),\n+            call(True, None, None, None, profiler_kwargs=None),\n             call(False),\n-            call(True, None, None, None),\n+            call(True, None, None, None, profiler_kwargs=None),\n         ]\n     )\n "
+        },
+        {
+          "filename": "tests/v1/engine/test_llm_engine.py",
+          "status": "modified",
+          "additions": 14,
+          "deletions": 1,
+          "patch": "@@ -63,7 +63,20 @@ def test_duplicate_profile_start_rejected_before_engine_core_dispatch():\n     with pytest.raises(ProfilerAlreadyActiveError):\n         engine.start_profile(\"duplicate\")\n \n-    engine.engine_core.profile.assert_called_once_with(True, \"first\", None, None)\n+    engine.engine_core.profile.assert_called_once_with(\n+        True, \"first\", None, None, profiler_kwargs=None\n+    )\n+\n+\n+def test_profiler_kwargs_passed_to_engine_core():\n+    engine = object.__new__(LLMEngine)\n+    engine.engine_core = MagicMock()\n+    engine._profile_session_active = False\n+\n+    engine.start_profile(\"prefix\", profiler_kwargs={\"record_shapes\": True})\n+    engine.engine_core.profile.assert_called_once_with(\n+        True, \"prefix\", None, None, profiler_kwargs={\"record_shapes\": True}\n+    )\n \n \n @pytest.mark.parametrize("
+        },
+        {
+          "filename": "tests/v1/worker/test_gpu_profiler.py",
+          "status": "modified",
+          "additions": 12,
+          "deletions": 1,
+          "patch": "@@ -300,6 +300,7 @@ def test_worker_creates_platform_torch_profiler(device_type, activities, expecte\n         worker_name=\"rank0\",\n         local_rank=0,\n         activities=expected,\n+        profiler_kwargs=None,\n     )\n \n \n@@ -321,6 +322,7 @@ def test_worker_reuses_torch_wrapper_across_profile_rounds(worker_type):\n             profile_prefix=\"first\",\n             delay_iterations=5,\n             max_iterations=2,\n+            profiler_kwargs={\"record_shapes\": True},\n         )\n         worker.profile(is_start=False)\n         worker.profile(profile_prefix=\"second\")\n@@ -331,6 +333,10 @@ def test_worker_reuses_torch_wrapper_across_profile_rounds(worker_type):\n         call(\"first_rank0\"),\n         call(\"second_rank0\"),\n     ]\n+    assert wrapper.return_value.set_profiler_kwargs.call_args_list == [\n+        call({\"record_shapes\": True}),\n+        call(None),\n+    ]\n     assert wrapper.return_value.start.call_args_list == [\n         call(delay_iterations=5, max_iterations=2),\n         call(delay_iterations=None, max_iterations=None),\n@@ -349,6 +355,7 @@ def test_executor_profile_only_forwards_supplied_override_kwargs():\n         \"bounded\",\n         delay_iterations=5,\n         max_iterations=2,\n+        profiler_kwargs={\"record_shapes\": True},\n     )\n \n     assert executor.collective_rpc.call_args_list == [\n@@ -356,7 +363,11 @@ def test_executor_profile_only_forwards_supplied_override_kwargs():\n         call(\n             \"profile\",\n             args=(True, \"bounded\"),\n-            kwargs={\"delay_iterations\": 5, \"max_iterations\": 2},\n+            kwargs={\n+                \"delay_iterations\": 5,\n+                \"max_iterations\": 2,\n+                \"profiler_kwargs\": {\"record_shapes\": True},\n+            },\n         ),\n     ]\n "
+        },
+        {
+          "filename": "vllm/engine/protocol.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -172,6 +172,7 @@ class EngineClient(ABC):\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict[str, Any] | None = None,\n     ) -> None:\n         \"\"\"Start profiling with optional per-session overrides.\"\"\"\n         ..."
+        },
+        {
+          "filename": "vllm/entrypoints/llm.py",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 0,
+          "patch": "@@ -803,6 +803,7 @@ class LLM(\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict[str, Any] | None = None,\n     ) -> None:\n         \"\"\"Start profiling with optional per-session overrides.\n \n@@ -814,12 +815,15 @@ class LLM(\n                 profiling starts.\n             max_iterations: Optional maximum number of worker iterations to profile.\n                 Zero means no limit.\n+            profiler_kwargs: Optional dictionary of keyword arguments to pass to\n+                the underlying profiler.\n \n         \"\"\"\n         self.llm_engine.start_profile(\n             profile_prefix,\n             delay_iterations=delay_iterations,\n             max_iterations=max_iterations,\n+            profiler_kwargs=profiler_kwargs,\n         )\n \n     def stop_profile(self) -> None:"
+        },
+        {
+          "filename": "vllm/entrypoints/serve/profile/api_router.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -2,6 +2,8 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \n \n+from typing import Any\n+\n from fastapi import APIRouter, FastAPI, Request\n from fastapi.responses import Response\n from pydantic import BaseModel, ConfigDict\n@@ -26,6 +28,7 @@ class StartProfileRequest(BaseModel):\n     profile_prefix: str | None = None\n     delay_iterations: int | None = None\n     max_iterations: int | None = None\n+    profiler_kwargs: dict[str, Any] | None = None\n \n \n def engine_client(request: Request) -> EngineClient:"
+        },
+        {
+          "filename": "vllm/profiler/wrapper.py",
+          "status": "modified",
+          "additions": 23,
+          "deletions": 1,
+          "patch": "@@ -208,6 +208,10 @@ class WorkerProfiler(ABC):\n         \"\"\"Set the output name for the next profiling session.\"\"\"\n         return None\n \n+    def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:\n+        \"\"\"Set profiler keyword argument overrides for the next profiling session.\"\"\"\n+        return None\n+\n     def annotate_context_manager(self, name: str):\n         \"\"\"Return a context manager to annotate profiler traces.\"\"\"\n         return nullcontext()\n@@ -229,6 +233,7 @@ class TorchProfilerWrapper(WorkerProfiler):\n         local_rank: int,\n         activities: Sequence[TorchProfilerActivity],\n         on_trace_ready: Callable[[torch.profiler.profile], None] | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         super().__init__(profiler_config)\n \n@@ -289,7 +294,7 @@ class TorchProfilerWrapper(WorkerProfiler):\n                     profiler_config.active_iterations,\n                 )\n \n-        self._profiler_kwargs = dict(\n+        self._base_profiler_kwargs = dict(\n             activities=[TorchProfilerActivityMap[activity] for activity in activities],\n             schedule=profiler_schedule,\n             record_shapes=profiler_config.torch_profiler_record_shapes,\n@@ -298,6 +303,9 @@ class TorchProfilerWrapper(WorkerProfiler):\n             with_flops=profiler_config.torch_profiler_with_flops,\n             on_trace_ready=trace_handler,\n         )\n+        self._profiler_kwargs = dict(self._base_profiler_kwargs)\n+        if profiler_kwargs:\n+            self._profiler_kwargs.update(profiler_kwargs)\n         self.profiler: torch.profiler.profile\n \n         # Track if we're using a schedule (need to call step())\n@@ -328,6 +336,18 @@ class TorchProfilerWrapper(WorkerProfiler):\n             )\n         )\n \n+    @override\n+    def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:\n+        if self._active:\n+            return\n+        on_trace_ready = self._profiler_kwargs[\"on_trace_ready\"]\n+        self._profiler_kwargs = {\n+            **self._base_profiler_kwargs,\n+            \"on_trace_ready\": on_trace_ready,\n+        }\n+        if profiler_kwargs:\n+            self._profiler_kwargs.update(profiler_kwargs)\n+\n     def _build_profiler_table(\n         self,\n         sort_key: str,\n@@ -740,6 +760,7 @@ def create_worker_profiler(\n     *,\n     worker_name: str,\n     local_rank: int,\n+    profiler_kwargs: dict | None = None,\n ) -> WorkerProfiler:\n     \"\"\"Create a profiler using a validated config and platform defaults.\"\"\"\n     profiler_type = profiler_config.profiler\n@@ -754,6 +775,7 @@ def create_worker_profiler(\n             worker_name=worker_name,\n             local_rank=local_rank,\n             activities=default_activities if configured is None else tuple(configured),\n+            profiler_kwargs=profiler_kwargs,\n         )\n     if profiler_type == \"cuda\":\n         logger.debug(\"Starting CUDA profiler\")"
+        },
+        {
+          "filename": "vllm/v1/engine/async_llm.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -1139,6 +1139,7 @@ class AsyncLLM(EngineClient):\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict[str, Any] | None = None,\n     ) -> None:\n         async with self._profile_lock:\n             if self._profile_session_guard_enabled and self._profile_session_active:\n@@ -1156,6 +1157,7 @@ class AsyncLLM(EngineClient):\n                     profile_prefix,\n                     delay_iterations,\n                     max_iterations,\n+                    profiler_kwargs=profiler_kwargs,\n                 )\n             except Exception:\n                 self._profile_session_active = False"
+        },
+        {
+          "filename": "vllm/v1/engine/core.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -845,12 +845,14 @@ class EngineCore:\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ):\n         self.model_executor.profile(\n             is_start,\n             profile_prefix,\n             delay_iterations=delay_iterations,\n             max_iterations=max_iterations,\n+            profiler_kwargs=profiler_kwargs,\n         )\n \n     def reset_mm_cache(self):"
+        },
+        {
+          "filename": "vllm/v1/engine/core_client.py",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 0,
+          "patch": "@@ -190,6 +190,7 @@ class EngineCoreClient(ABC):\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         raise NotImplementedError\n \n@@ -297,6 +298,7 @@ class EngineCoreClient(ABC):\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         raise NotImplementedError\n \n@@ -419,12 +421,14 @@ class InprocClient(EngineCoreClient):\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         self.engine_core.profile(\n             is_start,\n             profile_prefix,\n             delay_iterations=delay_iterations,\n             max_iterations=max_iterations,\n+            profiler_kwargs=profiler_kwargs,\n         )\n \n     def reset_mm_cache(self) -> None:\n@@ -1070,6 +1074,7 @@ class SyncMPClient(MPClient):\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         self.call_utility(\n             \"profile\",\n@@ -1077,6 +1082,7 @@ class SyncMPClient(MPClient):\n             profile_prefix,\n             delay_iterations,\n             max_iterations,\n+            profiler_kwargs,\n         )\n \n     def reset_mm_cache(self) -> None:\n@@ -1361,6 +1367,7 @@ class AsyncMPClient(MPClient):\n         profile_prefix: str | None = None,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ) -> None:\n         await self.call_utility_async(\n             \"profile\",\n@@ -1368,6 +1375,7 @@ class AsyncMPClient(MPClient):\n             profile_prefix,\n             delay_iterations,\n             max_iterations,\n+            profiler_kwargs,\n         )\n \n     async def reset_mm_cache_async(self) -> None:"
+        },
+        {
+          "filename": "vllm/v1/engine/llm_engine.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -371,6 +371,7 @@ class LLMEngine:\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ):\n         if self._profile_session_active:\n             raise ProfilerAlreadyActiveError()\n@@ -384,6 +385,7 @@ class LLMEngine:\n                 profile_prefix,\n                 delay_iterations,\n                 max_iterations,\n+                profiler_kwargs=profiler_kwargs,\n             )\n         except BaseException:\n             self._profile_session_active = False"
+        },
+        {
+          "filename": "vllm/v1/executor/abstract.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 2,
+          "patch": "@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod\n from collections.abc import Callable\n from concurrent.futures import Future\n from functools import cached_property\n-from typing import TYPE_CHECKING, Literal, TypeVar, overload\n+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload\n \n from vllm.config import VllmConfig\n from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator\n@@ -300,12 +300,15 @@ class Executor(ABC):\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ):\n-        kwargs: dict[str, int] = {}\n+        kwargs: dict[str, Any] = {}\n         if delay_iterations is not None:\n             kwargs[\"delay_iterations\"] = delay_iterations\n         if max_iterations is not None:\n             kwargs[\"max_iterations\"] = max_iterations\n+        if profiler_kwargs is not None:\n+            kwargs[\"profiler_kwargs\"] = profiler_kwargs\n         if kwargs:\n             # Reject before dispatch: a failing collective_rpc may leave\n             # unread worker replies queued."
+        },
+        {
+          "filename": "vllm/v1/worker/gpu_worker.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -1395,6 +1395,7 @@ class Worker(WorkerBase):\n         *,\n         delay_iterations: int | None = None,\n         max_iterations: int | None = None,\n+        profiler_kwargs: dict | None = None,\n     ):\n         # Check if profiling is enabled\n         if self.profiler_config is None or self.profiler_config.profiler is None:\n@@ -1425,9 +1426,11 @@ class Worker(WorkerBase):\n                     self.profiler_config,\n                     worker_name=trace_name,\n                     local_rank=self.local_rank,\n+                    profiler_kwargs=profiler_kwargs,\n                 )\n \n             self.profiler.set_output_name(trace_name)\n+            self.profiler.set_profiler_kwargs(profiler_kwargs)\n             self.profiler.start(\n                 delay_iterations=delay_iterations,\n                 max_iterations=max_iterations,\n"
+        }
+      ]
+    },
+    {
+      "sha": "e7473bf6862289f0647d1f4b01498288b181e063",
+      "author": {
+        "name": "Jee Jee Li",
+        "email": "pandaleefree@gmail.com"
+      },
+      "date": "2026-10-25T00:22:16+08:00",
+      "message": "[Kernel] Bump up FlashInfer to 0.7.2.post1 (#63466)\n\nSigned-off-by: Jee Jee Li <jeejeelee@inferact.ai>",
+      "parents": [
+        "be2de711989bb273e108c41f95d868122b154f9d"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 1,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "requirements/cuda.txt",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -10,7 +10,7 @@ torchaudio==2.11.0\n torchvision==0.29.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version\n torchcodec >= 0.14\n PyNvVideoCodec==2.0.4\n-flashinfer-python==0.7.2\n+flashinfer-python==0.7.2.post1\n apache-tvm-ffi==0.1.11\n tilelang==0.1.12\n # >=1.31.0 keeps execution plans alive for the CUDA graphs recorded from them\n"
+        }
+      ]
+    }
+  ]
+}
