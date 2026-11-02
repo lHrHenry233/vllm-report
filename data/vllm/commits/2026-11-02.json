@@ -1,0 +1,285 @@
+{
+  "date": "2026-11-02",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "dfe4a3025d89c17c11762acb1811009f96fcf385",
+      "author": {
+        "name": "Dongji Gao",
+        "email": "dongjig@nvidia.com"
+      },
+      "date": "2026-11-02T10:33:54+08:00",
+      "message": "[Model] Nemotron-3.5-Transcribe: pack the audio tower's valid frames for MMEncoderAttention (#64944)\n\nSigned-off-by: Dongji Gao <dongjig@nvidia.com>\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "16d667348d91ae010cb3cc9d4d6a5b7908a717a9"
+      ],
+      "stats": {
+        "total_additions": 216,
+        "total_deletions": 33,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "docs/models/supported_models.md",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 0,
+          "patch": "@@ -776,6 +776,13 @@ Speech2Text models trained specifically for Automatic Speech Recognition.\n     changes it), and `/v1/audio/transcriptions` splits longer audio into pieces of at most one hour, shorter\n     when `--max-model-len` is below 65,536.\n \n+    Audio tower: the FP8 and NVFP4 checkpoints quantize the linear layers of its ASR encoder to FP8 through\n+    their `quantization_config`. FP8 encoder attention (`--mm-encoder-attn-dtype fp8`) is not supported and\n+    raises an error when the model is built. The tower attends through vLLM's multimodal encoder attention\n+    backend (FlashAttention on CUDA GPUs that support it; `--mm-encoder-attn-backend` selects another). In\n+    bfloat16, its output can depend on that backend and on the other clips in the batch: small rounding\n+    differences can flip the thresholded speaker features on some frames.\n+\n !!! note\n     `VoxtralForConditionalGeneration` requires `mistral-common[audio]` to be installed.\n "
+        },
+        {
+          "filename": "tests/models/multimodal/processing/test_nemotron3_5_transcribe.py",
+          "status": "modified",
+          "additions": 72,
+          "deletions": 1,
+          "patch": "@@ -240,9 +240,15 @@ def tiny_tower(dist_init):\n     from vllm.model_executor.models.nemotron3_5_transcribe_audio import (\n         Nemotron3_5TranscribeAudioTower,\n     )\n+    from vllm.platforms import current_platform\n \n     torch.manual_seed(0)\n-    tower = Nemotron3_5TranscribeAudioTower(TINY_AUDIO_CONFIG).eval()\n+    # vLLM registers the encoder attention ops for the platform's device only.\n+    tower = (\n+        Nemotron3_5TranscribeAudioTower(TINY_AUDIO_CONFIG)\n+        .eval()\n+        .to(current_platform.device_type)\n+    )\n     with torch.no_grad():\n         # vLLM's linear layers allocate their weights uninitialized.\n         for module in tower.modules():\n@@ -458,3 +464,68 @@ def test_audio_tower_encodes_each_clip_as_if_alone(tiny_tower):\n         ]\n     for got, expected in zip(together, alone):\n         torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)\n+\n+\n+def test_encoder_packs_each_rows_valid_frames(tiny_tower):\n+    encoder = tiny_tower.encoder.asr_encoder\n+    packed = encoder.pack(torch.tensor([2, 0, 3]), 4, torch.device(\"cpu\"))\n+    assert packed.rows.tolist() == [0, 1, 8, 9, 10]\n+    assert packed.positions.tolist() == [0, 1, 0, 1, 2]\n+    assert packed.cu_seqlens.tolist() == [0, 2, 5]\n+\n+\n+def test_encoder_runs_only_the_valid_frames(tiny_tower):\n+    encoder = tiny_tower.encoder.asr_encoder\n+    device = encoder.final_norm.weight.device\n+    torch.manual_seed(2)\n+    x = torch.randn(3, 6, encoder.d_model, device=device)\n+    lengths = torch.tensor([6, 0, 3])\n+    with torch.inference_mode():\n+        states, _ = encoder(\n+            x, lengths.to(device), bypass_pre_encode=True, lengths_cpu=lengths\n+        )\n+        alone = [\n+            encoder(\n+                x[row : row + 1, :length],\n+                lengths[row : row + 1].to(device),\n+                bypass_pre_encode=True,\n+            )[0][0]\n+            for row, length in ((0, 6), (2, 3))\n+        ]\n+    assert not states[1].any()\n+    assert not states[2, :, 3:].any()\n+    torch.testing.assert_close(states[0], alone[0], rtol=1e-4, atol=1e-4)\n+    torch.testing.assert_close(states[2, :, :3], alone[1], rtol=1e-4, atol=1e-4)\n+\n+\n+@pytest.mark.parametrize(\"name\", [\"asr_encoder\", \"diarization_model.encoder\"])\n+@pytest.mark.parametrize(\"num_frames\", [0, 6])\n+def test_encoder_returns_zeros_when_no_row_has_frames(tiny_tower, name, num_frames):\n+    encoder = tiny_tower.encoder.get_submodule(name)\n+    device = encoder.final_norm.weight.device\n+    x = torch.randn(3, num_frames, encoder.d_model, device=device)\n+    lengths = torch.zeros(3, dtype=torch.int64)\n+    with torch.inference_mode():\n+        states, _ = encoder(\n+            x, lengths.to(device), bypass_pre_encode=True, lengths_cpu=lengths\n+        )\n+    assert states.shape == (3, encoder.d_model, num_frames)\n+    assert not states.any()\n+\n+\n+@pytest.mark.usefixtures(\"dist_init\")\n+def test_fp8_encoder_attention_is_refused(tmp_path):\n+    from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config\n+    from vllm.model_executor.models.nemotron3_5_transcribe_audio import (\n+        Nemotron3_5TranscribeAudioTower,\n+    )\n+\n+    (tmp_path / \"config.json\").write_text(json.dumps(CHECKPOINT_CONFIG))\n+    model_config = ModelConfig(str(tmp_path), mm_encoder_attn_dtype=\"fp8\")\n+    # vLLM's encoder attention refuses FP8 with another message, except on the\n+    # FlashInfer cuDNN and ROCm AITER backends; the tower refuses it on all.\n+    with (\n+        set_current_vllm_config(VllmConfig(model_config=model_config)),\n+        pytest.raises(ValueError, match=r\"Nemotron-3\\.5-Transcribe does not support\"),\n+    ):\n+        Nemotron3_5TranscribeAudioTower(TINY_AUDIO_CONFIG)"
+        },
+        {
+          "filename": "vllm/model_executor/models/nemotron3_5_transcribe_audio.py",
+          "status": "modified",
+          "additions": 137,
+          "deletions": 32,
+          "patch": "@@ -21,15 +21,20 @@ from collections.abc import Iterable, Sequence\n from dataclasses import dataclass\n from typing import Any, cast\n \n+import numpy as np\n import torch\n import torch.nn.functional as F\n from torch import nn\n \n+from vllm.model_executor.layers.attention.mm_encoder_attention import (\n+    MMEncoderAttention,\n+)\n from vllm.model_executor.layers.linear import ReplicatedLinear\n from vllm.model_executor.layers.quantization import QuantizationConfig\n from vllm.utils.torch_utils import async_tensor_h2d\n \n from .utils import maybe_prefix\n+from .vision import get_multimodal_config\n \n # Checkpoint tensors that the inference path does not use. The speaker\n # encoder's own preprocessor is unused because both encoders read the mel\n@@ -261,7 +266,26 @@ class FeatureStacking(nn.Module):\n         x = x.reshape(\n             batch_size, (num_frames + pad) // self.factor, channels * self.factor\n         )\n-        return self.proj(x), (lengths + self.factor - 1) // self.factor\n+        return self.proj(x), self.output_lengths(lengths)\n+\n+    def output_lengths(self, lengths: torch.Tensor) -> torch.Tensor:\n+        return (lengths + self.factor - 1) // self.factor\n+\n+\n+@dataclass\n+class PackedFrames:\n+    \"\"\"The valid frames of a padded ``(B, T)`` batch, packed row after row.\n+\n+    ``rows`` indexes the flattened batch and ``positions`` holds each frame's\n+    position in its row. ``cu_seqlens``, ``max_seqlen`` and ``sequence_lengths``\n+    are in the format of the attention backend.\n+    \"\"\"\n+\n+    rows: torch.Tensor\n+    positions: torch.Tensor\n+    cu_seqlens: torch.Tensor\n+    max_seqlen: torch.Tensor\n+    sequence_lengths: torch.Tensor | None\n \n \n class MultiHeadAttention(nn.Module):\n@@ -295,25 +319,37 @@ class MultiHeadAttention(nn.Module):\n         if self.qk_norm:\n             self.q_norm = nn.LayerNorm(self.head_dim)\n             self.k_norm = nn.LayerNorm(self.head_dim)\n+        self.attn = MMEncoderAttention(\n+            num_heads=self.n_heads,\n+            head_size=self.head_dim,\n+            prefix=f\"{prefix}.attn\",\n+        )\n \n     def forward(\n         self,\n         x: torch.Tensor,\n-        attn_mask: torch.Tensor,\n+        packed: PackedFrames,\n         cos: torch.Tensor,\n         sin: torch.Tensor,\n     ) -> torch.Tensor:\n-        batch_size, num_frames, _ = x.shape\n-        qkv = self.w_qkv(x).view(batch_size, num_frames, 3, self.n_heads, self.head_dim)\n-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)\n+        \"\"\"Attend within each row of the packed ``(N, d_model)`` frames.\"\"\"\n+        num_frames = x.shape[0]\n+        qkv = self.w_qkv(x).view(num_frames, 3, self.n_heads, self.head_dim)\n+        q, k, v = qkv.unbind(1)\n         if self.qk_norm:\n             q = self.q_norm(q).to(v.dtype)\n             k = self.k_norm(k).to(v.dtype)\n         q = self.rope.apply(q, cos.to(q.dtype), sin.to(q.dtype))\n         k = self.rope.apply(k, cos.to(k.dtype), sin.to(k.dtype))\n-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)\n-        out = out.transpose(1, 2).reshape(batch_size, num_frames, self.d_model)\n-        return self.out_proj(out)\n+        out = self.attn(\n+            q.unsqueeze(0),\n+            k.unsqueeze(0),\n+            v.unsqueeze(0),\n+            cu_seqlens=packed.cu_seqlens,\n+            max_seqlen=packed.max_seqlen,\n+            sequence_lengths=packed.sequence_lengths,\n+        )\n+        return self.out_proj(out.reshape(num_frames, self.d_model))\n \n \n class TransformerBlock(nn.Module):\n@@ -354,11 +390,11 @@ class TransformerBlock(nn.Module):\n     def forward(\n         self,\n         x: torch.Tensor,\n-        attn_mask: torch.Tensor,\n+        packed: PackedFrames,\n         cos: torch.Tensor,\n         sin: torch.Tensor,\n     ) -> torch.Tensor:\n-        x = x + self.attn(self.norm1(x), attn_mask, cos, sin)\n+        x = x + self.attn(self.norm1(x), packed, cos, sin)\n         return x + self.ffn.net(self.norm2(x))\n \n \n@@ -367,8 +403,10 @@ class TransformerEncoder(nn.Module):\n \n     ``forward`` takes ``(B, C, T)`` mel features, or ``(B, T, d_model)``\n     pre-encoded embeddings with ``bypass_pre_encode=True``, and returns\n-    ``(B, d_model, T')`` states with their lengths. Only keys are masked, so\n-    padded frames never influence valid ones.\n+    ``(B, d_model, T')`` states with their lengths. Only each row's valid frames\n+    run through the layers, packed for variable-length attention; the padded\n+    positions of the output are zero. ``lengths_cpu``, the lengths on the host,\n+    lets the packing skip a device-to-host copy.\n     \"\"\"\n \n     def __init__(\n@@ -401,28 +439,63 @@ class TransformerEncoder(nn.Module):\n             ]\n         )\n         self.final_norm = nn.LayerNorm(self.d_model)\n+        self.attn_backend = self.layers[0].attn.attn.attn_backend\n \n     def forward(\n-        self, x: torch.Tensor, lengths: torch.Tensor, bypass_pre_encode: bool = False\n+        self,\n+        x: torch.Tensor,\n+        lengths: torch.Tensor,\n+        bypass_pre_encode: bool = False,\n+        lengths_cpu: torch.Tensor | None = None,\n     ) -> tuple[torch.Tensor, torch.Tensor]:\n         if not bypass_pre_encode:\n             x, lengths = self.pre_encode(x, lengths)\n+            if lengths_cpu is not None:\n+                lengths_cpu = self.pre_encode.output_lengths(lengths_cpu)\n         lengths = lengths.to(torch.int64)\n-        if self.xscale:\n-            x = x * self.xscale\n-        x = self.embed_norm(x)\n-        num_frames = x.shape[1]\n-        positions = torch.arange(num_frames, device=x.device).unsqueeze(0)\n-        # A row with no valid frame (a short clip in a later window) attends to\n-        # frame 0 to stay finite; its outputs are discarded.\n-        key_mask = (positions < lengths.unsqueeze(1)) | (\n-            (positions == 0) & (lengths.unsqueeze(1) == 0)\n-        )\n-        attn_mask = key_mask[:, None, None, :]\n-        cos, sin = self.rope.cos_sin(num_frames, x.dtype, x.device)\n-        for layer in self.layers:\n-            x = layer(x, attn_mask, cos, sin)\n-        return self.final_norm(x).transpose(1, 2), lengths\n+        if lengths_cpu is None:\n+            lengths_cpu = lengths.cpu()\n+        batch_size, num_frames, width = x.shape\n+        out = x.new_zeros(batch_size * num_frames, width)\n+        packed = self.pack(lengths_cpu, num_frames, x.device)\n+        if packed.rows.numel():\n+            h = x.reshape(-1, width).index_select(0, packed.rows)\n+            if self.xscale:\n+                h = h * self.xscale\n+            h = self.embed_norm(h)\n+            cos, sin = self.rope.cos_sin(num_frames, x.dtype, x.device)\n+            cos = cos.index_select(0, packed.positions).unsqueeze(1)\n+            sin = sin.index_select(0, packed.positions).unsqueeze(1)\n+            for layer in self.layers:\n+                h = layer(h, packed, cos, sin)\n+            out.index_copy_(0, packed.rows, self.final_norm(h))\n+        return out.view(batch_size, num_frames, width).transpose(1, 2), lengths\n+\n+    def pack(\n+        self, lengths_cpu: torch.Tensor, num_frames: int, device: torch.device\n+    ) -> PackedFrames:\n+        \"\"\"Index each row's valid frames; rows without any are left out.\"\"\"\n+        lengths_cpu = lengths_cpu.to(torch.int64).clamp(min=0, max=num_frames)\n+        valid = torch.arange(num_frames) < lengths_cpu.unsqueeze(1)\n+        rows = valid.flatten().nonzero().squeeze(1)\n+        positions = torch.arange(num_frames).expand_as(valid)[valid]\n+        seq_lens = lengths_cpu[lengths_cpu > 0].numpy()\n+        cu_seqlens = np.concatenate(([0], np.cumsum(seq_lens))).astype(np.int32)\n+        backend = self.attn_backend\n+        return PackedFrames(\n+            rows=async_tensor_h2d(rows, device=device),\n+            positions=async_tensor_h2d(positions, device=device),\n+            cu_seqlens=MMEncoderAttention.maybe_recompute_cu_seqlens(\n+                backend, cu_seqlens, self.d_model, 1, device\n+            ),\n+            max_seqlen=torch.tensor(\n+                MMEncoderAttention.compute_max_seqlen(backend, cu_seqlens),\n+                dtype=torch.int32,\n+            ),\n+            sequence_lengths=MMEncoderAttention.maybe_compute_seq_lens(\n+                backend, cu_seqlens, device\n+            ),\n+        )\n \n \n def downsample_preds(preds: torch.Tensor, factor: int) -> torch.Tensor:\n@@ -718,6 +791,7 @@ class SortformerSpeakerEncoder(nn.Module):\n         state: SpeakerCacheState,\n         left_offset: int,\n         right_offset: int,\n+        lengths_cpu: torch.Tensor | None = None,\n     ) -> tuple[SpeakerCacheState, torch.Tensor]:\n         \"\"\"Process one window of ``(B, C, T)`` mel features.\n \n@@ -730,7 +804,14 @@ class SortformerSpeakerEncoder(nn.Module):\n         embs = torch.cat([state.spkcache, state.fifo, chunk_embs], dim=1)\n         context_len = state.spkcache.shape[1] + state.fifo.shape[1]\n         emb_lengths = context_len + chunk_lengths\n-        states, state_lengths = self.encoder(embs, emb_lengths, bypass_pre_encode=True)\n+        emb_lengths_cpu = (\n+            None\n+            if lengths_cpu is None\n+            else context_len + self.encoder.pre_encode.output_lengths(lengths_cpu)\n+        )\n+        states, state_lengths = self.encoder(\n+            embs, emb_lengths, bypass_pre_encode=True, lengths_cpu=emb_lengths_cpu\n+        )\n         hidden = modules.encoder_proj(states.transpose(1, 2))\n         high_res_preds = modules.speaker_probs(hidden, state_lengths)\n \n@@ -818,7 +899,11 @@ class ParallelExpertEncoder(nn.Module):\n         return self.asr_norm.weight.dtype\n \n     def forward(\n-        self, mel: torch.Tensor, mel_lengths: torch.Tensor, max_feat_len: int\n+        self,\n+        mel: torch.Tensor,\n+        mel_lengths: torch.Tensor,\n+        max_feat_len: int,\n+        mel_lengths_cpu: torch.Tensor | None = None,\n     ) -> torch.Tensor:\n         total_feat_len = min(mel.shape[-1], max_feat_len)\n         num_windows = max(1, math.ceil(total_feat_len / self.window_feat_len))\n@@ -837,9 +922,18 @@ class ParallelExpertEncoder(nn.Module):\n             window_lengths = (mel_lengths - context_start).clamp(\n                 min=0, max=context_end - context_start\n             )\n+            window_lengths_cpu = (\n+                None\n+                if mel_lengths_cpu is None\n+                else (mel_lengths_cpu - context_start).clamp(\n+                    min=0, max=context_end - context_start\n+                )\n+            )\n \n             encoded, _ = self.asr_encoder(\n-                asr_signal[:, :, context_start:context_end], window_lengths\n+                asr_signal[:, :, context_start:context_end],\n+                window_lengths,\n+                lengths_cpu=window_lengths_cpu,\n             )\n             left_drop = left_offset // self.subsampling_factor\n             core_len = self._output_boundary(end) - self._output_boundary(start)\n@@ -852,6 +946,7 @@ class ParallelExpertEncoder(nn.Module):\n                 state,\n                 left_offset,\n                 right_offset,\n+                lengths_cpu=window_lengths_cpu,\n             )\n             speaker_windows.append(align_frames(window_preds, core_len))\n \n@@ -890,6 +985,14 @@ class Nemotron3_5TranscribeAudioTower(nn.Module):\n         prefix: str = \"\",\n     ) -> None:\n         super().__init__()\n+        mm_config = get_multimodal_config()\n+        if mm_config is not None and mm_config.mm_encoder_attn_dtype == \"fp8\":\n+            raise ValueError(\n+                \"Nemotron-3.5-Transcribe does not support \"\n+                \"mm_encoder_attn_dtype='fp8': the audio tower's attention runs in \"\n+                \"the model dtype. The FP8 checkpoints quantize the tower's linear \"\n+                \"layers without this setting.\"\n+            )\n         self.preprocessor = AudioPreprocessor(audio_config[\"preprocessor\"])\n         self.encoder = ParallelExpertEncoder(\n             audio_config, quant_config, maybe_prefix(prefix, \"encoder\")\n@@ -961,7 +1064,9 @@ class Nemotron3_5TranscribeAudioTower(nn.Module):\n         mel_lengths_cpu = self.preprocessor.featurizer.get_seq_len(\n             num_samples_cpu\n         ).clamp(max=mel.shape[-1])\n-        encoded = self.encoder(mel, mel_lengths, int(mel_lengths_cpu.max()))\n+        encoded = self.encoder(\n+            mel, mel_lengths, int(mel_lengths_cpu.max()), mel_lengths_cpu\n+        )\n         encoded_lengths = (\n             mel_lengths_cpu + self.subsampling_factor - 1\n         ) // self.subsampling_factor\n"
+        }
+      ]
+    },
+    {
+      "sha": "16d667348d91ae010cb3cc9d4d6a5b7908a717a9",
+      "author": {
+        "name": "Nick Hill",
+        "email": "nickhill123@gmail.com"
+      },
+      "date": "2026-11-02T09:47:08+08:00",
+      "message": "[MRV2] Cap torch.topk rows in chunked prompt logprobs (#64914)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "08e3f264583e57199c167c577f3b445a58c155ab"
+      ],
+      "stats": {
+        "total_additions": 41,
+        "total_deletions": 22,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/sample/test_logprobs.py",
+          "status": "modified",
+          "additions": 14,
+          "deletions": 3,
+          "patch": "@@ -1630,21 +1630,32 @@ def test_token_logprobs_large_batch_int64_row_offset():\n     )\n \n \n+@pytest.mark.parametrize(\"split_topk\", [False, True])\n @pytest.mark.parametrize(\"num_prompt_logprobs\", [-1, 3])\n-def test_chunked_prompt_logprobs_match_unchunked(num_prompt_logprobs: int):\n-    \"\"\"Chunks written into preallocated outputs must match one unchunked pass.\"\"\"\n+def test_chunked_prompt_logprobs_match_unchunked(\n+    num_prompt_logprobs: int, split_topk: bool, monkeypatch\n+):\n+    \"\"\"Chunks, and top-k blocks within them, written into preallocated outputs\n+    must match one unchunked pass.\"\"\"\n     if not current_platform.is_cuda_alike():\n         pytest.skip(\"the logprob kernels are Triton\")\n+    from vllm.v1.worker.gpu.sample import prompt_logprob\n     from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores\n     from vllm.v1.worker.gpu.sample.prompt_logprob import (\n         CHUNK_SIZE,\n         compute_prompt_logprobs_with_chunking,\n     )\n \n+    if split_topk:\n+        # Blocks of 100 rows at full vocab, straddling the chunk boundaries.\n+        monkeypatch.setattr(prompt_logprob, \"TOPK_MAX_ELEMENTS\", 100 * 513)\n     device = torch.device(current_platform.device_type)\n     vocab_size = 512\n     num_tokens = 2 * CHUNK_SIZE + 3\n-    logits = torch.randn(num_tokens, vocab_size, device=device)\n+    # Distinct values per row, since topk's order among ties can vary with the\n+    # number of rows ranked together.\n+    logits = torch.rand(num_tokens, vocab_size, device=device).argsort(dim=-1)\n+    logits = logits.float() / vocab_size\n     prompt_token_ids = torch.randint(vocab_size, (num_tokens,), device=device)\n \n     token_ids, logprobs, ranks = compute_prompt_logprobs_with_chunking("
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/sample/prompt_logprob.py",
+          "status": "modified",
+          "additions": 27,
+          "deletions": 19,
+          "patch": "@@ -18,6 +18,9 @@ from vllm.v1.worker.gpu.sample.logprob import (\n )\n \n CHUNK_SIZE = 1024\n+# Cap rows x k per torch.topk call, whose workspace grows with both (~5.5 GiB\n+# for 1024 rows at a 152k vocab). Only splits chunks when k is very large.\n+TOPK_MAX_ELEMENTS = 64 << 20\n \n \n @dataclass\n@@ -308,25 +311,30 @@ def compute_prompt_logprobs_with_chunking(\n             if num_prompt_logprobs == -1\n             else num_prompt_logprobs\n         )\n-        result = compute_topk_scores(\n-            prompt_logits,\n-            requested_num,\n-            prompt_token_ids[start_idx:end_idx],\n-            logits_mode=logits_mode,\n-        )\n-        # Return token_ids as int32 to reduce peak memory usage.\n-        if num_tokens <= CHUNK_SIZE:\n-            logprob_token_ids = result.logprob_token_ids.to(torch.int32)\n-            return logprob_token_ids, result.logprobs, result.selected_token_ranks\n-        if token_ids is None:\n-            size = num_tokens, result.logprobs.shape[1]\n-            token_ids = prompt_token_ids.new_empty(size, dtype=torch.int32)\n-            scores = result.logprobs.new_empty(size)\n-            ranks = result.selected_token_ranks.new_empty(num_tokens)\n-        assert scores is not None and ranks is not None\n-        token_ids[start_idx:end_idx] = result.logprob_token_ids\n-        scores[start_idx:end_idx] = result.logprobs\n-        ranks[start_idx:end_idx] = result.selected_token_ranks\n+        rows_per_topk = max(1, TOPK_MAX_ELEMENTS // (requested_num + 1))\n+        for block_start in range(0, prompt_logits.shape[0], rows_per_topk):\n+            logits = prompt_logits[block_start : block_start + rows_per_topk]\n+            num_logits = len(logits)\n+            rows = slice(start_idx + block_start, start_idx + block_start + num_logits)\n+            result = compute_topk_scores(\n+                logits, requested_num, prompt_token_ids[rows], logits_mode=logits_mode\n+            )\n+            # Return token_ids as int32 to reduce peak memory usage.\n+            if num_logits == num_tokens:\n+                logprob_token_ids = result.logprob_token_ids.to(torch.int32)\n+                return logprob_token_ids, result.logprobs, result.selected_token_ranks\n+            if token_ids is None:\n+                size = num_tokens, result.logprobs.shape[1]\n+                token_ids = prompt_token_ids.new_empty(size, dtype=torch.int32)\n+                scores = result.logprobs.new_empty(size)\n+                ranks = result.selected_token_ranks.new_empty(num_tokens)\n+            assert scores is not None and ranks is not None\n+            token_ids[rows] = result.logprob_token_ids\n+            scores[rows] = result.logprobs\n+            ranks[rows] = result.selected_token_ranks\n+            # Free each block's results before ranking the next.\n+            del result\n+        del prompt_logits, logits\n \n     assert token_ids is not None and scores is not None and ranks is not None\n     return token_ids, scores, ranks\n"
+        }
+      ]
+    },
+    {
+      "sha": "08e3f264583e57199c167c577f3b445a58c155ab",
+      "author": {
+        "name": "Nick Hill",
+        "email": "nickhill123@gmail.com"
+      },
+      "date": "2026-11-02T09:09:19+08:00",
+      "message": "[CI] Lower gpu_memory_utilization in test_gemma4_lora (#65008)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "ea836290a7166f7d5b8efb1ae6ef1e2b2faa8b56"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 0,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "tests/lora/test_gemma4_tp.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -62,6 +62,7 @@ def test_gemma4_lora(gemma4_vision_lora_files):\n         limit_mm_per_prompt={\"image\": 1},\n         mm_processor_cache_gb=0,\n         enable_tower_connector_lora=True,\n+        gpu_memory_utilization=0.8,\n     )\n \n     generate_and_test(llm, gemma4_vision_lora_files, lora_id=1)\n"
+        }
+      ]
+    },
+    {
+      "sha": "ea836290a7166f7d5b8efb1ae6ef1e2b2faa8b56",
+      "author": {
+        "name": "Juntian Liu",
+        "email": "Juntianl777@gmail.com"
+      },
+      "date": "2026-11-02T08:55:53+08:00",
+      "message": "[Perf][DSv4.1] Vectorize first-layer HC expansion copy (#64816)\n\nSigned-off-by: Juntian Liu <204972208+Juntian777@users.noreply.github.com>\nCo-authored-by: Juntian Liu <204972208+Juntian777@users.noreply.github.com>\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "49fee5b34c164532b889747eef6d194fe0103d1c"
+      ],
+      "stats": {
+        "total_additions": 69,
+        "total_deletions": 1,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/kernels/mhc/test_mhc_kernels.py",
+          "status": "modified",
+          "additions": 34,
+          "deletions": 0,
+          "patch": "@@ -46,6 +46,7 @@ from vllm.models.deepseek_v41.nvidia.ops.mega_mhc import (\n     is_mega_mhc_supported,\n     mhc_shifted_post_pre_deep_gemm,\n )\n+from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand\n from vllm.platforms import current_platform\n from vllm.utils.torch_utils import set_random_seed\n \n@@ -1889,3 +1890,36 @@ def test_mhc_fused_post_pre_delayed_falls_back_for_large_batches():\n \n     assert not rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1)\n     assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1 << 20)\n+\n+\n+@pytest.mark.parametrize(\n+    \"num_tokens,hidden_size,hc_mult\",\n+    [(0, 17, 4), (1, 513, 1), (7, 17, 8), (33, 5137, 4), (8192, 5120, 4)],\n+)\n+@pytest.mark.parametrize(\"dtype\", [torch.bfloat16, torch.float32])\n+@pytest.mark.parametrize(\"strided\", [False, True])\n+def test_hc_expand_preserves_bits_in_eager_and_graph(\n+    num_tokens, hidden_size, hc_mult, dtype, strided\n+):\n+    \"\"\"Expansion preserves every input bit, including NaNs and signed zero.\"\"\"\n+    set_random_seed(42)\n+    storage = torch.randn(num_tokens, 2 * hidden_size + 1, dtype=dtype, device=DEVICE)\n+    x = storage[:, 1::2] if strided else storage[:, :hidden_size].contiguous()\n+    if num_tokens:\n+        x[0, 0] = float(\"nan\")\n+        x[0, -1] = -0.0\n+\n+    def check(actual):\n+        expected = x.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()\n+        assert actual.shape == expected.shape and actual.dtype == x.dtype\n+        assert actual.is_contiguous()\n+        if actual.numel():\n+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))\n+\n+    check(hc_expand(x, hc_mult))\n+    graph = torch.cuda.CUDAGraph()\n+    with torch.cuda.graph(graph):\n+        captured = hc_expand(x, hc_mult)\n+    x.copy_(torch.randn_like(x))\n+    graph.replay()\n+    check(captured)"
+        },
+        {
+          "filename": "vllm/models/deepseek_v41/nvidia/model.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -110,6 +110,7 @@ from ..common.engram import (\n from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask\n from .ops.mhc import (\n     MHC_OVERLAP_MAX_TOKENS,\n+    hc_expand,\n     init_mhc_all_reduce,\n     mhc_pre_delayed_overlap,\n     mhc_shifted_post_pre,\n@@ -527,7 +528,7 @@ class DeepseekV4DecoderLayer(nn.Module):\n                 # First layer: the stream is the embedding broadcast to hc\n                 # copies and the identity pre-mix selects copy 0.\n                 assert self.hc_attn_fn_broadcast is not None\n-                residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()\n+                residual = hc_expand(x, self.hc_mult)\n                 post_mix, res_mix, x, attn_pre = mhc_pre(\n                     residual,\n                     self.hc_attn_fn_broadcast,"
+        },
+        {
+          "filename": "vllm/models/deepseek_v41/nvidia/ops/mhc.py",
+          "status": "modified",
+          "additions": 33,
+          "deletions": 0,
+          "patch": "@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (\n     UnfinalizedMoEOutput,\n )\n from vllm.platforms import current_platform\n+from vllm.triton_utils import tl, triton\n from vllm.utils.deep_gemm import is_deep_gemm_supported\n \n from .mega_mhc import (\n@@ -320,3 +321,35 @@ def mhc_shifted_post_pre(\n         norm_eps=norm_eps,\n         capture_aux=capture_aux,\n     )\n+\n+\n+@triton.jit\n+def _hc_expand_kernel(\n+    x,\n+    out,\n+    numel,\n+    H: tl.constexpr,\n+    N: tl.constexpr,\n+    STRIDE_M: tl.constexpr,\n+    STRIDE_H: tl.constexpr,\n+    BLOCK: tl.constexpr,\n+):\n+    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)\n+    mask = index < numel\n+    row = index // H\n+    col = index % H\n+    value = tl.load(x + row * STRIDE_M + col * STRIDE_H, mask=mask, other=0)\n+    for stream in tl.static_range(N):\n+        tl.store(out + (row * N + stream) * H + col, value, mask=mask)\n+\n+\n+def hc_expand(x: torch.Tensor, hc_mult: int) -> torch.Tensor:\n+    \"\"\"``x.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()``, reading\n+    ``x`` once instead of once per copy.\"\"\"\n+    m, h = x.shape\n+    out = x.new_empty(m, hc_mult, h)\n+    if out.numel():\n+        _hc_expand_kernel[(triton.cdiv(m * h, 1024),)](\n+            x, out, m * h, h, hc_mult, *x.stride(), BLOCK=1024, num_warps=4\n+        )\n+    return out\n"
+        }
+      ]
+    },
+    {
+      "sha": "49fee5b34c164532b889747eef6d194fe0103d1c",
+      "author": {
+        "name": "aoshen02",
+        "email": "aoshen@inferact.ai"
+      },
+      "date": "2026-11-02T08:17:00+08:00",
+      "message": "[Kernel] Batch invariance: combine the NVFP4 linear kernel overrides (follow-up to #62192) (#65000)\n\nSigned-off-by: aoshen02 <aoshen@inferact.ai>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "72a340466f0b0c6358b50967f26616cd552d82ae"
+      ],
+      "stats": {
+        "total_additions": 21,
+        "total_deletions": 52,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/kernels/quantization/test_nvfp4_kernel_selection.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 16,
+          "patch": "@@ -4,15 +4,12 @@\n \n import pytest\n \n-import vllm.envs as envs\n from vllm.model_executor.kernels.linear import (\n     _POSSIBLE_NVFP4_KERNELS,\n     CutlassNvFp4LinearKernel,\n     FlashInferB12xNvFp4LinearKernel,\n     FlashInferCuteDslNvFp4W4A16LinearKernel,\n     FlashInferCutlassNvFp4LinearKernel,\n-    HummingNvFp4LinearKernel,\n-    init_nvfp4_linear_kernel,\n )\n from vllm.platforms.interface import PlatformEnum\n \n@@ -33,16 +30,3 @@ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):\n         f\"{w4a4_kernel.__name__} must be preferred over \"\n         f\"{FlashInferCuteDslNvFp4W4A16LinearKernel.__name__}\"\n     )\n-\n-\n-def test_batch_invariant_w4a16_selects_humming(monkeypatch):\n-    # The batch-invariant CUTLASS kernel is W4A4-only.\n-    monkeypatch.setattr(envs, \"VLLM_BATCH_INVARIANT\", True)\n-    for kernel in (CutlassNvFp4LinearKernel, HummingNvFp4LinearKernel):\n-        monkeypatch.setattr(\n-            kernel,\n-            \"is_supported\",\n-            classmethod(lambda cls, compute_capability=None: (True, None)),\n-        )\n-    kernel = init_nvfp4_linear_kernel(use_a16=True)\n-    assert isinstance(kernel, HummingNvFp4LinearKernel)"
+        },
+        {
+          "filename": "vllm/model_executor/kernels/linear/__init__.py",
+          "status": "modified",
+          "additions": 21,
+          "deletions": 36,
+          "patch": "@@ -1202,49 +1202,34 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:\n         HummingNvFp4LinearKernel,\n     )\n \n-    # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the\n-    # batch-invariant CUTLASS implementation when available, otherwise fall\n-    # back to emulation. It overrides --linear-backend.\n+    # VLLM_BATCH_INVARIANT forces deterministic execution: Humming for W4A16,\n+    # otherwise CUTLASS, or emulation where CUTLASS is unsupported. It\n+    # overrides --linear-backend.\n     force_kernel: type[NvFp4LinearKernel] | None = None\n     quantization = \"nvfp4_w4a16\" if use_a16 else \"nvfp4_w4a4\"\n     linear_backend = _get_linear_backend(quantization=quantization)\n-    if envs.VLLM_BATCH_INVARIANT and use_a16:\n-        if linear_backend not in (\"auto\", \"humming\"):\n-            logger.warning_once(\n-                \"VLLM_BATCH_INVARIANT overrides --linear-backend=%s; using the \"\n-                \"Humming backend for deterministic W4A16 execution.\",\n-                linear_backend,\n-            )\n-        force_kernel = HummingNvFp4LinearKernel\n-    elif envs.VLLM_BATCH_INVARIANT:\n-        bi_supported, reason = CutlassNvFp4LinearKernel.is_supported()\n-        if bi_supported:\n-            if linear_backend not in (\"auto\", \"cutlass\"):\n-                logger.warning_once(\n-                    \"VLLM_BATCH_INVARIANT overrides --linear-backend=%s; \"\n-                    \"using the CUTLASS backend for deterministic execution.\",\n-                    linear_backend,\n-                )\n+    if envs.VLLM_BATCH_INVARIANT:\n+        if use_a16:\n+            force_kernel, bi_backend = HummingNvFp4LinearKernel, \"humming\"\n+        else:\n+            cutlass_supported, reason = CutlassNvFp4LinearKernel.is_supported()\n+            if cutlass_supported:\n+                force_kernel, bi_backend = CutlassNvFp4LinearKernel, \"cutlass\"\n             else:\n                 logger.info_once(\n-                    \"VLLM_BATCH_INVARIANT forces NVFP4 linear to use the \"\n-                    \"CUTLASS backend for deterministic execution.\"\n+                    \"VLLM_BATCH_INVARIANT is set but the batch-invariant NVFP4 \"\n+                    \"kernel is not supported on this platform; falling back to \"\n+                    \"emulation for deterministic execution. Reason: %s\",\n+                    reason,\n                 )\n-            force_kernel = CutlassNvFp4LinearKernel\n-        else:\n-            if linear_backend not in (\"auto\", \"emulation\"):\n-                logger.warning_once(\n-                    \"VLLM_BATCH_INVARIANT overrides --linear-backend=%s; \"\n-                    \"using the emulation backend for deterministic execution.\",\n-                    linear_backend,\n-                )\n-            logger.info_once(\n-                \"VLLM_BATCH_INVARIANT is set but the batch-invariant NVFP4 \"\n-                \"kernel is not supported on this platform; falling back to \"\n-                \"emulation for deterministic execution. Reason: %s\",\n-                reason,\n+                force_kernel, bi_backend = EmulationNvFp4LinearKernel, \"emulation\"\n+        if linear_backend not in (\"auto\", bi_backend):\n+            logger.warning_once(\n+                \"VLLM_BATCH_INVARIANT overrides --linear-backend=%s; using the \"\n+                \"%s backend for deterministic execution.\",\n+                linear_backend,\n+                bi_backend,\n             )\n-            force_kernel = EmulationNvFp4LinearKernel\n     elif linear_backend == \"auto\" and use_a16:\n         _cc = current_platform.get_device_capability()\n         compute_capability = _cc.to_int() if _cc is not None else None\n"
+        }
+      ]
+    },
+    {
+      "sha": "72a340466f0b0c6358b50967f26616cd552d82ae",
+      "author": {
+        "name": "Juntian Liu",
+        "email": "Juntianl777@gmail.com"
+      },
+      "date": "2026-11-02T08:05:39+08:00",
+      "message": "[Bugfix][DSv4.1] Autotune the sparse indexer's wq_b GEMM (#60543)\n\nSigned-off-by: Juntian Liu <Juntianl777@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "b8c04dd3b455affd8d91f0ab436b815491c9af38"
+      ],
+      "stats": {
+        "total_additions": 17,
+        "total_deletions": 0,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/warmup/kernel_warmup.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -390,6 +390,7 @@ def _run_flashinfer_autotune_dummy_runs(\n     runner: \"GPUModelRunner\", *, skip_attn: bool = False\n ) -> None:\n     import vllm.utils.flashinfer as fi_utils\n+    from vllm.models.deepseek_v41.attention import autotune_indexer_wq_b\n \n     dummy_run_kwargs = {\"skip_attn\": True} if skip_attn else {}\n     for num_tokens in _flashinfer_autotune_token_counts(runner):\n@@ -426,6 +427,7 @@ def _run_flashinfer_autotune_dummy_runs(\n                 randomize_inputs=True,\n                 **dummy_run_kwargs,\n             )\n+            autotune_indexer_wq_b(runner.get_model(), max_tuning_tokens)\n \n \n def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:"
+        },
+        {
+          "filename": "vllm/models/deepseek_v41/attention.py",
+          "status": "modified",
+          "additions": 15,
+          "deletions": 0,
+          "patch": "@@ -1610,3 +1610,18 @@ class DeepseekV4Indexer(nn.Module):\n         # ReplicatedLinear returns (output, bias); bias is None.\n         q, _ = self.wq_b(qr)\n         return q\n+\n+\n+def autotune_indexer_wq_b(model: nn.Module, num_tokens: int) -> None:\n+    \"\"\"Short-context dummy runs skip wq_b, so tune it directly.\"\"\"\n+    for module in model.modules():\n+        if isinstance(module, DeepseekV4Indexer):\n+            # Run every wq_b: FlashInfer keys on op, runner, shapes and dtype,\n+            # and skips profiling on a cache hit, so duplicates are cheap.\n+            qr = torch.randn(\n+                num_tokens,\n+                module.q_lora_rank,\n+                dtype=module.vllm_config.model_config.dtype,\n+                device=next(module.weights_proj.parameters()).device,\n+            )\n+            module.wq_b(qr)\n"
+        }
+      ]
+    },
+    {
+      "sha": "b8c04dd3b455affd8d91f0ab436b815491c9af38",
+      "author": {
+        "name": "jthomson04",
+        "email": "jwillthomson19@gmail.com"
+      },
+      "date": "2026-11-02T02:27:46+08:00",
+      "message": "[Perf][KV Offload] Keep offload event metadata out of the cyclic GC (#63927)\n\nSigned-off-by: jthomson04 <jwillthomson19@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "b2d07f59c7a5909287f9ef5f037fd575ebdbbed0"
+      ],
+      "stats": {
+        "total_additions": 40,
+        "total_deletions": 27,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/kv_connector/unit/offloading_connector/test_events.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 5,
+          "patch": "@@ -1,5 +1,6 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import gc\n from types import SimpleNamespace\n from unittest.mock import MagicMock\n \n@@ -866,17 +867,16 @@ def test_reoffload_preserves_secondary_residency(record_method, position):\n \n     getattr(tracker, record_method)(req, group_config, position, key)\n \n-    assert tracker._pending_event_metadata[key].active_residencies == {\n-        (Medium.CPU, None),\n-        (Medium.STORAGE, \"custom\"),\n-    }\n+    assert not gc.is_tracked(tracker._pending_event_metadata[key])\n+    list(tracker.take_events([_removed_event([key])]))\n+    assert key in tracker._pending_event_metadata\n     [removed] = tracker.take_events(\n         [_removed_event([key], Medium.STORAGE, ownership=\"custom\")]\n     )\n \n     assert stored.token_ids == [1, 2, 3, 4]\n     assert stored.ownership == removed.ownership == \"custom\"\n-    assert key in tracker._pending_event_metadata\n+    assert key not in tracker._pending_event_metadata\n \n \n def test_take_events_groups_removed_hashes_by_kv_group():"
+        },
+        {
+          "filename": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py",
+          "status": "modified",
+          "additions": 35,
+          "deletions": 22,
+          "patch": "@@ -24,9 +24,10 @@ Windowed attention groups keep the legacy placeholder payload.\n \"\"\"\n \n from collections.abc import Iterable\n-from dataclasses import dataclass\n from typing import TYPE_CHECKING, Any, NamedTuple\n \n+import msgspec\n+\n from vllm.distributed.kv_events import (\n     MEDIUM_CPU,\n     MEDIUM_STORAGE,\n@@ -69,8 +70,8 @@ _MEDIUM_TO_EVENT_STR: dict[Medium, str] = {\n     Medium.STORAGE: MEDIUM_STORAGE,\n }\n \n-# The tracker is CPU-primary by construction: the primary tier's residency key.\n-_PRIMARY_RESIDENCY: tuple[Medium, str | None] = (Medium.CPU, None)\n+# The tracker is CPU-primary by construction: the primary tier's residency bit.\n+_PRIMARY_RESIDENCY_BIT = 1\n \n \n class OffloadingEventGroupSpec(NamedTuple):\n@@ -88,11 +89,16 @@ def get_offloading_event_group_spec(\n     )\n \n \n-@dataclass(slots=True)\n-class _OffloadEventMetadata:\n+class _OffloadEventMetadata(\n+    msgspec.Struct,\n+    gc=False,  # type: ignore[call-arg]\n+):\n     \"\"\"BlockStored payload snapshot for one OffloadKey, captured while the\n     Request is available and kept until the final matching removal event.\n-    ``medium`` and ``ownership`` are forwarded from the OffloadingEvent.\"\"\"\n+    ``medium`` and ``ownership`` are forwarded from the OffloadingEvent.\n+\n+    One is kept per offloaded chunk, so it is untracked by the cyclic GC: keep\n+    fields free of tracked containers (``active_residencies`` is a bitmask).\"\"\"\n \n     # The chunk's constituent block hashes; the last one is the OffloadKey.\n     block_hashes: tuple[BlockHash, ...]\n@@ -105,7 +111,7 @@ class _OffloadEventMetadata:\n     extra_keys: tuple[tuple[Any, ...] | None, ...] | None\n     group_idx: int\n     kv_cache_spec: OffloadingEventGroupSpec\n-    active_residencies: set[tuple[Medium, str | None]]\n+    active_residencies: int\n \n \n def describes_group(group_config: \"GroupOffloadConfig\") -> bool:\n@@ -164,6 +170,10 @@ class OffloadingEventsTracker:\n \n         # OffloadKey -> payload snapshot, kept until final removal or reset.\n         self._pending_event_metadata: dict[OffloadKey, _OffloadEventMetadata] = {}\n+        # (medium, ownership) -> its bit in active_residencies.\n+        self._residency_bits: dict[tuple[Medium, str | None], int] = {\n+            (Medium.CPU, None): _PRIMARY_RESIDENCY_BIT\n+        }\n \n     def record_store(\n         self,\n@@ -183,7 +193,7 @@ class OffloadingEventsTracker:\n             return\n         meta = self._build_event_metadata(req, group_config, chunk_idx)\n         if existing := self._pending_event_metadata.get(offload_key):\n-            meta.active_residencies.update(existing.active_residencies)\n+            meta.active_residencies |= existing.active_residencies\n         self._pending_event_metadata[offload_key] = meta\n \n     def record_lookup(\n@@ -198,17 +208,15 @@ class OffloadingEventsTracker:\n             return\n         if not describes_group(group_config):\n             return\n-        if offload_key not in self._pending_event_metadata:\n-            self._pending_event_metadata[offload_key] = self._build_event_metadata(\n-                req, group_config, chunk_idx\n-            )\n+        meta = self._pending_event_metadata.get(offload_key)\n+        if meta is None:\n+            meta = self._build_event_metadata(req, group_config, chunk_idx)\n+            self._pending_event_metadata[offload_key] = meta\n         # Primary residency is registered here rather than by the manager's\n         # prepare_write(): the payload needs the Request, which only the\n         # scheduler holds at lookup time, and the manager reaches this tracker\n         # only through OffloadingEvents.\n-        self._pending_event_metadata[offload_key].active_residencies.add(\n-            _PRIMARY_RESIDENCY\n-        )\n+        meta.active_residencies |= _PRIMARY_RESIDENCY_BIT\n \n     def record_partial_store(\n         self,\n@@ -287,12 +295,12 @@ class OffloadingEventsTracker:\n             extra_keys=None,\n             group_idx=group_config.group_idx,\n             kv_cache_spec=group_config.kv_event_group_spec,\n-            active_residencies={_PRIMARY_RESIDENCY},\n+            active_residencies=_PRIMARY_RESIDENCY_BIT,\n         )\n         if _is_recurrent_group(group_config):\n             meta = _as_state_checkpoint(meta)\n         if existing := self._pending_event_metadata.get(offload_key):\n-            meta.active_residencies.update(existing.active_residencies)\n+            meta.active_residencies |= existing.active_residencies\n         self._pending_event_metadata[offload_key] = meta\n \n     def take_events(self, events: Iterable[OffloadingEvent]) -> Iterable[KVCacheEvent]:\n@@ -399,7 +407,7 @@ class OffloadingEventsTracker:\n             extra_keys=None,\n             group_idx=group_config.group_idx,\n             kv_cache_spec=group_config.kv_event_group_spec,\n-            active_residencies={_PRIMARY_RESIDENCY},\n+            active_residencies=_PRIMARY_RESIDENCY_BIT,\n         )\n         if _is_recurrent_group(group_config):\n             meta = _as_state_checkpoint(meta)\n@@ -442,6 +450,11 @@ class OffloadingEventsTracker:\n         # eviction event so BlockRemoved can fan out to the same hashes.\n         # Events are self-contained (own parent), so key order is free.\n         locality = event.locality.value if event.locality is not None else None\n+        residency_bit = 0\n+        if event.removal_expected:\n+            residency_bit = self._residency_bits.setdefault(\n+                (event.medium, event.ownership), 1 << len(self._residency_bits)\n+            )\n         for key in event.keys:\n             meta = self._pending_event_metadata.get(key)\n             if meta is None:\n@@ -459,8 +472,7 @@ class OffloadingEventsTracker:\n                 )\n                 continue\n \n-            if event.removal_expected:\n-                meta.active_residencies.add((event.medium, event.ownership))\n+            meta.active_residencies |= residency_bit\n             yield BlockStored(\n                 block_hashes=list(\n                     maybe_convert_block_hash(h) for h in meta.block_hashes\n@@ -489,18 +501,19 @@ class OffloadingEventsTracker:\n         # Keep group_idx unambiguous if a manager batch spans groups.\n         locality = event.locality.value if event.locality is not None else None\n         by_group: dict[int, list] = {}\n+        residency_mask = ~self._residency_bits.get((event.medium, event.ownership), 0)\n         for key in event.keys:\n             meta = self._pending_event_metadata.get(key)\n             if event.metadata_only:\n                 if meta is not None:\n-                    meta.active_residencies.discard((event.medium, event.ownership))\n+                    meta.active_residencies &= residency_mask\n                 continue\n             if meta is not None:\n                 group_idx = meta.group_idx\n                 by_group.setdefault(group_idx, []).extend(\n                     maybe_convert_block_hash(h) for h in meta.block_hashes\n                 )\n-                meta.active_residencies.discard((event.medium, event.ownership))\n+                meta.active_residencies &= residency_mask\n             else:\n                 if self.self_describing_enabled:\n                     logger.warning_once(\n"
+        }
+      ]
+    },
+    {
+      "sha": "b2d07f59c7a5909287f9ef5f037fd575ebdbbed0",
+      "author": {
+        "name": "Thien Tran",
+        "email": "gau.nernst@yahoo.com.sg"
+      },
+      "date": "2026-11-02T02:27:25+08:00",
+      "message": "[Bugfix][GDN] Restore in_proj_ba overlap on CUDA (#64999)\n\nSigned-off-by: Thien Tran <gau.nernst@yahoo.com.sg>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "8530a778f78dc7cd9a31e108ebc035c4b27ceb3c"
+      ],
+      "stats": {
+        "total_additions": 40,
+        "total_deletions": 2,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/models_basic.yaml",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -419,6 +419,9 @@ steps:\n   timeout_in_minutes: 20\n   device: b200-k8s\n   source_file_dependencies:\n+  - vllm/model_executor/layers/linear.py\n+  - vllm/model_executor/layers/mamba/gdn\n+  - vllm/model_executor/layers/utils.py\n   - vllm/models/qwen3_5/\n   - vllm/model_executor/models/qwen3_next.py\n   - tests/models/qwen3_5/"
+        },
+        {
+          "filename": "tests/models/qwen3_5/test_gdn_ba_overlap.py",
+          "status": "added",
+          "additions": 35,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,35 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\n+import pytest\n+from transformers import Qwen3NextConfig\n+\n+from tests.utils import init_test_distributed_environment\n+from tests.v1.attention.utils import create_vllm_config\n+from vllm.config import set_current_vllm_config\n+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (\n+    QwenGatedDeltaNetAttention,\n+)\n+from vllm.platforms import current_platform\n+from vllm.utils.network_utils import get_open_port\n+\n+\n+@pytest.mark.skipif(not current_platform.is_cuda(), reason=\"CUDA-only overlap\")\n+def test_ba_proj_overlaps_on_aux_stream_with_default_linear_backend() -> None:\n+    \"\"\"A GEMM dispatch change must not silently disable the ba overlap.\"\"\"\n+    vllm_config = create_vllm_config(dtype=\"bfloat16\")\n+    with set_current_vllm_config(vllm_config):\n+        init_test_distributed_environment(1, 1, 0, str(get_open_port()))\n+        layer = QwenGatedDeltaNetAttention(\n+            Qwen3NextConfig(\n+                hidden_size=64,\n+                linear_num_key_heads=2,\n+                linear_num_value_heads=4,\n+                linear_key_head_dim=8,\n+                linear_value_head_dim=8,\n+            ),\n+            vllm_config,\n+            prefix=\"model.layers.0.linear_attn\",\n+            overlap_ba_proj=True,\n+        )\n+    assert layer._ba_stream is not None"
+        },
+        {
+          "filename": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -57,7 +57,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig\n from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig\n from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig\n from vllm.model_executor.layers.quantization.inc import INCConfig\n-from vllm.model_executor.layers.utils import default_unquantized_gemm\n+from vllm.model_executor.layers.utils import cuda_unquantized_gemm\n from vllm.model_executor.model_loader.weight_utils import (\n     sharded_weight_loader,\n )\n@@ -653,7 +653,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):\n             overlap_ba_proj\n             and current_platform.is_cuda()\n             and isinstance(ba_method, UnquantizedLinearMethod)\n-            and ba_method._gemm_impl is default_unquantized_gemm\n+            and ba_method._gemm_impl is cuda_unquantized_gemm\n             and not vllm_config.parallel_config.use_ubatching\n             and vllm_config.lora_config is None\n         ):\n"
+        }
+      ]
+    }
+  ]
+}
