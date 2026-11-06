@@ -4,6 +4,65 @@
   "branch": "main",
   "commits": [
     {
+      "sha": "3becade3b0485323e7f8b4e892b51ebdf8a9e2f8",
+      "author": {
+        "name": "liuzhenwei",
+        "email": "zhenweiliu@habana.ai"
+      },
+      "date": "2026-11-06T12:59:41+08:00",
+      "message": "[CI][KV Offload] Pin GPU block size in test_p2p_cache_reset_with_absent_decoder (#66019)\n\nSigned-off-by: zhenwei-intel <zhenwei.liu@intel.com>\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "9dbb5e37d56265d902a29fd9af82aab7f98ffc92"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 0,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "tests/v1/kv_connector/unit/test_offloading_connector.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -859,6 +859,7 @@ def test_p2p_cache_reset_with_absent_decoder(monkeypatch):\n         max_num_batched_tokens=256,\n         gpu_memory_utilization=0.2,\n         attention_config={\"backend\": \"TRITON_ATTN\"},\n+        block_size=16,\n         enforce_eager=True,\n         async_scheduling=False,\n         disable_log_stats=False,\n"
+        }
+      ]
+    },
+    {
+      "sha": "9dbb5e37d56265d902a29fd9af82aab7f98ffc92",
+      "author": {
+        "name": "Lee Hojun (이호준)",
+        "email": "102869513+hojuna@users.noreply.github.com"
+      },
+      "date": "2026-11-06T12:44:47+08:00",
+      "message": "[Bugfix][Attention] Fix KV-sharing fast prefill hang from unsynchronized host offsets (#64986)\n\nSigned-off-by: hojuna <102869513+hojuna@users.noreply.github.com>\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+      "parents": [
+        "e336407a3ddb204edf6cfdfdd002cb28b9715438"
+      ],
+      "stats": {
+        "total_additions": 125,
+        "total_deletions": 1,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/attention/test_kv_sharing_fast_prefill_metadata.py",
+          "status": "added",
+          "additions": 114,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,114 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Tests for `make_kv_sharing_fast_prefill_common_attn_metadata`.\n+\n+The metadata builders read `query_start_loc_cpu` on the host as soon as the\n+fast-prefill metadata is built, so it must hold final values on return even\n+while the GPU is still busy with earlier work (async scheduling).\n+\"\"\"\n+\n+import pytest\n+import torch\n+\n+from vllm.v1.attention.backends.utils import (\n+    CommonAttentionMetadata,\n+    make_kv_sharing_fast_prefill_common_attn_metadata,\n+)\n+\n+\n+def _make_metadata(\n+    query_lens: list[int], logits_per_req: list[int], device: str\n+) -> tuple[CommonAttentionMetadata, list[int]]:\n+    num_reqs = len(query_lens)\n+    query_start_loc = [0]\n+    for q in query_lens:\n+        query_start_loc.append(query_start_loc[-1] + q)\n+    # The logits of each request are its last `k` scheduled tokens.\n+    logits_indices: list[int] = []\n+    for i, k in enumerate(logits_per_req):\n+        end = query_start_loc[i + 1]\n+        logits_indices.extend(range(end - k, end))\n+    expected = [0]\n+    for k in logits_per_req:\n+        expected.append(expected[-1] + k)\n+    # Simulate CUDA graph padding of the logits indices.\n+    padded = logits_indices + [logits_indices[-1]] * 3\n+    qsl = torch.tensor(query_start_loc, dtype=torch.int32)\n+    num_tokens = query_start_loc[-1]\n+    metadata = CommonAttentionMetadata(\n+        query_start_loc=qsl.to(device),\n+        query_start_loc_cpu=qsl,\n+        seq_lens=torch.tensor([q + 8 for q in query_lens], dtype=torch.int32).to(\n+            device\n+        ),\n+        num_reqs=num_reqs,\n+        num_actual_tokens=num_tokens,\n+        max_query_len=max(query_lens),\n+        max_seq_len=max(query_lens) + 8,\n+        block_table_tensor=torch.zeros(num_reqs, 4, dtype=torch.int32, device=device),\n+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device=device),\n+        logits_indices_padded=torch.tensor(padded, dtype=torch.int32, device=device),\n+        num_logits_indices=len(logits_indices),\n+        max_logits_per_req=max(logits_per_req),\n+    )\n+    return metadata, expected\n+\n+\n+DEVICES = [\"cpu\"] + ([\"cuda\"] if torch.cuda.is_available() else [])\n+\n+\n+@pytest.mark.parametrize(\"device\", DEVICES)\n+@pytest.mark.parametrize(\n+    \"query_lens,logits_per_req\",\n+    [\n+        # One logit per request (no speculative decoding), mixed chunk sizes.\n+        ([15, 5, 8, 300], [1, 1, 1, 1]),\n+        # Several logits per request (speculative decoding).\n+        ([15, 5, 8], [1, 2, 1]),\n+        ([40, 3, 17, 9], [4, 3, 1, 2]),\n+        # A request without logits: max_logits_per_req == 1 but\n+        # num_logits_indices != num_reqs, so `arange` would be wrong.\n+        ([15, 5, 8, 9], [1, 1, 1, 0]),\n+        # num_logits_indices == num_reqs but max_logits_per_req > 1.\n+        ([15, 5, 8, 9], [2, 1, 1, 0]),\n+    ],\n+)\n+def test_fast_prefill_query_start_loc(\n+    device: str, query_lens: list[int], logits_per_req: list[int]\n+):\n+    metadata, expected = _make_metadata(query_lens, logits_per_req, device)\n+    out = make_kv_sharing_fast_prefill_common_attn_metadata(metadata)\n+    assert out.query_start_loc_cpu.device.type == \"cpu\"\n+    assert out.query_start_loc_cpu.tolist() == expected\n+    assert out.query_start_loc.tolist() == expected\n+    assert out.num_reqs == len(query_lens)\n+    assert out.num_actual_tokens == sum(logits_per_req)\n+    assert out.max_query_len == max(logits_per_req)\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+@pytest.mark.parametrize(\"logits_per_req\", [[1, 1, 1, 1], [2, 1, 3, 1]])\n+def test_fast_prefill_query_start_loc_cpu_ready_while_gpu_busy(\n+    logits_per_req: list[int],\n+):\n+    \"\"\"With async scheduling the CPU builds metadata while the GPU still runs\n+    the previous step. Keep the stream busy and read the host offsets right\n+    away, as the attention metadata builders do.\"\"\"\n+    metadata, expected = _make_metadata([64, 7, 33, 12], logits_per_req, \"cuda\")\n+    torch.accelerator.synchronize()\n+    torch.cuda._sleep(2_000_000_000)  # keep the current stream busy\n+    out = make_kv_sharing_fast_prefill_common_attn_metadata(metadata)\n+    observed = out.query_start_loc_cpu.tolist()  # no synchronization before\n+    torch.accelerator.synchronize()\n+    assert observed == expected\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+def test_fast_prefill_query_start_loc_cpu_under_cuda_default_device():\n+    \"\"\"The host offsets must stay on the CPU even when the default device is\n+    CUDA.\"\"\"\n+    metadata, expected = _make_metadata([15, 5, 8, 300], [1, 1, 1, 1], \"cuda\")\n+    with torch.device(\"cuda\"):\n+        out = make_kv_sharing_fast_prefill_common_attn_metadata(metadata)\n+    assert out.query_start_loc_cpu.device.type == \"cpu\"\n+    assert out.query_start_loc_cpu.tolist() == expected"
+        },
+        {
+          "filename": "vllm/v1/attention/backends/utils.py",
+          "status": "modified",
+          "additions": 11,
+          "deletions": 1,
+          "patch": "@@ -822,9 +822,19 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(\n     decode_max_query_len = common_attn_metadata.max_logits_per_req\n     assert decode_max_query_len is not None\n \n+    if decode_max_query_len == 1 and total_num_decode_tokens == num_reqs:\n+        # One logit per request: the offsets are [0, 1, ..., num_reqs].\n+        decode_query_start_loc_cpu = torch.arange(\n+            num_reqs + 1, dtype=decode_query_start_loc.dtype, device=\"cpu\"\n+        )\n+    else:\n+        # TODO fix this sync\n+        with gpu_sync_allowed():\n+            decode_query_start_loc_cpu = decode_query_start_loc.cpu()\n+\n     common_attn_metadata = CommonAttentionMetadata(\n         query_start_loc=decode_query_start_loc,\n-        query_start_loc_cpu=decode_query_start_loc.to(\"cpu\", non_blocking=True),\n+        query_start_loc_cpu=decode_query_start_loc_cpu,\n         seq_lens=common_attn_metadata.seq_lens,\n         num_reqs=num_reqs,\n         num_actual_tokens=total_num_decode_tokens,\n"
+        }
+      ]
+    },
+    {
       "sha": "e336407a3ddb204edf6cfdfdd002cb28b9715438",
       "author": {
         "name": "Fangzhou Ai",
