@@ -1,0 +1,206 @@
+{
+  "date": "2026-11-09",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-09T10:34:22+08:00",
+  "daily_summary": "11-09 只到上午（末条提交 09:55），13 条的小日里主线是并行与 KV 通路：sig-core 4 条、sig-ci 3 条、sig-large-scale-serving 3 条、sig-quantization 2 条、sig-rl 1 条。分量最重的是 #65137——#56492 的可扩展 KV cache 默认开启后，同机 NIXL 的 P/D 因 UCX 导不出 cuMemMap 内存而静默退回 TCP，靠 imex_channel_available 探测与 FABRIC handle 把单次 KV 读取从 9.9 s 拉回约 24 ms（GSM8K 0.9757 对 0.9742）；同向还有 #65766 放开 DeepSeek-V4 MegaMoE 在 PP 下的序列并行（PP2×TP2 decode +7.8%、PP4 GSM8K 0.955）与 ROCm 侧的 #63401（用 sysfs 的 mem_info_vram_used 精确用量补回 hipMemGetInfo 的 2 MB 悲观计数，KV 由 51,712 提到 76,288 token）。量化线两条都围着 AITER：#66350 让全局 flag 下 FP8 MoE oracle 回落而不是抛 ValueError，#66206 给 MXFP4 W4A16 交给 AITER 的 intermediate_pad 补上 mock 级守卫。CI 线里 #65158 一次性清扫 1,847 个文件的 docstring 风格并装上 check-docstring-style 钩子，当天就把刚合入的 #46871 判红、由 #66441 用钩子 autofix 补平，另加 #66313 为 Python 3.14 把 tensorizer 提到 2.12.1。风险面有三处：#46871 自陈仍是 WIP、端到端性能回退且依赖未上游的 autotune，还带进 24 份新调优 JSON；#66334 把 Muse Spark 的类名、model_type 与 parser 别名 musespark1x 一并改掉，属破坏性改名而正文四节是空模板、只给一张评测表；#63401 与 #65766 分别只在 gfx1201 单卡与 B300 单一拓扑验证，CDNA、多实例同卡与仅由 DP 触发的 SP 路径明确未覆盖。",
+  "sig_summaries": {
+    "sig-large-scale-serving": "3 条都改通信与并行通路，但一个是新功能、两个是修回归。#65137 是当天最有价值的一条：#56492 默认可扩展 KV cache 后同机 NIXL 走不到 cuda_ipc（cuIpcGetMemHandle 导不出驱动映射内存、FABRIC handle 只在带 IMEX channel 创建时可用），于是 8xB200 单机 1P1D 的 KV 读取从 9.9 s 回到 23.6-24.2 ms，且精度不变所以原有 NIXL 精度校验查不出来；#65766 去掉 MegaMoE 的 PP = 1 条件，把出口 all-gather 前移、下一段入口再分片，PP2×TP2 的 decode 吞吐 +7.8%、混合 batch +12.9%，短提示的 logprobs 差异被归因到 PP 边界使用分离的 mHC kernel；#46871 给 XPU 新增 alltoall_batched 后端与 245 行的 AllToAllBatchedPrepareAndFinalize（一个 token 只发往持有其专家的 rank 一次），并连带自动改写 backend、收缩 max_num_batched_tokens 与 24 份 Arc Pro 调优 JSON，但作者明说仍 WIP 且端到端回退。共同的风险是验证集中在单一拓扑：#65137 只在 1P1D 单机、#65766 只在 B300 TP2 + EP、#46871 未给端到端数字。",
+    "sig-core": "4 条里三块：内存与启动正确性、模型迁移、命名整理。#63401 在 ROCm 上把 KV 定尺从被 2 MB 悲观计数的 free memory 换成 sysfs 精确用量，新加 Platform.free_device_memory 钩子，R9700 上 KV 从 51,712 到 76,288 token，边界写得很清（集显、分区卡、sysfs 读不到一律 no-op，KFD 页表与 RAS 约 80 MB 靠 3 GiB 下限兜）。#66263 把 vendored FLA 的 import 期 CUDA 初始化换成 current_platform 判定，让 GDN 类模型的 engine core 回到 fork，GB10 上到 /health 就绪 41.3 s 降到 37.6 s。#66393 删掉 gemma.py 与 stablelm.py（净 −765 行）迁到 Transformers 后端，并为此把 EncoderOnlyAttention 收窄到非多模态服务以保住 PaliGemma。#66334 是 Muse Spark 的公开面改名：类名去 1x、model_type 换 muse_spark_dspark、parser 别名 musespark1x 直接不再注册，而 PR 正文四节为空模板、只有一张 TEP4/DEP4 表，是本日验证口径最薄的一条。",
+    "sig-ci": "3 条，主体是样式与依赖的供给面。#65158 落地 check-docstring-style 钩子并做全仓 docstring 清扫（+15690/-15306、1847 文件），钩子拒绝方括号交叉引用、NumPy 段落、RST 指令与错位 code span，并自动把双反引号改成单反引号，价值是把 #65157 那类文档构建失败拦在提交时；#66441 正是它当日的尾巴——钩子把 07:15 合入的 #46871 判红，用钩子自身 autofix 补平 benchmarks/kernels/benchmark_batched_moe.py；#66313 为 Python 3.14 把 tensorizer 从 2.10.1 提到 2.12.1，根因是 PEP 649 让旧 metaclass 查不到 __annotations__ 而在 import 期抛 KeyError 并打死引擎初始化，验证给了 3.12/3.14 的导入矩阵与 MI350X 上各 21 passed 的 loader 用例。一条链条说明治理成本：一次全仓样式清扫会在同一天制造新的红灯，需要紧随的补丁才能恢复绿灯。",
+    "sig-quantization": "2 条都在 ROCm/AITER 侧，一条放开回落、一条补上守卫。#66350 让只有 VLLM_ROCM_USE_AITER=1 时 FP8 MoE oracle 不再硬要 AITER——碰上 kernel 不支持 no act_and_mul MLP 的层改判回落 TRITON，只有显式 VLLM_ROCM_USE_AITER_MOE 才强制并在不支持时抛错，直接解除了 Nemotron-3-Super-120B-A12B-FP8 镜像的阻塞（回落 GSM8K 三次 0.9348/0.9310/0.9287、接受长度 4.24），Qwen3-30B-A3B 仍照常选中 AITER。#66206 给 #61816 的两处修正补测：无 bias 的 MXFP4 W4A16 声明 pad 归零（aiter#6598 可能不写 pad 列而留 NaN）与 TP1 停止 pad 翻倍（曾遮住 gpt-oss 有效行），新用例 mock rocm_aiter_ops.fused_moe 核对无 bias、带 bias、SITU 三种 intermediate_pad，因走 mock 也能在 gfx942 跑，MI300X 上 10/10。两条都明确挂了回退条件：#66206 与 #61960 的模型级 override 约定等 aiter#6598 钉版后一起撤。",
+    "sig-rl": "1 条。#66287 清的是 #66010 之后不再需要的 level-2 sleep workaround：LoRA 权重替换后的 adapter 全清与 LogitsProcessorWithLoRA.reset_sharded_to_full_mapping 被删（钩子改名 on_target_weights_replaced 并搬出 LoRA mixin，Model Runner V2 用它刷新 draft lm_head、独立 CPU runner 给空实现），DeepSeek-V4.1 Engram 的 peer 指针表从 buffer 退回普通属性（EngramPeerExchange 与 EngramBatch 不再是 nn.Module），三处把 level-2 当理由的注释改为 IPC 权重缓存加载器只实体化参数与 buffer。GB200 上 LoRA 的两个深睡用例通过，而负向对照（旧规则且不 reset）在 tp2 失败，说明删除确实依赖 #66010 的新语义；Engram DP4 与 V4.1-Flash TP4 的多轮 level-2 与直接重载 GSM8K 都在 0.90 上下、每 rank 160 个专家张量 0 个与冷启动不同；单测 worker 71 passed、LoRA 262 passed 168 skipped。带一条需要留意的行为变化：基座权重被替换时不再驱逐已加载的 adapter。"
+  },
+  "commits": [
+    {
+      "sha": "3213796cd32df625a0669e9423acb397b627b790",
+      "comment": "**背景**：#65158 引入的 check-docstring-style 钩子禁止 docstring 里用双反引号写 code span，而当天 07:15 才合入的 #46871 带进 benchmarks/kernels/benchmark_batched_moe.py 通篇是这种写法——它自己的 pre-commit 在钩子存在之前就跑过了——结果从 0555390170 起 main 的 pre-commit 对每个继承它的 PR 都判红（正文附了一条 runs/42539702240 的作业链接）。**方法**：只落地钩子自己的 autofix，把 docstring 中的双反引号换成单反引号，声明除注释文本外不动任何东西；作者检索「benchmark_batched_moe」与「check-docstring-style」确认没有别的开放 PR 在修。**效果**：+22/-22、1 文件；针对该文件跑该钩子由 Failed（files modified）转 Passed，整文件全部钩子通过，当天把 main 的红灯补平，代价是 398 行的基准脚本仍带着那批调优 JSON 等着后续 autotune。",
+      "sig": "sig-ci",
+      "sig_reason": "改动是给 pre-commit 钩子让路、恢复 main 的样式检查绿灯，不涉及基准脚本的逻辑或性能；与 hint 一致。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "pre-commit",
+        "docstrings",
+        "benchmarks"
+      ],
+      "pr_number": 66441
+    },
+    {
+      "sha": "62902f6ce6731058657fbaa1c565ed30002bec96",
+      "comment": "**背景**：只设 VLLM_ROCM_USE_AITER=1 时，FP8 MoE oracle 把 AITER 当硬要求，碰上 kernel 不支持 no act_and_mul MLP 的层直接抛 ValueError（Fp8 MoE backend AITER does not support the deployment configuration since kernel does not support no act_and_mul MLP layer），把 #66318 里 Nemotron-3-Super-120B-A12B-FP8 的 MI355 ReplaySSM 镜像整个卡死。**方法**：oracle/fp8.py 改成只有显式的 VLLM_ROCM_USE_AITER_MOE（既设定又为真）才强制 AITER 后端；全局 flag 只把 AITER 挪到优先级表首位，能不能服务交给常规自动选择；test_moe_kernel_oracle.py 的 test_fp8_aiter_env_selection 覆盖四种 env 组合（全局 flag 回落、支持时仍选 AITER、显式 MoE flag 仍抛错、任一 flag 为 0 则摘掉 AITER）。**效果**：+53/-1、2 文件；gfx950 上不带 fp8.py 改动时 global-falls-back 独挂、改后同文件 69 passed 且连跑 10 轮全绿，相邻三个 oracle 测试 73 passed 9 skipped、test_quark 的 moe/fp8 56 passed；Nemotron-3-Super TP2 + EP 回落 TRITON 后 GSM8K 三次 0.9348/0.9310/0.9287、接受长度 4.24，Qwen3-30B-A3B 仍照常选中 AITER。",
+      "sig": "sig-quantization",
+      "sig_reason": "改的是 FP8 MoE 后端选择（AITER 与 Triton 回落）这一量化 kernel 派发逻辑与其测试；hint 的 sig-quantization 成立。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "fp8-moe",
+        "rocm-aiter",
+        "backend-selection"
+      ],
+      "pr_number": 66350
+    },
+    {
+      "sha": "e5f2ea9be8b2ca62ac6e049effe2dc438b78c8f1",
+      "comment": "**背景**：#66010 之后 level-2 sleep 只丢弃「活块全部由 update 会重写的参数持有」的分配，其余原地址 offload 再恢复，于是为旧语义加的一圈 workaround 失去理由：#39935 在每次权重替换后清掉所有 adapter 并重建 TP logits 映射、#59923 把 Engram peer 指针表注册成 buffer 只为让 level-2 恢复它，另有三处注释把 level-2 当成 buffer 的理由。**方法**：删掉 LoRA 复位与 LogitsProcessorWithLoRA.reset_sharded_to_full_mapping，钩子改名 on_target_weights_replaced 并搬出 LoRA mixin（Model Runner V2 定义它以在 reload 或权重传输后刷新 draft lm_head，独立 CPU runner 给空实现）；EngramPeerExchange 与 EngramBatch 不再是 nn.Module、object.__setattr__ 绕过随之删除；rope_norm.py、routing_simulator_router.py 与 compressed-tensors KV scale 的 buffer 保留但注释改为真实原因——IPC 权重缓存加载器在 meta device 建模、只实体化参数与 buffer。**效果**：+29/-97、12 文件；GB200 上 test_deep_sleep_lora 与 test_deep_sleep_lora_tp2 通过，负向对照（旧规则且 LoRA 进 weights pool 不 reset）在 tp2 失败；DP4 Engram 经两次 level-2 循环 GSM8K 0.9098/0.9090/0.9030/0.9014，V4.1-Flash TP4 两次直接重载 0.9060→0.9037→0.9098 且每 rank 160 个专家张量 0 个与冷启动不同；worker 71 passed、LoRA 262 passed 168 skipped，唯一失败是缺 kaldi_native_fbank 的 fireredasr2 用例。行为变化：基座权重被替换时不再驱逐已加载 adapter。",
+      "sig": "sig-rl",
+      "sig_reason": "主题是 sleep mode level-2 语义与 weight reload 钩子链路（RL 侧内存让渡与权重更新的复用面），延续 10-22 #62701、10-28 #64186、10-30 #64630 的同类归属，hint 的 sig-core 不成立。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "sleep-mode",
+        "weight-reload",
+        "lora"
+      ],
+      "pr_number": 66287
+    },
+    {
+      "sha": "3b33a845c6733a50aafae933c10ac0be0f18be93",
+      "comment": "**背景**：#61816 做了两件事——把无 bias 的 MXFP4 W4A16 声明 pad 归零（ROCm/aiter#6598 可能不写 pad 列而留下 NaN），并停掉 TP1 下对 W4A16 pad 的翻倍（它会遮住 gpt-oss 的有效行），但这两处都没有测试守在 pad 交给 AITER 的那一点：test_aiter_moe_pads 只测 aiter_moe_pads 这个 helper，gfx950 的 pad 用例永远带 bias。**方法**：tests/kernels/moe/test_rocm_aiter_moe.py 新增用例 mock rocm_aiter_ops.fused_moe，核对 rocm_aiter_fused_experts 为 padded MXFP4 W4A16 传下去的 intermediate_pad 在无 bias、带 bias（gpt-oss）与 SITU 三种形状下的取值；rocm_aiter_moe.py 把 aiter_moe_pads 的 docstring 钉到 AITER v0.1.28.post1 与其当前的 stage-2 pad 处理。**效果**：+66/-3、2 文件；MI300X 上 pytest tests/kernels/moe/test_rocm_aiter_moe.py 10/10，mock 使它在 gfx942 同样可跑，摘掉无 bias 守卫或让 TP1 翻倍回来都会失败；#61960 的模型级 override 保留（它还覆盖在线 FP8 与 W4A4 重量化、未量化专家等通用守卫管不到的路径），两处约定等 aiter#6598 钉版后一起回退。",
+      "sig": "sig-quantization",
+      "sig_reason": "守的是 MXFP4 W4A16 量化 MoE 在 ROCm 上的 pad 契约，属量化格式与权重路径的正确性；hint 成立。",
+      "tags": [
+        "test",
+        "low-risk",
+        "mxfp4",
+        "w4a16",
+        "rocm-aiter",
+        "moe-pad"
+      ],
+      "pr_number": 66206
+    },
+    {
+      "sha": "0555390170b7f4cfd380762412097d2beb7b60c3",
+      "comment": "**背景**：XPU 上 DP 加 EP 的 MoE 只有 allgather/reducescatter 的朴素派发，能消费 batched 激活格式（E × capacity × K）的分发后端是空的。**方法**：给 All2AllBackend 增加 alltoall_batched 取值并纳入 use_batched_dp_moe；新增 245 行的 AllToAllBatchedPrepareAndFinalize，用固定容量的 all_to_all_single 做 routed 派发——一个 token 不论有几个专家落在同一 rank 只发一次，随包带 local expert ids 与 router weights，activation_format 报 BatchedExperts；XPUPlatform 在 moe_backend 为 batched_triton 且 backend 仍是 allgather_reducescatter 时自动改写，并把 max_num_batched_tokens 夹到 DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP；unquantized oracle 在 batched 格式下把 BATCHED_TRITON 排到 XPU 之前；配 579 行的 benchmark_batched_moe.py、96 行的 merge_batched_moe_configs.py 和 24 份 Arc Pro B60/B70 的 E/N 调优 JSON。**效果**：+2360/-7、38 文件；作者自陈仍是 WIP、端到端有性能回退、依赖尚未上游的 autotune，且 DeepSeek MLA 在 XPU 上另有一个无关的 batched-prefill 数值 bug 需 VLLM_MLA_DISABLE=1 绕开；同批新增的 tests/kernels/moe/test_alltoall_batched_capacity.py 覆盖容量核算，但该文件正是当天 main pre-commit 红灯的来源，由 #66441 补平。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "交付对象是专家并行的 all2all 通信后端与并行/调度配置契约，与 10-31 #61361、11-06 #65930 的 all2all 后端归属一致；hint 的 sig-model-performance 只反映其 MoE kernel 与调优配置。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "expert-parallel",
+        "all2all",
+        "xpu",
+        "batched-moe"
+      ],
+      "pr_number": 46871
+    },
+    {
+      "sha": "fd0c471b3a4c2446c44b2ba8b4699a42e181d7b2",
+      "comment": "**背景**：ROCm 上 hipMemGetInfo 把每笔分配至少按 2 MB 计为已用（amdgpu 刻意的悲观可用量，除非 apu_prefer_gtt 把显存留在系统内存），warmup 期加载的大量小 kernel code object 因此隐藏掉几 GB 空闲，让 #56492 的可扩展 KV cache 在最后定尺时按偏小的 free memory 决策。**方法**：Platform 新增 free_device_memory 类方法（默认取 device_memory_info 的 free 值，报低了的平台覆写），rocm.py 与新 rocm_device_memory.py 在读到匹配的 sysfs 计数时用 mem_info_vram_used 的全设备精确用量补回差额；extensible_kv_cache.py 的 measure_kv_cache_blocks 与 _release_for_weight_update 改走该钩子，cache.py 文档说明 gpu_memory_utilization 在此界定的是精确用量。**效果**：+539/-6、10 文件；Llama 3.1 8B / R9700 上 KV cache 从 51,712 提到 76,288 token、无 OOM 无失败请求；补回量不超过物理空闲、不为负、不加回别人进程的分配；集显、分区 GPU、sysfs 缺失或不匹配以及非 ROCm 全为 no-op；--optional 用例会以 64 MB / 2 MB torch 块和单个 ExtensibleTensor 吃掉纠正后空闲减 256 MB。残余风险：仅 gfx1201 实测、CDNA 属推断，同卡多实例时后启动者缓存更小（不 OOM），KFD 页表与 RAS 约 80 MB 靠 #65418 的 3 GiB 下限兜。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 KV cache 定尺所依赖的空闲显存口径（platform 内存钩子与 extensible worker），与 11-04 #65413 同类；hint 的高置信 sig-core 成立。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-cache",
+        "rocm",
+        "memory-sizing",
+        "platform"
+      ],
+      "pr_number": 63401
+    },
+    {
+      "sha": "5d840812d313262275c7f0319cfe651e6db41b7d",
+      "comment": "**背景**：tensorizer 2.10.1 用一个读取 dct.pop 拿 __annotations__ 的 metaclass 拼 libsodium 常量，PEP 649 下 Python 3.14 传进类命名空间的是 __annotate_func__ 而不是 __annotations__，于是查表拿到空 dict 并在 import 期抛 KeyError（crypto_stream_salsa20_NONCEBYTES 缺键）；vLLM 导入 tensorizer，这个失败会一路打死引擎初始化。**方法**：requirements/rocm.txt、setup.py 的 tensorizer extra、requirements/test 下 cuda/rocm/xpu 三个 .in 与 nightly-torch.txt 由 2.10.1 提到 2.12.1，三份 lock 按各自头部命令重生成，正文声明只有版本号与两个 hash 变化。**效果**：+18/-18、10 文件；对照表里 3.12 两版都正常、3.14 配 2.10.1 复现 KeyError、配 2.12.1 通过；MI350X（Python 3.12、torch 2.13.0+rocm）下 tensorizer_loader 基线 1 次与改后 4 次各 21 passed、entrypoint 各 1 passed；3.14 的 ROCm LLM() 贪心 smoke 打 bump 后 10/10、不打则在引擎初始化即失败；pre-commit 含全部 pip-compile 钩子与 nightly-torch 同步钩子通过，未跑模型评测（作者认为序列化往返已由 loader 测试覆盖）。",
+      "sig": "sig-ci",
+      "sig_reason": "全部改动是 requirements 与 setup.py 的依赖 pin 刷新，动因是 Python 3.14 的构建与导入可用性；与 #65669、#65494 等同类 pin 归属一致，hint 成立。",
+      "tags": [
+        "dependency-bump",
+        "low-risk",
+        "tensorizer",
+        "python-3.14",
+        "requirements"
+      ],
+      "pr_number": 66313
+    },
+    {
+      "sha": "15166efabb4d7f27eaf807ee8e1c7454fd188886",
+      "comment": "**背景**：DeepSeek-V4 的模型级序列并行让 residual 流按 token 保持在各 TP rank 分片，但现有实现带 PP = 1 的前置条件，多段流水线用不上；PP 传输会把每个 IntermediateTensors 条目按 TP rank 切片送出、接收端再 all-gather，所以每个 stage 必须返回 TP 复制的全 token 张量。**方法**：vllm/models/deepseek_v4/nvidia/model.py 去掉 MegaMoE 的 PP 限制，把出口的 hidden_states all-gather 挪到非末段 return 之前、下一段在入口重新分片（沿用 MiniMax-M3 与 DeepSeek-V4.1 的写法，辅助 hidden states 本已逐层 gather），并整体建立在 #55520 的 requires_raw_input_tokens（给后续 PP stage 供 input_ids）之上；仅由 DP 大于 1 触发的 SP 仍要求 PP = 1 且本次未验证。**效果**：+15/-11、2 文件；B300 上 DeepSeek-V4-Flash TP2 + EP + MegaMoE、FP8 KV：PP2×TP2 输出吞吐 decode +7.8%、混合 batch +12.9%、prefill 亦升；GSM8K 1319 题 5-shot PP2 0.950（main 关 SP 0.949）、PP4 0.955（0.946）；6 条固定提示 412 个打分位置里每 rank 超过 32 token 者 logprobs 与 PP1 逐位一致，更短者 mean 绝对差 0.037 到 0.128、最大 0.62，根因是 PP 边界走 mhc_post 加 mhc_pre 的分离路径而非 32 token 内的融合 kernel（每层强制分离后 412 位全等）；PP1、非 MegaMoE 后端与 DP 触发 SP 不变，tests/models/test_deepseek_v4_fi_moe_ep.py 同步放宽门槛。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是放开序列并行与 PP、TP、EP 的组合并给出多机流水线吞吐，属并行度能力；与 11-05 #65537（MiniMax-M3 同类 SP×PP）归属一致，hint 的 sig-core 不成立。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "sequence-parallel",
+        "pipeline-parallel",
+        "deepseek-v4",
+        "megamoe"
+      ],
+      "pr_number": 65766
+    },
+    {
+      "sha": "9b9bd049a73617e996d06cf35e6baf2a29ed03ae",
+      "comment": "**背景**：docstring 里的 reStructuredText 习惯会打坏 MkDocs 渲染，其中不可解析的方括号交叉引用甚至直接让文档构建失败（#65157 就是这一类），此前只能靠人工清扫、反复回潮。**方法**：.pre-commit-config.yaml 新增 check-docstring-style 钩子并覆盖全部 Python 文件（钩子自身源码除外）：自动把双反引号 code span 改成单反引号、把 Sphinx 角色换成显示文本的 code span；拒绝会被 mkdocs-autorefs 读成交叉引用的方括号序列、NumPy 风格段落、RST 指令与链接、以及首尾错位的 code span；含转义或行续、无法原地修的 21 处改 raw 字符串并报出；AGENTS.md 补一行该约定。**效果**：+15690/-15306、1847 文件；核对口径是 1,845 个改动的 .py 除字符串内容外与 upstream/main 相同，钩子在全仓 tracked Python 文件上无改写无 finding、对修复前版本每条新检查都能抓到；13 处 NumPy 风格与 3 处畸形 docstring 手工转 Google 风格、4 处 note 指令转 admonition、2 处 code-block 转围栏，未重排段落。副作用当天即现：它把 07:15 合入的 #46871 判红，由 #66441 用钩子 autofix 补平。",
+      "sig": "sig-ci",
+      "sig_reason": "交付物是 pre-commit 钩子与其在全仓的样式落地，不改任何运行时代码；hint 的 sig-core 只反映被扫文件的位置，不成立。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "pre-commit",
+        "docstrings",
+        "mkdocs",
+        "style-sweep"
+      ],
+      "pr_number": 65158
+    },
+    {
+      "sha": "80e2e486f2b895c06ea962e6146b8f97376dcaff",
+      "comment": "**背景**：#56492 的可扩展 KV cache 成为默认后，同机 NIXL 的 P/D 静默把 KV 从 NVLink 挪到 TCP——该 cache 用 cuMemCreate 加 cuMemMap 映射，而 UCX 的 cuda_ipc 用 cuIpcGetMemHandle 只导得出普通内存、FABRIC handle 又只对带 IMEX channel 创建的内存可用，于是这块内存没有 cuda_ipc 通路，UCX 不报错地退到下一级传输；精度不变，所以 #56492 的 NIXL 精度校验发现不了。**方法**：vmm_driver.py 加 imex_channel_available()（真去 open /dev/nvidia-caps-imex-channels/channel*，设备文件存在不算数，容器 device cgroup 可能仍拒绝）与 FABRIC 属性号、句柄类型常量；KVTransferConfig 抽出 _connector_children 并新增 uses_nixl_on_device_memory()（含 MultiConnector 子项，kv_buffer_device 为 cpu 时不算），CacheConfig 据此在「NIXL 走设备内存但没有 channel」时默认关掉可扩展 KV，有 channel 则带 FABRIC handle 照常开启。**效果**：+234/-32、7 文件；GLM-5.3-Flash 1P1D 单机 8x B200、DEP4 + DEP4、driver 590.48.01、NIXL 1.5.2、真实 MTP、1,319 条 GSM8K：单次 KV 传输由 9.9 s（software emulation、tcp/cilium_host）降到 24 ms 量级（关可扩展 KV 的 main 是 23.4 ms、本 PR 无 channel 23.6 ms、有 channel 24.2 ms），GSM8K 0.9757/0.9750 对基线 0.9742；一小时并发 256 的 AgentX replay 里 24,041 次传输均值 894 MB、22.1 ms、0 失败；回退规则与 driver 改动后新测试即失败，传输路径可用 UCX_PROTO_INFO=y 在 D 侧日志确认。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题是 PD 分离下 NIXL KV 传输的显存句柄与 UCX 传输选择，属 KV 传输链路；hint 的 sig-core 不成立，与 10-23 #62827 同类。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "nixl",
+        "kv-transfer",
+        "pd-disaggregation",
+        "vmm"
+      ],
+      "pr_number": 65137
+    },
+    {
+      "sha": "34b780fe66bdf3df173358774eb4f29f684b8368",
+      "comment": "**背景**：Transformers modeling backend 的迁移线继续吞掉自研实现，Gemma v1 与 StableLM 还各自保有模型文件。**方法**：删除 vllm/model_executor/models/gemma.py 与 stablelm.py 并改 registry 与 supported_models.md，让 GemmaForCausalLM、StableLmForCausalLM 走后端；base.py 把 EncoderOnlyAttention 的选择收窄到被服务模型非多模态（用 model_config.is_multimodal_model 判定），因为 PaliGemma v1 复用的 Gemma text config 会设 use_bidirectional_attention，否则纯文本服务也会挑到双向注意力。**效果**：+8/-773、7 文件，净删 765 行；B200 加 Transformers 5.22 下 google/gemma-1.1-2b-it 的 GSM8K 0.118→0.119、吞吐 137.6 与 113.4→148.3 与 124.2 req/s，stabilityai/stablelm-3b-4e1t 0.091→0.097、27.6 与 26.3→25.9 与 26.1，两者都不比原生慢；test_common 与 test_initialization（含 PaliGemma、GemmaForSequenceClassification）、PaliGemma 多模态 test_common、test_bge_reranker_v2_gemma、test_gptq_marlin、Gemma perplexity、test_registry 以及把两模型临时加进 TEST_MODELS 的 test_pipeline_parallel 全过；不带 base.py 改动时 PaliGemma 的两个用例失败，limit_mm_per_prompt 把 image 设 0 或 language_model_only 打开时生成正常。",
+      "sig": "sig-core",
+      "sig_reason": "改的是模型注册与 Transformers 后端的建模路径选择（含 PaliGemma 的多模态判定），属引擎侧模型支持；hint 的高置信 sig-core 成立，与 10-30 #63384 同类迁移一致。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "transformers-backend",
+        "model-registry",
+        "gemma",
+        "stablelm"
+      ],
+      "pr_number": 66393
+    },
+    {
+      "sha": "f905e70070cce1ee0f7d184449f43a4af385360d",
+      "comment": "**背景**：vendored FLA 的 ops/utils.py 在 import 期就把 CUDA 拉起来——平台检测调 triton.runtime.driver.active.get_current_target()（内部走 torch.cuda.current_device()），Hopper 判断调 get_device_name 与 get_device_capability；GDN（Qwen3-Next/3.5、Olmo、Kimi GDN）、Bailing 线性注意力、KDA 这些在模块级 import FLA 的模型，于是在 API-server 进程构造 engine config 时就踩中，vLLM 打印「We must use the spawn multiprocessing start method」并列出 CUDA is initialized，改派 engine core、把 torch 与 vLLM 再 import 一遍。**方法**：vllm/third_party/flash_linear_attention/ops/utils.py 的 vendor 检查与 Hopper 检查都改用 current_platform（走 NVML、不建 CUDA context），让默认的 fork 保持可用。**效果**：+8/-2、1 文件；对 Qwen3.5 风格的 GDN 模型跑 EngineArgs.create_engine_config() 后 torch.cuda.is_initialized() 由 True 变 False；DGX Spark（GB10）上 vllm serve 三次冷启动（丢弃预热、清 page cache、编译缓存温热）强制 spawn 的告警消失、torch 只 import 一次；Qwen3.8 27B NVFP4 + MTP 到 /health 就绪 41.3±1.8 s（spawn）对 37.6±3.3 s（fork），贪心输出逐 token 相同；Nemotron-H 这类模块级不 import FLA 的模型本来就被 fork、不受影响。",
+      "sig": "sig-core",
+      "sig_reason": "解的是引擎进程派生方式与启动期 CUDA 初始化的核心链路问题，GDN 等模型只是触发条件；hint 的高置信 sig-core 成立。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "startup",
+        "process-spawn",
+        "linear-attention",
+        "vendored-fla"
+      ],
+      "pr_number": 66263
+    },
+    {
+      "sha": "c3a347a54865793fcb92957d51b32ddda3974807",
+      "comment": "**背景**：Muse Spark Open 上线时带着内部代号 1x 的命名——类名 MuseSpark1x 系列、model_type 为 musespark1x_text、Rust 与 Python 的 parser 别名 musespark1x 都在用；本 PR 正文的 Overview、Claims、Validation、Details 四节几乎全空，只留一张 TEP4 与 DEP4 的评测表，判断只能靠标题与 69 个改动文件。**方法**：全仓把 MuseSpark1x 统一改写为 MuseSpark（amd/model.py 与 nvidia/model.py 的残差流、RMSNorm、MoE 与 Router 类名，common/omni.py 的 Omni mixin 与三个 processor 类，csrc/fp32_router_gemm.cu 里 256 专家 × 8192 hidden 那档阈值的注释）；transformers_utils/configs/muse_spark.py 删掉 MuseSpark1xTextConfig、并入 MuseSparkDSparkConfig（model_type 改 muse_spark_dspark、rope_is_neox_style 由真改假、加 has_no_defaults_at_init 与 draft_vocab_size 与 draft_position_mode，用后者推导 use_rope，并取消按 gated_delta_net 开关写 architectures 的做法）；Rust 的 MUSE_SPARK_1X 常量改 MUSE_SPARK，reasoning 与 tool_parsers 的别名注册及 tool_calling.md 同步。**效果**：+430/-457、69 文件；表内 GSM8K 5-shot strict TEP4 0.9515、DEP4 0.9507，GPQA-Diamond 0.8939 对 0.8636，OCRBench（max_tokens 16384）849 对 850，MMAU 0.633 对 0.619，OCRBench（1024）两侧同 813；实质风险是破坏性改名：旧别名 musespark1x 不再注册、checkpoint 侧 model_type 与架构类名一并换掉，且正文未记录任何验证步骤与用例清单。",
+      "sig": "sig-core",
+      "sig_reason": "交付物是 Muse Spark 模型实现、config 类与 parser 命名的整理，跨 Python、Rust 前端与 csrc，属模型支持面；与 10-26 #61879、11-02 #65045 同类归属一致，hint 的低置信 sig-core 成立。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "muse-spark",
+        "rename",
+        "model-config",
+        "parser-alias"
+      ],
+      "pr_number": 66334
+    }
+  ]
+}
