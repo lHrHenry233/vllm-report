@@ -1,0 +1,1155 @@
+{
+  "date": "2026-11-12",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-12T20:27:53+08:00",
+  "daily_summary": "**今日概览**：全天 79 条，bugfix 29 条、performance 21 条、feature 11 条。三条主线很清楚：把 AMD 显卡上的量化与 MoE 内核做快、把专用解码和 MegaMoE 推到 Hopper、把可扩展 KV 缓存的显存记账问题一次修完。高风险只有 3 条（#65932、#60321、#61869）。\n\n**今日重点**：\n\n### AMD / ROCm\n- **MiniMax-M3.1 的一串内核提速**：#65479 让 MXFP8 线性层走 AITER 调优过的 FlyDSL 通用矩阵乘（只在 AITER 有调参的形状上生效，其余仍用 Triton），MI355X、TP4、并发 64 时解码步间隔 p50 降 11.1%、吞吐升 7.7%；#56451 给 ROCm 的 Triton 索引器与稀疏解码加上变长查询支持，这是这个模型能开自适应 DSpark 验证的前提；#63721 把 SiLU-and-mul 与逐 token FP8 量化融成一个内核，EP8 单卡 8192 token 时两个内核从 867 微秒降到 114 微秒。\n- **DeepSeek-V4 / V4.1 的 KV 缓存格式**：#66036 在 gfx950 上新增逐张量 scale 的 FP8 KV 缓存（每 token 512 字节，比打包格式少），同样显存多 12.5% 容量、输出吞吐最高 +7.6%，四个精度基准无退步；#60321（高风险）给无旋转位置编码的稀疏 MLA 加 MXFP4 打包 KV，每 token 272 字节、容量 3.76 倍，对打包缓存做注意力与反量化后按 bf16 存的结果逐位相同。\n- **两个静默错误的内核修复**：#64087 修 `reshape_and_cache` 在单 token 需要写的 16 字节块超过 512 个时漏写 KV 头，此前 32 个 KV 头乘 192 或 256 的 bf16 形状会读到陈旧缓存（最大误差 0.097 到 0.196，修后与 Triton 后端差值小于 0.0006）；#63878 给 ROCm 的稀疏索引器 prefill 循环补上续接子块跳过 K 收集的判断，512K 上下文的首 token 延迟降 7%、单请求的 K 收集时间从 2.8 秒降到 0.12 秒。\n- **CI 结构调整**：#67038 把两个会阻塞合并的 monokernel 步骤从「选整个目录」改成点名测试文件——按目录选会让新放进去的测试自动进 8 卡步骤、而钩子不报警；#67073 再把七个同类步骤集中成一个 Monokernels 测试区域（纯搬迁）。三份 AMD 验证过的 recipe 也在今天进来（#66625、#66721、#66689）。\n\n### NVIDIA\n- **专用解码补上草稿侧**（#61869，高风险，+2489 行）：DeepSeek-V4.1-Flash 在 GB300 上开 `latency_specialized` 时，DSpark 草稿层现在与目标模型共用同一套解码执行器——融合的全规约加 mHC 内核、注意力与路由专家 GEMM，采样走模型的 `sample_sequential` 钩子（融合的 Markov 循环，小批量时把 Markov 链按词表切到各张量并行 rank）。单托盘 TP4、5 个草稿 token：批量 1 解码步短 4.5%、批量 8 短 3.4%、批量 40 短 1.6%，GSM8K 与接受长度不变。\n- **MegaMoE 下 Hopper**：#62603 接进 FlashInfer 的 SM90 FP8 MegaMoE，把分发、两个专家 GEMM 与合并融在一起，8 台 H200 上 GLM-5.3-Flash 解码吞吐 +11% 到 +18%；#64061 用 DeepGEMM 新的 SM90 FP8 乘 FP4 内核支持 MXFP4 路由专家，单机 DP8 加 EP8 比默认路径高 17% 到 26%、跨两节点高 16% 到 27%（需要等 vllm-project/DeepGEMM#44 落地后抬 pin，此前 SM90 用例跳过）；#67040 让未量化（BF16）的 GLM-5.3 也走 MegaMoE，8 张 B200 并发 128 下 prefill 总吞吐 +40%、解码输出 +13.6%。\n- **FlashInfer 的三处能力与两个竞态**：#66018 给 MiniMax-M3 的稀疏注意力加 SM90 与 SM120/SM121 的 FlashInfer 后端（此前这两类卡只有 Triton），H100 上单层 prefill 快 2.6 到 5.6 倍、端到端首 token 延迟 p50 降 3% 到 19%；#46558 让多模态 PrefixLM 批次留在原生 FlashInfer 上，用每查询一对起止范围代替大掩码，省的是显存而非计算量。#64165 修元数据构建器在上一步内核还没把计划从页锁定缓冲拷走时就再次 plan、导致越界读的问题；#64329 修查询是 BF16 或 FP16 时仍把 FP8 的层 q_scale 传给内核的问题。\n\n### 跨平台 / 引擎通用\n- **可扩展 KV 缓存的显存账一次修完**：#66731 让定尺寸预热真正测到调度器能跑的最大那一步（多请求凑满预算、`max_num_seqs=1` 时按纯 prefill 跑）；#66197 把 FlashInfer 自动调优的一次性峰值从瞬时预留里排除；#66523 在捕获计算图之前释放预热占的 KV 块，此前大编码器图会让启动直接 OOM；#66704 给「显式设了 `gpu_memory_utilization` 因而把空闲显存挡在缓存之外」加启动告警；#67071 则把文档、基准、CI 与测试里那些从旧默认值时代抄来的 0.9 删掉（153 文件）。这五条是同一件事的连续修补。\n- **前端与 Rust 对齐**：#65993 让不带引擎的渲染器 `vllm-rs render` 支持多模态与 LoRA（新增 `--dtype` 与 `--limit-mm-per-prompt`，渲染结果可直接提交给生成）；#66531 与 #66767 让 MiniMax M3 的工具参数边生成边流出、并按 token 身份识别标记（此前正文里引用这套写法会被误判成标签）；#66773 让 Rust 服务在引擎永久失败时按 Python 的做法退出，方便进程管理器重启。\n- **并发正确性与输入处理**：#65932（高风险）修多个渲染 worker 共用一个分词器导致并发请求按别人的长度截断——此前约 16% 到 17% 的并发请求受影响，且不报错；#66608 让视频帧预算不再被别的模态扣减，四类模型不再拒绝明明放得下的纯视频提示；#66638 让 Unlimited-OCR-2 的多页请求真正用上处理器缓存；#66624 修 SigLIP2 复用 Gemma 分词器时被套上 Gemma 对话模板、丢结束符的问题；#60035 让 MEAN 池化在批量不变开关下可复现。\n\n**需要关注**：\n- #65932、#60321、#61869 是本日三条高风险：分别是跨请求的截断竞态修复、948 行的新 KV 缓存格式、2489 行的草稿层专用解码。\n- 依赖上游未落地或需要额外安装：#64061 等 DeepGEMM 的 SM90 改动合入后要抬 pin；#65521 依赖带实验性内核源码的 FlashInfer（PyPI wheel 不含），只装 wheel 时该内核建不起来、静默留在 TileLang；#64560 需要含 ROCm/aiter#7171 的 AITER。\n- 证据偏薄：#62309 的精度结果只给截图；#66292 只有命令没有运行数字；#66973 与 #5237388516 之外，#67035、#66465 未给端到端数据。",
+  "sig_summaries": {
+    "sig-core": "22 条。最值得注意的两条是并发正确性与显存记账：#65932（高风险）把按 worker 分词器池从 HfRenderer 上移到 BaseRenderer，此前直接继承基类的六个渲染器在 `--renderer-num-workers` 大于 1 时会用别人的截断长度，静默影响约 16% 到 17% 的并发请求；#66561 把 worker 里 `max_split_size_mb` 从 20 改成 21，让被释放的 1 到 10 MiB 张量能重新复用，Kimi-K3-REAP 在 8 张 B200 上的模型加载从约 700 秒降到 96.8 秒、分配器 OOM 重试从约 96.4 万次降到 0。可扩展 KV 缓存一条线有四项：#66731 让定尺寸预热覆盖调度器真正能跑的最大步、#66197 排除 FlashInfer 自动调优的一次性峰值、#66523 在捕获计算图前释放预热占的 KV 块、#66704 给挡住空闲显存的设置加告警。接口侧 #66489 把空 messages 提前拒成 400、#66848 把未知角色的异常改成 ValueError、#65029 让 run-batch 报出行号、#66777 让 SageMaker 端点与对应 v1 接口同错同处理；#66773 让 Rust 服务在引擎永久失败时退出。#66419 让建模后端遵守 `--cpu-offload-gb`（此前静默无效，现在逐层构建再交给卸载器，构建期峰值只高约一层）；#66624 与 #63636 分别修模板优先级与多模态编码器编译时的动态维度推断；#60035 让 MEAN 池化在批量不变下可复现；#66859 用 RoutedScaleMode 枚举替掉两个布尔参数。",
+    "sig-ci": "7 条，两条动了 CI 结构。#67038 把两个阻塞的 AMD monokernel 步骤从选整个目录改成点名测试文件：按目录选会让新加入的测试直接进一个 8 卡、60 分钟的阻塞步骤，而 tethering 钩子因目录已覆盖而保持沉默；#67073 再把七个同类步骤集中成独立的 Monokernels 测试区域，纯搬迁、键名保留以便历史与 flake 统计延续。#65765 把 Rubin 的 nightly 镜像从 CUDA 13.4 换到 13.5（最终镜像 13.5.0-base、按 cu135 发布，构建阶段仍留在 cuda13.4 的 builder 与 cu134 torch nightly，因为 PyTorch 还没有 13.5 的产物），并说明宿主驱动需要 R620 以上、R610 上前向兼容驱动会关掉卡间点对点。#66646 给 MiniMax-M3 的宽专家并行 CI 单元设小 token 预算（预fill 2048、解码 64），因为 AITER 的 MXFP8 MoE 内核按 `--max-num-batched-tokens` 定填充缓冲区大小，默认 131072 行让每个步骤都为整块付费，评测从约 1 小时 37 分降到几分钟。#66978 与 #66924 是测试条件修正：前者把提示加长到能跨过 XPU 的 64 token 块边界，后者加 `requires_lmcache` 跳过标记。",
+    "sig-model-performance": "20 条，AMD 与 NVIDIA 各占一半。ROCm 侧：#63878 让稀疏索引器 prefill 跳过续接子块的 K 收集，512K 上下文首 token 延迟降 7%；#64087 修 `reshape_and_cache` 超过 512 个块时漏写 KV 头，此前 ROCM_ATTN 对 32 头乘 192 的形状静默读陈旧数据；#54899 把 DCP gather 出的头数补到 AITER 原生支持的档（48 补到 64、80 补到 96），MI355X 上内核时间快 1.83 到 2.43 倍；#64560 把 bf16 的 W_UK absorb、q 拼接加 FP8 量化、头补齐三次启动合成一个 AITER 内核，每步查询准备从 947 微秒降到 279；#64883 把调优过的接缝扩到 TP4 与 TP8 的 K2，解码步短 2.8% 到 5.3%；#63627 给批量不变的融合 MoE 补按架构的调优表（此前永远跑同一份固定配置），GB300 上解码吞吐约 +48%；#66018 为 MiniMax-M3 稀疏注意力加 SM90 与 SM120/SM121 的 FlashInfer 后端，prefill 快 2.6 到 5.6 倍。另有 #67040（BF16 的 GLM-5.3 走 DeepGEMM MegaMoE，prefill 总吞吐 +40%）、#62603（SM90 块 FP8 MegaMoE，解码吞吐 +11% 到 +18%）、#64061（SM90 FP8 乘 FP4 MegaMoE，单机高 17% 到 26%）、#65521（GLM-5.3 的 mHC 步骤合成一次 FlashInfer 融合内核，但需要带实验性内核源码的 FlashInfer，PyPI wheel 不含、装 wheel 时静默留在 TileLang）、#61501 与 #59025 等后端选择。两个数值正确性问题：#64165 的 plan 缓冲竞态导致越界读，#64329 在查询非 FP8 时仍传入层上的 FP8 q_scale。",
+    "sig-large-scale-serving": "7 条集中在分层 KV 与流水线并行。#66674 实现 `KVCacheAccess.EXPORTS_FD`：连接器报告它时把可扩展 KV 缓存分配成可用 POSIX 文件描述符导出的形式，让 LMCache MP 连接器在开 `use_vmm_api` 时能按层导入 KV；这条要求可扩展 KV 缓存必须开启，否则 vLLM 直接拒绝启动，并取代早于 #66605 的 #65507。#66391 把分层卸载的共享 CPU 区域按多个文件拆开、调度器侧不再逐页预先触页，512 GiB 那一级的建立从 167 到 175 秒降到 59 秒。#65373 只声明 DeepSeek V4.1 的主 KV、索引器 K 与压缩器状态在张量并行各 rank 上是复制的，就让既有的主机共享卸载路径生效：8 台 H100、同样 64 GiB 主机预算下，请求每秒从 0.961 升到 5.785（6.02 倍）、p95 首 token 延迟从 11.30 秒降到 0.95 秒。#67080 让 Mooncake 存储把存在性检查失败当错误处理、跳过这次写入而不是发出一次注定无用的 PUT。#67150 修分离部署的代理把流式响应的 `media_type` 一律写成 JSON：按 Content-Type 选解析方式的基准工具因此把首 token 延迟报成端到端总时长、每 token 时间报成 0 且不报错。#66465 让流水线并行相邻级在计算图补齐行数不同时只传真实行、用接收方的补齐尺寸执行。#64324 让 LMCache 连接器把 `shutdown()` 传下去，此前一个 LMCache 线程会拖住 EngineCore 直到超时被强杀。",
+    "sig-spec-decode": "6 条，最大的是 #61869（高风险）：DSpark 草稿层接进 DeepSeek-V4.1 在 GB300 上的专用解码，与目标模型共用融合的全规约加 mHC、注意力与专家 GEMM，采样走 `sample_sequential` 钩子里的融合 Markov 循环（小批量时按词表把 Markov 链切到各张量并行 rank），批量 1 与 8 的解码步分别短 4.5% 与 3.4%。#66604 让 DFlash 直接算出已含打包块跨步的草稿 KV 槽位，于是删掉整层槽位映射转换（含一个 Triton 内核与若干缓冲区）与后端的一个能力标志，`vllm/` 净 +65/-156。#56451 给 MiniMax M3 的 ROCm Triton 索引器与稀疏解码加设备侧变长解码元数据，这是该模型能开自适应验证的前提，CUDA 后端与 AITER 各路径仍报不支持。#66292 让 GLM-5.3-Flash 的 dflash 草稿继承自动选定的 FP8 KV 缓存，TP4、2048 token 草稿窗口、48 并发下每卡少 790 MiB。#62309 把自适应验证带到 XPU 的 DeepSeek-V4（8 张 B70，精度只有截图）。#54820 去掉 ROCm 上 DSpark 草稿侧那两个并不拥有的占位模块，Strix Halo TP2 启动期每 rank 少约 1.73 GiB，做法与 kimi_k3 的 NVIDIA 草稿一致。",
+    "sig-quantization": "9 条，两条是新的 KV 存储格式：#66036 在 gfx950 上给 DeepSeek V4 与 V4.1 加逐张量 scale 的 FP8 KV（每 token 一条 448 无旋转编码加 64 旋转编码的 FP8 行），同样显存多 12.5% 容量、TP2 与 TP4 带投机解码时输出吞吐最高 +7.6%、四个精度基准无退步，需要含 ROCm/aiter#7429 的 AITER；#60321（高风险）给无旋转位置编码的稀疏 MLA 加 MXFP4 打包 KV（256 字节 E2M1 码加 16 个内联 E8M0 scale，共 272 字节），容量是 bf16 的 3.76 倍，对打包缓存做注意力与对反量化后的 bf16 结果逐位相同。权重侧：#64767 新增 ModelOpt 的 NVFP4 W4A16 嵌入加载，只对被查到的行反量化，让一个此前加载失败（4096 与 2048 对不上）的 Nemotron Bolt checkpoint 能起服务、权重少 0.72 GiB；#49539 让 AutoGPTQ 不再把量化方法套在本未量化的路由专家上，修的是 Qwen3.5 量化版只有 MTP 草稿层专家仍是 bf16 导致的形状不匹配；#65077 让 Humming 稠密线性层按请求使用 FP8 激活，B300 上解码 GEMM 快 1.4 到 1.9 倍、端到端每 token 时间 p50 降 8% 到 16%、GSM8K 0.681 到 0.683；#59384 把 Nemotron 共享专家的 BF16 ReLU2 与 NVFP4 量化融合，4096 token 时该环节快 1.25 倍、打包值与有效 scale 逐位相同。#65479 是 MXFP8 线性换用 AITER 调优过的 FlyDSL GEMM（只在有调参的形状上生效）；#63721 把 SiLU-and-mul 与逐 token FP8 量化合成一个内核，EP8 单卡快 7.6 倍；#66876 把 `lut_b_moe` 补进 ROCm 的量化名单。",
+    "sig-omni": "4 条都在多模态输入侧。#66608 把 `get_num_frames_with_most_features` 改成只接收视频数量：此前八个模型会用它把别的模态占掉的 token 从每条视频的帧预算里减掉，而逐条预算本来是一次只看一条内容，于是 GLM-4.1V、Ovis2.5、InternVL、Intern-S1 会拒绝一条放得进 `max_model_len` 的纯视频提示；改后 MiniCPM-V、MiniCPM-o 与 Nemotron Nano VL 失去这部分扣减，属于行为变化。#66638 让 Unlimited-OCR-2 的多页请求逐页用上处理器缓存（此前有一条只对 v1 成立的「多图就绕过缓存」规则），只按 UUID 重发已缓存页面的请求不再失败，且每页处理结果与单独处理一致。#66891 修 Inkling 渲染器把工具结果压成纯文本、导致里面带截图时报错、并且这张图片留在历史里让之后每一轮都失败。#57796 让 `/inference/v1/generate` 可以同时接受已经展开的 `features` 与新内容的 `content_parts`，只渲染最后一个范围之后的提示，这是多轮多模态强化学习必须的组合。",
+    "other": "4 条 recipe。三份是 AMD 单卡验证：#66625 给 JEV-27B-VL 加 MI355X 并标 verified，开 AITER 后 48 个 GDN 层走 FlyDSL、16 个 head 尺寸 256 的全注意力层走 ROCM_AITER_FA，单卡装下 51.5 GiB 的 BF16 权重、余 209 GiB 给 KV；#66721 给 Ripple-65B-Preview 把默认变体设成 BF16，因为 NVFP4 在 ROCm 上只能走模拟内核、比 BF16 慢，并把投机解码的最大上下文降到 1048576（2M 时草稿的 KV 放不下降，需要 168.8 GiB 而可用 151.5 GiB）；#66689 给 Ming-3.0-asr-tiny 加 AMD 路径，用 nightly 镜像因为里面已带 torchaudio 与 torchcodec、而 latest（0.33.0）还没有这个模型。#67184 把 MiniMax-M3.1-Flash 的 GB300 Dynamo AgentX 预设从第 4631 号赛道同步到第 4998 号：两档都设 `--stream-interval 20`（赛道要求 20 到 60、vLLM 默认 1），聚合档加 `--prefill-schedule-interval 24` 并删掉赛道已不跑的主机 DRAM 卸载测点，PD 档改成 DEP4 预fill 加一个 DEP16 解码、解码侧加 EPLB 的 16 个冗余专家、预fill 把 KV 写进以显存做段的 Mooncake 存储。"
+  },
+  "commits": [
+    {
+      "sha": "b6f417fcd1c291b0cbb013579e7c697ace4e4e0a",
+      "comment": "**背景**：`get_num_frames_with_most_features(seq_len, mm_counts)` 接收的是所有模态的计数，八个模型用它把别的模态占掉的 token 从每条视频的帧预算里减掉。可逐条预算是一次只看一条内容的，于是 GLM-4.1V/4.5V、Ovis2.5、InternVL、Intern-S1 会拒绝一条只含视频、其实完全放得进 `max_model_len` 的提示，报超出预分配的编码器缓存大小。**方法**：按评审建议把这个方法改成只接收视频数量，即 `get_num_frames_with_most_features(seq_len, num_videos)`，从此任何模型都无法再从视频预算里减别的模态。**效果**：+154/-131、25 个文件，19 处定义与全部调用点同步改。逐条视频预算现在与 GLM-4.1V/4.5V、Ovis2.5、InternVL、Intern-S1 做性能分析时用的视频虚拟输入一致，与 ERNIE-4.5-VL 的纯视频预算一致；MiniCPM-V、MiniCPM-o（原先还减音频）与 Nemotron Nano VL 失去这部分扣减，属于行为变化，测试覆盖也相应改了这四类模型的处理用例。",
+      "sig": "sig-omni",
+      "sig_reason": "问题在多模态输入的视频帧预算计算上，直接影响视频请求能否被接受。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "video-budget",
+        "encoder-cache",
+        "multimodal-processing"
+      ],
+      "pr_number": 66608
+    },
+    {
+      "sha": "49d6074354983f5278ba7202ce913f9b305d71eb",
+      "comment": "**背景**：Rust 的 API 服务在引擎输出分发器退出之后只是变成不健康状态，但仍继续监听、无限期返回失败响应，进程管理器看不出需要重启。**方法**：监控 LLM 的永久健康失败，收到之后关掉 HTTP 与 gRPC 服务器、走完资源清理、并返回错误码，让外部管理器可以重启前端；这与 Python 服务端的行为一致（默认引擎死亡即退出，同时尊重 `VLLM_KEEP_ALIVE_ON_ENGINE_DEATH`）。实现上还保证：正常终止信号下的优雅关闭不变；设了那个环境变量时保持辅助端点可用但报告不健康；gRPC 先发布 `NOT_SERVING` 再关闭健康订阅与监听器；关闭与健康事件同时到达时保留原始引擎失败信息。**效果**：+156/-4、6 个文件，含命令行、配置、gRPC 健康服务与外部引擎示例。用 `cargo nextest` 跑 vllm-server 与 vllm-cmd 两个包全特性验证。",
+      "sig": "sig-core",
+      "sig_reason": "决定前端进程在引擎永久失败时是否退出，属服务生命周期管理。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "engine-failure",
+        "grpc-health"
+      ],
+      "pr_number": 66773
+    },
+    {
+      "sha": "ddb0cb8cb83591ffd743fe5ad56147ca7c3d4b86",
+      "comment": "**背景**：Inkling 的渲染器把工具返回的内容压成一个纯文本字符串，因此工具结果里带图片（例如截图）时报错说工具响应内容必须是文本、却收到 image 这种片段。更糟的是这张图片留在会话历史里，之后每一轮都会以同样方式失败。**方法**：把相邻的文本片段合并成一个工具响应块，纯文本结果保持原来的写法；每个媒体项写一个对应的内容标记，交给 `InklingMultiModalProcessor` 展开成逐图像块的占位符串；工具结果为空时仍写一个空的文本块，避免被应答的工具调用悬空；工具结果里出现 thinking 片段时抛一条清楚的错误，而不是当成工具内容渲染。**效果**：+147/-10、2 个文件，新增渲染器测试。从 sgl-project/sglang#33898 移植而来。作者核对最接近的 #58793 处理的是同一渲染器里的思考内容片段，不覆盖工具结果中的媒体。",
+      "sig": "sig-omni",
+      "sig_reason": "解决的是工具结果带图像时的多模态渲染与占位符展开。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "inkling",
+        "renderer",
+        "tool-result-media"
+      ],
+      "pr_number": 66891
+    },
+    {
+      "sha": "3b43d2b01c2fb667101746e1acd33b6a3c9d0863",
+      "comment": "**背景**：ROCm 上未量化 MoE 有权重填充（`VLLM_ROCM_MOE_PADDING`，默认开启），但自 #46009 起在 TRITON 路径上静默失效——填充代码没有被调用。#46381 曾修过一次，#59332 与 #62977 加了填充相关测试。**方法**：在 `unquantized_fused_moe_method` 里重新接上这条填充路径，只对 ROCm 的 TRITON 未量化 MoE 生效。**效果**：+143/-13、2 个文件。Radeon Pro W7900、GLM-4.7-Flash、并发 1 下，输出吞吐恢复 4.5% 到 10.8%、首 token 延迟恢复 10% 到 13%。验证给出统一的一套命令：`tests/rocm/test_moe_padding.py` 与 `test_moe_weight_replay.py` 两组单元测试，以及在 TP4、4096 上下文的 GLM-4.7-Flash 服务端到端各跑一遍 main 与本改动的基准。",
+      "sig": "sig-model-performance",
+      "sig_reason": "恢复的是 ROCm 上 MoE 权重填充这一影响内核效率的处理步骤。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "moe-padding",
+        "triton"
+      ],
+      "pr_number": 61872
+    },
+    {
+      "sha": "9a77b4201bc4551f7e23ce59758dcbe6410c9e10",
+      "comment": "**背景**：DeepSeek V4.1 的主 KV、索引器 K 与压缩器状态在张量并行各 rank 上是重复的，但此前的元数据没有声明这一点，于是既有的 CPU 卸载共享路径不会被启用，每个 rank 各自在主机内存里存一份完整副本。**方法**：把这些张量声明为张量并行复制，让既有的共享主机路径自动生效。没有改缓存接口、规划器或连接器，代码只落在压缩器与一个新测试上。**效果**：+35/-0、2 个文件。8 台 H100、TP8、每卡 20 GiB 显卡 KV、主机 KV 总量同为 64 GiB，用 LongBench v2 的 407 个上下文播种重放 3072 条请求、并发 8、chunks=1、最多 128 个输出 token：请求每秒从 0.961 升到 5.785（6.02 倍），输出 token 每秒从 25.60 升到 146.09（5.71 倍），p95 首 token 延迟从 11.30 秒降到 0.95 秒。单卡 H100 上 93 项针对性检查通过，三条生产端回归在基线失败、改后通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "收益来自让分层 KV 卸载走多 rank 共享的主机内存，属大规模服务的缓存复用。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "kv-offload",
+        "deepseek-v4.1",
+        "tensor-parallel"
+      ],
+      "pr_number": 65373
+    },
+    {
+      "sha": "f55b08ec0f904ddeec748ea24c1e029cab992292",
+      "comment": "**背景**：Mooncake 分层存储在写入前会用 SDK 的存在性检查判断键是否已在远端。此前检查失败（返回负值或抛异常）时会被当成未命中，于是仍发一次 PUT。**方法**：把存在性检查失败当成错误处理，跳过这次可选的缓存保存；普通保存与边界状态保存两条路径都按同样规则归类负值与异常。跳过的任务仍通过既有路径上报完成，使显卡引用能在所有 worker 结束后释放；原生传输在进行期间保留自己的缓冲区。**效果**：+86/-34、2 个文件（连接器 worker 与其单元测试）。用未改动的 main 版本 worker `fe3ed684ce` 配新测试可复现问题：6 failed、3 passed，每个存在性检查失败的场景都错误地发出了 PUT；改后这些用例通过，并记录准确的失败键数与错误或部分失败状态。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "改动在分层 KV 存储连接器对远端写入失败的处理与任务收尾上。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "mooncake",
+        "kv-store",
+        "existence-check"
+      ],
+      "pr_number": 67080
+    },
+    {
+      "sha": "5916cef98eed2152b232ed4712ac468402be849b",
+      "comment": "**背景**：预解码与生成分离用的几个代理会把解码实例的 SSE 流原样转发，但 `media_type` 永远写 `application/json`。按 `Content-Type` 决定解析方式的客户端（EvalScope perf、NVIDIA AIPerf）于是把整个流当成一个 JSON 体等完整响应，解析不出 token，报告里首 token 延迟等于端到端总延迟、每 token 时间为 0、输出 token 与吞吐都是 0，且没有任何报错。`vllm bench serve` 与 OpenAI 的 Python 客户端忽略这个头，所以 CI 抓不到。NIXL 的那个 toy 代理在分离部署文档里被推荐做单机测试，走它跑的基准就会静默给出错的数字。**方法**：请求里 `stream` 为 true 时改用 `text/event-stream`，非流式仍用 `application/json`；三个转发解码流的代理都改。**效果**：+24/-4、3 个文件（示例与测试里的代理），不改引擎本身。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题在分离部署代理转发流式响应的内容类型，影响 P/D 链路的度量正确性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "p-d-disaggregation",
+        "proxy",
+        "sse-content-type"
+      ],
+      "pr_number": 67150
+    },
+    {
+      "sha": "1c675c68687ddfdb823f0c8662358c380f3f2ca9",
+      "comment": "**背景**：SageMaker 的 `/invocations` 端点对格式错误的请求报的是误导性错误：一条字段非法的聊天请求会回成「要么提供 prompt 要么提供 prompt_embeds」；同时有些合法的 completion 请求因为只走聊天校验器而被拒。这个行为由 #36254 引入，与 #65029 在 `run-batch` 里修的是同一类 pydantic 问题。**方法**：让 `/invocations` 与对应的 `/v1/...` 端点在服务请求与报错方式上一致——非法聊天或 completion 请求得到与聊天或补全端点相同的 400 消息与 `param`（例如 `param=body.temperature` 而不是 `param=prompt`）；像 `{\"prompt\": \"hi\", \"logprobs\": 0, \"logprob_token_ids\": [1]}` 这种被聊天校验器拒掉但完全合法的 completion 请求按 completion 处理。**效果**：+136/-6、2 个文件，新增 SageMaker 校验测试目录下的用例。",
+      "sig": "sig-core",
+      "sig_reason": "统一的是路由入口对请求类型的选择与错误回报，属 API 层正确性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "sagemaker",
+        "validation",
+        "api-router"
+      ],
+      "pr_number": 66777
+    },
+    {
+      "sha": "2011b8f0fd783dadc2d71359487b2b5d67a82744",
+      "comment": "**背景**：不依赖引擎的 Rust 渲染器 `vllm-rs render` 此前只能处理纯文本聊天请求，多模态内容与 LoRA 名称都不支持。**方法**：让它加载多模态处理器、取回并预处理聊天消息里的图像、视频与音频片段，并接收 LoRA 适配器名。新增两个参数：`--dtype` 决定媒体张量的产出类型，必须与引擎一致，默认 `auto` 跟随模型配置、把 float32 的 checkpoint 按 bfloat16 产出（与 vLLM 的 `--dtype auto` 相同，接受 vLLM 的全部取值包括 half 与 float）；`--limit-mm-per-prompt` 使用引擎的每模态上限，因此渲染阶段就会拒掉引擎本来也会拒的请求。HTTP 的聊天渲染返回与 Python 相同的 `features` 对象，Rust 的 `/inference/v1/generate` 也接受 `features`，于是一次多模态渲染的结果可以原样提交给生成。**效果**：+928/-99、20 个文件，含 README 与聊天、命令行、gRPC 媒体侧测试。这是从 #64685 按评审要求拆出的系列第一段，后续 gRPC 的 RenderChat 与 Derender 接口建立在此之上。",
+      "sig": "sig-core",
+      "sig_reason": "扩展的是无引擎渲染这一前端能力本身，多模态只是它新支持的输入形式。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "renderer",
+        "multimodal",
+        "lora"
+      ],
+      "pr_number": 65993
+    },
+    {
+      "sha": "94febce7563ae2d67a062dc0f8ab408cd817f66c",
+      "comment": "**背景**：Hopper 上目前没有可用的 MegaMoE：DeepGEMM 的 `deep_gemm_mega_moe` 要求 SM100，FlashInfer 的两条 megakernel（cute-dsl 与 mega-deep-gemm）同样要求 SM100。**方法**：接进 FlashInfer 0.7.2 提供的 SM90 FP8 MegaMoE。这个内核把分发、两个专家 GEMM 与合并融在一起，仍走已有的 `--moe-backend flashinfer_moe_ep_cutedsl` 路径、不需要模型侧代码，因此兼容的 128×128 块 FP8 MoE checkpoint 可以直接用；同时处理了空闲 rank 的情况。**效果**：+675/-82、11 个文件，涉及内核配置、MoE 模块化内核与 fp8 选择、compressed-tensors 的 W8A8 FP8 MoE 路径。8 台 H200（DP8/EP8、128K 输入 512 输出、MTP3）上，GLM-5.3-Flash 解码在测试到的并发下输出吞吐提升 11% 到 18%、每输出 token 时间 p50 降 6% 到 14%。作者列出相邻工作：#58540 是同一内核但用于转成 FP8 的 DeepSeek-V4 FP4 checkpoint，#62073 含同样的空闲 rank 改动，#60895 与 #53527 分别针对 SM100 与 DeepGEMM 分支。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主要收益是给 Hopper 补一条把分发与专家 GEMM 融合的内核路径。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "megamoe",
+        "hopper",
+        "flashinfer",
+        "fp8"
+      ],
+      "pr_number": 62603
+    },
+    {
+      "sha": "0a77deacd3035b723994d15dc7a65f4ad6859a70",
+      "comment": "**背景**：Muse Spark 在 TP8 加专家并行下每卡的专家形状是 E=32、N=4096、FP8 W8A8 逐 token，gfx942（MI300X 与 MI325X）没有对应的调优参数表，因此落到 `get_default_config`。**方法**：补这两张卡的 Triton 融合 MoE 配置文件。**效果**：+292/-0、2 个配置文件，没有其他 PR 增加这一形状。MI300X 上并发 64 服务吞吐提升 12% 到 25%、GSM8K 不变；MI325X 上并发 64 到 128 提升 20% 到 21%、GSM8K 不变。两轮用同一镜像与同一组参数（amd 的 Muse-Spark-Open-816B-A42B-Quark-PTPC-FP8、8 卡 MI300X、AITER 开启、MoE 归约用 bf16、可中断计算图、safetensors 快速 GPU 加载、`--moe-backend triton`），候选轮把配置文件挂载覆盖到 configs 目录，并以服务端日志确认该文件确实被读到。",
+      "sig": "sig-model-performance",
+      "sig_reason": "新增的是特定显卡与专家形状上的 MoE 内核调优参数表。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "moe",
+        "fp8",
+        "gfx942",
+        "mi300x"
+      ],
+      "pr_number": 63727
+    },
+    {
+      "sha": "613fa94e3d185b6bdc9057d5ff8fdc37c63fc294",
+      "comment": "**背景**：Intel V1 作业一直用 `--ignore` 跳过 `v1/core` 里的两个前缀缓存端到端测试。在 XPU 上给 LLM 传 `block-size=16` 时 KV 缓存初始化会失败，EngineCore 直接报错，这也是当初跳过它们的原因；测试本身在 XPU 上其实可以跑。**方法**：去掉两个 `--ignore`，并优化 XPU 的块大小选择逻辑，让 `test_scheduler_e2e.py` 能在该平台上初始化引擎；改动落在 XPU 平台实现、flash attention 后端与注意力工具函数上。**效果**：+44/-26、4 个文件。Intel Arc Pro B60 上：`test_reset_prefix_cache_e2e.py` 1 passed；`test_scheduler_e2e.py` 从 2 errors（引擎初始化失败）变成 2 passed；整个 `v1/core` 目录 1042 项全部通过、耗时约 19 分 44 秒。这是把 Intel CI 启用时跳过的覆盖真正加回来，并顺带修掉一个用户设置块大小时会遇到的初始化失败。",
+      "sig": "sig-ci",
+      "sig_reason": "目的是把两个被跳过的端到端测试重新纳入 Intel CI，平台侧改动为它服务。",
+      "tags": [
+        "test",
+        "low-risk",
+        "xpu",
+        "prefix-cache",
+        "block-size"
+      ],
+      "pr_number": 62656
+    },
+    {
+      "sha": "9e6815acab1a6acb188931510271b1bce4688c75",
+      "comment": "**背景**：分层卸载为每个引擎保留一块共享 CPU 区域，好让第二级存储能寻址它。区域很大时建立很慢：整块区域是一个 `/dev/shm` 文件，所有 worker 往同一个文件里预先触页，页缓存插入互相串行；随后调度器还要映射整块区域并单线程再逐页预先触一遍。**方法**：把区域按 `REGION_SEGMENTS` 拆成多个文件（`CPUOffloadingSpec` 早就这么做了，见 #59546），调度器侧只做映射、不再预先触页；对第二级存储仍呈现成一段连续范围。hugetlbfs（#45693）是另一条独立的可选项。**效果**：+69/-4、4 个文件。只计 CPU 那一级建立（worker 预先触页与钉住、调度器映射、P2P 注册），用一个直接调用 vLLM 自身类跑这些步骤的脚本计时，单台 H100、8 个 worker 共享一张卡、P2P 第二级、GLM-5.3 尺寸的行（每槽 8 × 3.8 MB）：512 GiB 从 167 到 175 秒降到 59 秒。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "优化的是分层 KV 卸载主机区域的建立过程，属大规模服务的启动成本。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "kv-offload",
+        "tiering",
+        "shared-memory"
+      ],
+      "pr_number": 66391
+    },
+    {
+      "sha": "d9690929be4167eaafe964f274f992bcc6ffe03a",
+      "comment": "**背景**：TeleChat2 与 TeleChat3 两个架构的使用量与下载量都很低，维护成本与收益不匹配。**方法**：删除 `telechat2.py` 以及两个架构在模型注册表、测试注册表和支持模型文档里的条目；加载时改由 `_PREVIOUSLY_SUPPORTED_MODELS` 报「vLLM 支持到 v0.34.0」这条明确错误；同时删掉 `patch_legacy_rope_type` 里只有 TeleChat3 会走的 `telechat3-yarn` 旋转位置编码补丁。**效果**：+3/-178、7 个文件，v0.34.0 是最后一个支持它们的发布版。验证给出 `tests/transformers_utils/test_config.py` 与 `tests/test_config.py` 里 rope 与 max_len 相关 31 项通过、`tests/models/test_registry.py` 445 passed 与 10 skipped。本条覆盖 #66416 中的 TeleChat 部分。",
+      "sig": "sig-core",
+      "sig_reason": "决定某个模型架构是否继续被引擎支持并注册，属模型支持面。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "model-removal",
+        "telechat",
+        "registry"
+      ],
+      "pr_number": 67035
+    },
+    {
+      "sha": "c6573eed5e56fd39b01d610db04616ed9b221851",
+      "comment": "**背景**：MiniMax-M3.1-Flash recipe 里两份 GB300 的 Dynamo AgentX 预设上次是从 InferenceX 第 4631 号赛道同步过来的，与当前赛道已经不一致。**方法**：按 #4998 更新 `gb300_agentx_agg` 与 `gb300_agentx_pd`：两档都钉到赛道实际用的镜像（cu134-arm64-1107-mdev 的一个 digest）并在 `0c1f2da` 上引用该赛道；都设 `--stream-interval 20`（AgentX 要求 20 到 60，vLLM 默认是 1）。聚合 TP4 那档加上 `--prefill-schedule-interval 24`，测点分「低延迟」（`--max-num-seqs 32`，每托盘约 16 路会话）与「吞吐」（64，约 32 路），原先放在主机 DRAM 的卸载测点因赛道不再跑而被删掉。PD 那档用 DEP4 预fill（每托盘一个 worker）加一个 DEP16 解码，取代原先的 DEP2 预fill 与 DEP8/DEP16 解码；解码侧新增 EPLB（16 个冗余专家）、`--max-num-inflight-kv-loads 64` 与 `--max-async-kv-loads-per-step 4`，预fill 把自己的 KV 写进一个用显卡显存做段（`hbm_pool`）的 Mooncake 存储。**效果**：+117/-91、1 个 recipe YAML。",
+      "sig": "other",
+      "sig_reason": "改动只在 recipe 的外部基准预设配置。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "minimax-m3.1-flash",
+        "agentx",
+        "dynamo"
+      ],
+      "pr_number": 67184
+    },
+    {
+      "sha": "efe12305f064b9c5301231d66eb42b7c0db5895f",
+      "comment": "**背景**：flashinfer-python 从 0.7.2 起自带 b12x，并把它作为顶层 `b12x` 包安装，所以 vLLM 钉的 0.7.2.post1 下 `import b12x` 已经解析到 FlashInfer 那份。但 vLLM 的 `b12x` extra 仍会装独立的 `b12x==1.5.1`，它也提供同名顶层包，于是按安装顺序可能覆盖掉 FlashInfer 的那份；独立仓库已归档、开发转到 FlashInfer。**方法**：把 `b12x` extra 改成空列表但保留（与 `flashinfer` extra 同样做法），这样 `pip install vllm[b12x]` 继续可用、且不再装独立包；b12x 注意力与线性内核里「后端不可用」的提示改成需要 `flashinfer-python>=0.7.2`，两个断言这条提示的测试同步更新；文档页删掉单独的安装步骤，CI 里注释掉的 Spark b12x 通道一并去掉。**效果**：+15/-21、12 个文件，含 `setup.py`、MXFP4 与 MXFP8 的 b12x 线性内核、注意力内核与两份设计文档。",
+      "sig": "sig-quantization",
+      "sig_reason": "b12x 是 MXFP4 与 MXFP8 内核的提供方，这里改的是它作为量化后端的安装与提示。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "b12x",
+        "flashinfer",
+        "packaging"
+      ],
+      "pr_number": 64765
+    },
+    {
+      "sha": "6d3eba0272acac182d2b95d5374b619f1efd6ce5",
+      "comment": "**背景**：`Worker.load_model` 与 `profile_run` 把缓存分配器限制在 `max_split_size_mb:20`（#41268、#58430）。恰好 20 MiB 时，每个被释放的 1 到 10 MiB 显卡张量都会占住一整段 20 MiB 不再复用，于是一次上传一小块权重的加载器会把显存填满、只能靠分配器的 OOM 重试继续。**方法**：把这个上限改成 21 MiB。21 MiB 及以上的块仍然永不切分，所以大块的释放行为与 #41268、#58430 建立的原意一致。**效果**：+34/-4、3 个文件。Kimi-K3-REAP（780 GiB）、8 张 B200 TP8、分布式模式下的 RunAI streamer：模型加载从 690 到 703 秒降到 96.8 秒，分配器 OOM 重试从约 96.4 万次降到 0 次，输出不变。#51205（Inkling-Small-NVFP4）在不改 Inkling 的情况下被修好——#51962 为它加的专用绕过因此不再需要，用未打补丁的加载器跑那条测试也能通过。",
+      "sig": "sig-core",
+      "sig_reason": "改动在 worker 的显存分配器参数上，影响加载与预热阶段的复用。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "caching-allocator",
+        "model-loading",
+        "oom-retry"
+      ],
+      "pr_number": 66561
+    },
+    {
+      "sha": "7a8f1f9e7cf779afac354d3d8c14fcc185627cea",
+      "comment": "**背景**：MiniMax-M3-MXFP8 的宽专家并行 CI 单元非常慢：2P2D 的 EP16 GSM8K 评测在 CI 里约 1 小时 37 分，1P1D 的 EP8 约 1 小时。原因是 AITER 的 MXFP8 MoE 内核在按 `--max-num-batched-tokens` 定尺寸的填充缓冲区上运行，默认是 131072 行，于是每个 prefill 与解码步骤都要为整个缓冲区付出代价。**方法**：给这些单元设小的 token 预算——预fill 2048、解码 64；`--max-num-seqs` 自己会夹到预算之内。TP 单元不动。**效果**：+2/-2、1 个 AMD 分离部署的 models YAML，评测降到几分钟。作者用一个启动器干跑覆盖每个模型、TP 或 EP、拓扑与 rank 共 168 种组合，结果与 main 的差异只出现在 MiniMax 的宽 EP 单元上；并给出用 MORIIO 读模式与 vllm-router 跑该流水线的完整命令。",
+      "sig": "sig-ci",
+      "sig_reason": "通过收紧 CI 单元的批量预算缩短 AMD 分离部署评测耗时。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "rocm",
+        "wide-ep",
+        "max-num-batched-tokens"
+      ],
+      "pr_number": 66646
+    },
+    {
+      "sha": "3b95523ed904cf02a26b872f4a900ef17e6be8ad",
+      "comment": "**背景**：可扩展 KV 缓存（#56492，CUDA 与 ROCm 上默认开启）下 `gpu_memory_utilization` 默认是 1.0，KV 缓存按预热之后实测的余量来定尺寸。但文档、示例、基准脚本、CI 配置、测试与 recipe 里还在传 0.9 这类从旧的按估计值定尺寸时代抄来的数字，现在它们只会把 KV 缓存改小。**方法**：在 `docs/configuration/optimization.md` 新增一节 GPU Memory Utilization，说明什么时候应该不设这个值，并列出仍需设置的合理情形：同一显卡上有别的进程（包括之后才分配的）、统一内存设备、权重更新用的权重传输缓冲区、自带显存缓冲的 KV 连接器；同时说明该选项在哪些场合仍然决定 KV 尺寸（其他平台等）。其余改动是删掉那些已经没有理由的取值。**效果**：+199/-462、153 个文件，覆盖 CI 的性能基准配置、nightly、若干基准脚本与自动调参文档、测试与 recipe。这是 #66704 的配套改动，后者在启动时对显式设置超过 0.7 的情况告警。",
+      "sig": "sig-core",
+      "sig_reason": "针对的是这一引擎配置项在默认改变后的正确用法与广泛误用。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "gpu-memory-utilization",
+        "extensible-kv-cache",
+        "configuration"
+      ],
+      "pr_number": 67071
+    },
+    {
+      "sha": "be47189f37f6162991366ff6b91539f6e9d1f432",
+      "comment": "**背景**：Rust 前端把约束解码的 answer 部分与工具语法分开处理，此前遇到 Lark 语法会返回 None，导致两种错法：在 `auto` 下没有工具语法时，Lark 约束留在自己的字段上、把整个输出都约束住，一次工具调用都发不出来；而当解析器构造出工具语法（严格的 tools）时，answer 约束被丢掉。**方法**：升级 `xgrammar-structural-tag` 到 0.5.0（与 XGrammar 0.2.9 同步），并把 Lark 的 answer 语法组合进解析器构造的输出语法里，与 Python 前端一致：`answer_format` 对 grammar 约束返回 `Format::grammar(grammar, syntax)`，Lark 语法带上 `GrammarSyntax::Lark`。0.5.0 在构造语法叶时要求显式给 syntax，只有反序列化时省略才按 EBNF 处理。DeepSeek V4 与 V4.1 的 `auto` 语法按上游 mlc-ai/xgrammar#936 改为在一段调用块之后就停（`stop_after_first = true`）。**效果**：+50/-33、9 个文件，含 DeepSeek-V4-Flash 与 V4.1-Flash 两份语法回放夹具。建立在 #66691 之上（同一系列的 Python 侧）。",
+      "sig": "sig-core",
+      "sig_reason": "改的是前端约束解码语法的构造与依赖版本，属结构化输出接口。",
+      "tags": [
+        "dependency-bump",
+        "medium-risk",
+        "xgrammar",
+        "lark",
+        "rust-frontend",
+        "structured-output"
+      ],
+      "pr_number": 66692
+    },
+    {
+      "sha": "4fee061e3e42b5e23f8a6bd5e18e3efdc3626c87",
+      "comment": "**背景**：Python 前端把 Lark 语法组合进解析器的结构化标签时（`response_format` 或 `structured_outputs` 配 `tool_choice=auto`），会经过一次不带分词器的 `Grammar.from_lark(...)` 再转成 EBNF，与 xgrammar 后端把 Lark 当原生语法编译的结果不一致。**方法**：升级 xgrammar 到 0.2.9 并使用它的 Lark 结构化标签语法（mlc-ai/xgrammar#1015）：`structured_outputs_to_format` 对 `grammar_is_likely_lark` 判为 Lark 的语法返回带 `syntax=\"lark\"` 的格式对象，判断标准与后端处理原生语法时相同；组合出的标签交给 `full_vocab_compiler` 编译，和原生 Lark 语法走同一个编译器。**效果**：+193/-211、9 个文件。`requirements/common.txt` 钉 0.2.9，CPU、CUDA、ROCm、XPU 四个测试锁文件只改这一处 pin 与哈希（0.2.9 的依赖与 0.2.8 相同）。改后组合出的语法叶既与原生 Lark 一致，也与 Rust 前端（同系列的另一条 PR）一致。",
+      "sig": "sig-core",
+      "sig_reason": "升级依赖并修正结构化输出语法的编译方式，属前端约束解码。",
+      "tags": [
+        "dependency-bump",
+        "medium-risk",
+        "xgrammar",
+        "lark",
+        "structured-output"
+      ],
+      "pr_number": 66691
+    },
+    {
+      "sha": "cfe069c9e229dea2ae71acaa1b76f50a2fa98982",
+      "comment": "**背景**：直接继承 `BaseRenderer` 的几个渲染器（Cohere、DeepseekV32、DeepseekV4 与 V4.1、Inkling、KimiK3）在 `--renderer-num-workers` 个线程之间共用一个 HF 快速分词器。带不同 `truncate_prompt_tokens` 的并发请求于是可能被按**别的请求**的长度截断，而且是静默发生。此前 #64036 与 #64412 因为 `tokenizers >= 0.23.2` 不再抛「Already borrowed」而被关闭——但竞态在受支持依赖（transformers 5.22.0、tokenizers 0.23.3）下仍然存在，只是从抛异常变成返回错误的 token 数。**方法**：把原来只有 `HfRenderer` 有的按 worker 分词器池上移到 `BaseRenderer.__init__`。**效果**：+244/-15、4 个文件，含新的池测试与 hf、kimi_k3 渲染器改动。设了 `--renderer-num-workers` 大于 1 之后，每个渲染器都用本请求自己的截断长度做分词；此前约 16% 到 17% 的并发请求会拿到别人的截断结果。相关：#64034。",
+      "sig": "sig-core",
+      "sig_reason": "修的是渲染器线程池里分词器共享造成的跨请求状态污染。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "renderer",
+        "tokenizer-pool",
+        "truncation",
+        "concurrency"
+      ],
+      "pr_number": 65932
+    },
+    {
+      "sha": "dac51063cc1295a2a8426998c4c372b19c42a0f9",
+      "comment": "**背景**：ROCm 的 AITER 稀疏 MLA 后端此前没有针对无旋转位置编码（NoPE）潜变量（例如 GLM-5.3-Flash）的低比特 KV 缓存格式。**方法**：新增 `mxfp4_mla` 这一 KV 缓存 dtype：每个 512 宽的潜变量存成 256 字节的 E2M1 码加 16 个内联的 E8M0 scale（每 32 个值一个），即每 token 272 字节，而 bf16 要 1024 字节。本条是 #59739 按评审拆出的若干小 PR 中的第一个，包含缓存格式、写入路径，以及 #58584 那两个内核（ragged 与 split-K 解码）的 Triton 读取路径；全部是 Triton 或 Python，没有 HIP 与 C++ 源码，也没有新增环境变量。共享内核只加了一处按缓存指针元素类型分支的判断，由 Triton 在编译期解析。**效果**：+948/-19、13 个文件，含缓存配置、MLA 注意力、平台接口与 torch 工具。每 GiB 可放的 token 数是 bf16 的 3.76 倍；对打包缓存做注意力与对同样的值反量化后按 bf16 存再做注意力，结果逐位相同。其他 KV dtype 的行为不变。",
+      "sig": "sig-quantization",
+      "sig_reason": "新增一种量化 KV 缓存格式及其读写路径，核心是存储打包。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "mxfp4",
+        "kv-cache-dtype",
+        "sparse-mla",
+        "rocm"
+      ],
+      "pr_number": 60321
+    },
+    {
+      "sha": "54ba56981e54489255bf95eaa6e108fc1c9f9069",
+      "comment": "**背景**：#52875 把 completion 流式帧的常量部分做了模板化，本条是它的后续，继续削 `/v1/completions` 流式与请求校验路径上的每块与每请求 CPU 开销。**方法**：三处。流式增量改用一个模块级的 `json.JSONEncoder(ensure_ascii=False)` 来编码，而不是每次调 `json.dumps(..., ensure_ascii=False)`——带上非默认参数会绕过 json 内部缓存的编码器、每次重新构造；提示文本只在需要 echo 的分支里解析，此前每个增量都会调一次 `_extract_prompt_text`；`CompletionRequest`、`ChatCompletionRequest`、`ResponsesRequest`、`TranscriptionRequest`、`TranslationRequest` 上的 `_DEFAULT_SAMPLING_PARAMS` 声明成 `ClassVar`，pydantic 不再把这个字典深拷进每个实例（此前每个请求要 17 次 `copy.deepcopy`）。**效果**：+16/-18、6 个文件，发出的字节与请求对象完全不变。文本提示的每块编码从 1.6 降到 1.06 微秒（-32%）；token id 提示的每块从 2.2 降到 1.07 微秒（-51%）；`CompletionRequest` 的校验从 17.6 降到 10.7 微秒。",
+      "sig": "sig-core",
+      "sig_reason": "削减的是前端每块与每请求的序列化与校验开销。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "streaming",
+        "json-encoding",
+        "pydantic",
+        "completion"
+      ],
+      "pr_number": 66325
+    },
+    {
+      "sha": "ee548e7f6036e7fc8ff0090b0daecdbfe42d43d1",
+      "comment": "**背景**：进程内引擎（`VLLM_ENABLE_V1_MULTIPROCESSING=0`）关闭之后，它编译出的模型可能仍活着、继续占着权重与 CUDA 计算图。Dynamo 的全局字节码钩子登记表会为每个 `TorchCompileWithNoGuardsWrapper` 保存一个绑定方法，而有两处遗漏让钩子留下来。**方法**：两处都修：每个实例的钩子只注册一次；在 `GPUModelRunner.shutdown()` 里移除钩子。**效果**：+48/-10、4 个文件（编译包装、LLMEngine、GPU 模型运行器与一个关闭测试）。关闭后不再有残留钩子，编译出的模型与权重可被释放。这修的是 #45195 加钩子清理、#54162 把模型引用改成弱引用之后仍未覆盖的两种情况；与 #60089（让 `LLMEngine.__del__` 调 `engine_core.shutdown()`）互补——那条路径的关闭仍会在终结器执行前丢掉模型。直接受益的是 CI：#66523 的构建里，第二个进程内 Qwen3-0.6B 引擎启动时可用显存少了 1.2 GiB，因而没过 0.92 占用率的检查。",
+      "sig": "sig-core",
+      "sig_reason": "问题在编译层与引擎关闭流程留下的全局钩子引用，属引擎资源生命周期。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "torch-compile",
+        "shutdown",
+        "memory-leak"
+      ],
+      "pr_number": 67081
+    },
+    {
+      "sha": "b5dcc877257d644d63ecc01de4ac191e68b7abe7",
+      "comment": "**背景**：AMD 即将把 CI 改成默认带 AITER 运行。设了 `VLLM_ROCM_USE_AITER=1` 时，`fused_topk_bias` 走的是未经钳位的普通 torch top-k 来算 softmax 加 `e_score_correction_bias`，于是含 NaN 或正无穷的整行会得到 NaN 权重。**方法**：把受支持的那几种启动改走 AITER 的 `topk_gating`：`rocm_aiter_topk_gating` 这个算子、它的 fake 实现与 `rocm_aiter_ops.topk_gating` 都加上末尾两个参数 `correction_bias`（张量或 None，默认 None）与 `routed_scaling_factor`（默认 1.0），已有调用方不变；`topk_gating` 自己会吃掉 NaN 行并给出有限权重。**效果**：+55/-5、2 个文件（AITER 算子封装与融合 top-k 带偏置路由）。`tests/kernels/moe/test_fused_topk.py::test_fused_topk_bias_nan_inf_clamp` 里 36 个原本在 AITER 开启时失败的 softmax 用例现在全部通过（72 中 72），AITER 关闭时行为不变（同样 72 中 72）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "改动落在 MoE 路由内核的选择上，修的是特定内核下权重出现 NaN 的问题。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "moe-router",
+        "aiter",
+        "topk-gating",
+        "nan"
+      ],
+      "pr_number": 67107
+    },
+    {
+      "sha": "2a14a5e4778213d538e3cc1875fea432636f32e0",
+      "comment": "**背景**：Unlimited-OCR-2 的多页请求一直不进多模态处理器缓存。`_cached_apply_hf_processor` 里有一条「提示里图片超过一张就绕过缓存」的规则，而这条规则只对 Unlimited-OCR v1 成立——v1 在多图的提示上会关掉裁剪。#64016 让 v2 在 `_get_prompt_updates` 与 `_get_mm_hashes` 里逐页独立裁剪，却没有改这条绕过。结果是每一页每次请求都要重算，而且一个只按 `multi_modal_uuids` 重发已缓存页面、不带图片数据的请求会直接失败。**方法**：把这条绕过限定为只对 v1 生效。**效果**：+66/-3、2 个文件（模型实现与处理测试）。多页请求现在与单页一样逐页缓存；只发 UUID 的重发能被正常服务；每一页处理出的张量单独处理与合在一起处理结果相同，因此加缓存不改变输出；Unlimited-OCR v1 的行为不变。",
+      "sig": "sig-omni",
+      "sig_reason": "针对的是 OCR 模型多页图像输入被重复处理与无法复用缓存的问题。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "unlimited-ocr",
+        "processor-cache",
+        "multi-page"
+      ],
+      "pr_number": 66638
+    },
+    {
+      "sha": "3de0b48c85133be800f572a4e17c1f48e5c00c47",
+      "comment": "**背景**：GLM-5.3-Flash 的融合 mHC 步骤（本层 mHC post 加下一子层的 pre 再加 RMSNorm，隐藏维 4096、四条残差流）此前由 TileLang 写的内核承担，分多次启动。**方法**：在微基准显示 FlashInfer 的融合内核更快的那些形状上，改为一整次 `flashinfer.mega_mhc` 启动；不新增选项或环境变量，由算子内部按架构设定的 token 阈值决定。这个内核需要 FlashInfer 含 flashinfer-ai/flashinfer#7024（4096 隐藏维的程序）与 #7885（PDL 启动），且要装带实验性内核源码的版本：两个改动都在 0.7.3（vLLM 当前 pin）里，但 PyPI 发布的 wheel 不带实验性内核源码（#7977），所以只装 PyPI 0.7.3 时该内核建不起来、模型继续用 TileLang；用 FlashInfer 的 nightly 或源码安装才能启用。其他显卡、其他形状同样继续用 TileLang。**效果**：+790/-0、5 个文件，含 mhc 内核目录下的 flashinfer_mega 实现、内核测试与一个基准脚本。作者没有给出端到端耗时数字，收益判定依赖内核级微基准。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把多段残差与归一化合并成一次内核启动，目标是减少 mHC 步骤开销。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "mhc",
+        "flashinfer",
+        "glm-5.3-flash",
+        "tilelang"
+      ],
+      "pr_number": 65521
+    },
+    {
+      "sha": "6201c7d3cd690f7f75494e48b3be1ff1f19ac03b",
+      "comment": "**背景**：#66605 在连接器基类上加了访问模式声明，其中 `KVCacheAccess.EXPORTS_FD` 当时只是声明、没有实现。LMCache MP 连接器要在把 `lmcache.mp.use_vmm_api` 设为 true 时配合可扩展 KV 缓存运行，就需要每层 KV 能被当作 POSIX 文件描述符导出（依赖 LMCache/LMCache#6487 与 #6266）。**方法**：当连接器报告 `EXPORTS_FD`（直接或作为 `MultiConnector` 的子连接器）时，把可扩展 KV 缓存分配成可用文件描述符导出的形式，即物理分配请求 POSIX fd 这一句柄类型；其他配置保持现有分配方式。`EXPORTS_FD` 要求可扩展 KV 缓存开启，因为 LMCache 无法导入 torch 分配器的缓存池，所以在该缓存会被关掉的情况下（设了 `kv_cache_memory_bytes`、`num_gpu_blocks_override` 等）vLLM 直接拒绝启动。它取代 #65507，那条早于 #66605、自带一套 LMCache 配置解析；现在 vLLM 不再读任何 LMCache 的配置键，由连接器自己声明访问模式。**效果**：+316/-51、13 个文件，新增可扩展张量与 VMM 驱动的工具层与测试、KV 传输配置与引擎参数测试，另更新 LMCache 示例文档。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "让分层 KV 缓存能被外部存储进程按文件描述符导入，属跨进程 KV 传输。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "extensible-kv-cache",
+        "lmcache",
+        "exports-fd",
+        "vmm"
+      ],
+      "pr_number": 66674
+    },
+    {
+      "sha": "8527d757d2184da0ed8f6c78532524fa6d23cc24",
+      "comment": "**背景**：Rust 前端的 MiniMax M3 工具解析器要等整段 invoke 闭合才一次性吐出，参数生成期间没有任何增量输出。**方法**：改用 #66528 引入的共享 writer 与调用状态，让 M3 的参数边生成边流出：invoke 名在起始处就发出；模式类型恰好是 string 的顶层参数按转义后的 JSON 字符串分片流出；其他参数（包括嵌套元素）等其元素闭合后再经模式一次性转换——用一层深度计数在单趟扫描里找到对应的闭合标签，再由既有的元素语法构造值。这条叠在 #66767（按 token 身份匹配 M3 标记）之上。**效果**：+333/-92、2 个文件（M3 解析器与解析工具函数）。除分块行为之外还有两处语义变化：字符串参数里出现真正的子元素现在算格式错误，而不再把值变成对象（流出的字符串无法变成对象，结构化标签本身也排除了这种情形）；重复出现的顶层参数保留第一个值。",
+      "sig": "sig-core",
+      "sig_reason": "改的是前端工具调用解析的流式输出方式，属接口行为。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "minimax-m3",
+        "tool-call-streaming"
+      ],
+      "pr_number": 66531
+    },
+    {
+      "sha": "9a4decde960a8dabcc0a6dba5cdedb9a7a5dcdef",
+      "comment": "**背景**：Rust 的 MiniMax M3 工具解析器按字符串拼写匹配标签，但 M3 每个标签开头的命名空间标记（那个由 `]<]minimax[>[` 组成的标记）其实是一个单独添加的 token。按拼写匹配的代价是：模型在正文或参数值里引用这套写法时，会被误判成标签——提前结束值或 invoke、把调用判成格式错误，甚至从正文里开出一个工具块。**方法**：改成按 token 身份匹配，与 DeepSeek DSML（#62875）和 Kimi K3（#58358）的解析器一致：只有命名空间 token 真的产出该标记时才算标签；正文与参数值（含嵌套元素）里用普通 token 拼出的同样写法保持为文本。内容末尾出现的半截普通拼写立即流出而不再扣留；分词器里没有这个 token 时退回按拼写匹配。**效果**：+341/-94、1 个文件（M3 解析器）。除匹配方式外行为不变：每个 invoke 仍缓冲到结束再整体发出。这条是从 #66531 拆出来的前置，后者现在叠在它之上。",
+      "sig": "sig-core",
+      "sig_reason": "修正前端工具解析器识别标签的方式，避免把正文当成协议标记。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "minimax-m3",
+        "token-identity"
+      ],
+      "pr_number": 66767
+    },
+    {
+      "sha": "c9c36486c3f7c767c25bb37f087e38d101edf1ef",
+      "comment": "**背景**：`FusedMoEFactory` 与 `MoERunner` 收两个相关的布尔参数：`apply_routed_scale_to_output` 与 `divide_shared_output_in_fp16`，后者只在前者为真时才有意义。这种组合容易传出非法搭配，也难读懂。是 #65842 评审里 @bnellnm 提的后续。**方法**：用一个枚举 `RoutedScaleMode` 取代两者，直接说明 `routed_scaling_factor` 施加在哪里：`ROUTER`（默认，原为 False）把 scale 交给路由与专家内核，分组 top-k 把它折进 top-k 权重、部分内核（如 ROCm AITER）自己施加；`OUTPUT`（原为 True）由 runner 对路由输出缩放；`OUTPUT_FP16_GUARD`（原两者都 True）在 FP16 且带共享专家时改为由 runner 去除以共享输出，需要解码层做补偿，DeepSeek-V2 与 AXK1 的非 MHA 层以及 openPangu 走这条。**效果**：+139/-73、20 个文件，覆盖 MoE 配置、层、runner 与多个模型实现，另加共享专家缩放的测试。行为与枚举映射前的三种组合一一对应。",
+      "sig": "sig-core",
+      "sig_reason": "收敛的是 MoE 工厂与 runner 的参数接口形式。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "moe",
+        "routed-scaling",
+        "api"
+      ],
+      "pr_number": 66859
+    },
+    {
+      "sha": "52373885168d70886d0a047477a33f65f06b5dc0",
+      "comment": "**背景**：`test_late_chunking_recomputes_cached_prefix_with_chunked_prefill` 在 XPU 上断言失败。原提示只有 43 个 token，少于 XPU 上 vllmrunner 的 64 token 块大小；前缀缓存要求整块才计入，于是 `num_cached_tokens` 是 0，断言「大于 0」不成立。**方法**：把测试里的提示加长到足够跨过块边界。**效果**：+1/-1、1 个文件，纯测试改动。作者在复现命令里给出改动前后的对比：改前该用例以 `assert 0 > 0` 失败，改后通过。测试的是晚分块（late chunking）在分块 prefill 下重算已缓存前缀这条路径，此前只在 XPU 上因为块尺寸差异暴露。",
+      "sig": "sig-ci",
+      "sig_reason": "只调整测试提示长度以满足该平台上前缀缓存的整块条件。",
+      "tags": [
+        "test",
+        "low-risk",
+        "xpu",
+        "prefix-cache",
+        "late-chunking"
+      ],
+      "pr_number": 66978
+    },
+    {
+      "sha": "a547de8a8176c46bbfaf1c37e16de4c5180bbc43",
+      "comment": "**背景**：AITER 的 MLA 解码内核有自己原生生效的头数。经分离上下文并行（DCP）gather 出来的头数比如 48、80、112 不在其中，会被折成 16 头的伪批量，而每个伪批量都要把 KV 缓存重读一遍。**方法**：把解码头数向上补齐到 AITER 原生支持的那一档，补齐目标由 `aiter.get_mla_decode_shape_support` 给出（ROCm/aiter#6107，在 AITER v0.1.27 里，vLLM 自 #63774 起钉住该版本）。补齐始终生效，没有新增环境变量。**效果**：+357/-15、3 个文件（AITER MLA 后端与两个测试）。MI355X（gfx950）、AITER v0.1.27、Q 与 KV 都用 fp8、qlen 为 1、开启 LSE 的内核时间：48 补到 64 时，批量 52 每请求 16K KV 从 274.3 降到 112.9 微秒（2.43 倍）、批量 8 每请求 8K KV 从 107.6 降到 54.9（1.96 倍）；80 补到 96 分别为 2.00 倍与 1.83 倍。",
+      "sig": "sig-model-performance",
+      "sig_reason": "通过补齐头数避免 KV 被重复读取，直接降低解码内核耗时。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "mla",
+        "aiter",
+        "dcp",
+        "head-padding"
+      ],
+      "pr_number": 54899
+    },
+    {
+      "sha": "20ad1db3fe900ce07c2ee2ccdac077ed9826530b",
+      "comment": "**背景**：GLM-5.3 的 MegaMoE 路径（#60895）只接受块 FP8 的 checkpoint，未量化（BF16）的 GLM-5.3 只能走默认的 BF16 MoE 实现。**方法**：让 BF16 checkpoint 也走 DeepGEMM 的 `bf16xbf16` MegaMoE：使用 #61538 那个共享 MegaMoE 层里的 `MEGA_MOE_BF16` 行，融合共享专家、权重按其原样加载。开关不变，仍是 `--kernel-config` 里把 `moe_backend` 设为 `deep_gemm_mega_moe`，配合 TP1 乘 DP 加专家并行。**效果**：+63/-25、3 个文件。glm-5.3-bf16 在 8 张 B200 上以 DEP8、并发 128 跑 `vllm bench serve`，对比默认 BF16 路径（FlashInfer TRTLLM）：8192/1 的 prefill 总 token 每秒 +40%，1024/1024 的解码输出 token 每秒 +13.6%；GSM8K 与默认路径一致。块 FP8 checkpoint 与其他 `moe_backend` 完全不变，其余量化版本仍然抛错。基准两轮同机同容器、各跑一次，只差这一个后端参数，且关掉 MTP 与前缀缓存。",
+      "sig": "sig-model-performance",
+      "sig_reason": "让未量化 checkpoint 也能用融合的 MegaMoE 内核，主要收益是吞吐。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "megamoe",
+        "deepgemm",
+        "bf16",
+        "glm-5.3"
+      ],
+      "pr_number": 67040
+    },
+    {
+      "sha": "0854d2f280ef11a404ae56b4fe708f0462bca20d",
+      "comment": "**背景**：DeepSeek V4 与 V4.1 在 ROCm gfx950 上只有打包的 `fp8_ds_mla` KV 记录格式。AITER 的稀疏 MLA 内核也支持逐张量 scale 的普通 FP8 行。**方法**：新增 `--kv-cache-dtype fp8_e4m3` 这一路：每 token 存一条 `[448 NoPE / 64 RoPE]` 的 FP8 行配一个逐张量 scale，滑窗缓存与压缩缓存都用它；打包格式仍是默认。需要 AITER 含 ROCm/aiter#7429（4e91c7ea6）或更新版本。同时改了 top-k：此前 V4 与 V4.1 的打包器统计了有效 top-k 条目数、却只拷贝那么多个位置，这个改动对既有打包路径同样生效。**效果**：+524/-100、8 个文件（AITER 算子封装、V4 与 V4.1 的 AMD 路径、压缩量化缓存内核、topk 打包、压缩器与稀疏 MLA 测试）。同样显存下 KV 容量多 12.5%（每 token 512 而非 584 字节）；TP2 与 TP4 带投机解码时输出吞吐最高 +7.6%，8K/1K、并发 16 及以上收益最大；DeepSeek-V4.1-Flash 与 V4-Pro-0813 在 GPQA Diamond、GSM8K、MMLU、NIAH 上都没有精度退步。",
+      "sig": "sig-quantization",
+      "sig_reason": "新增一种 FP8 KV 缓存存储格式并配套 top-k 修正，核心是量化存储。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "fp8-kv",
+        "sparse-mla",
+        "deepseek-v4.1",
+        "rocm"
+      ],
+      "pr_number": 66036
+    },
+    {
+      "sha": "11ddd587ebdcb3d3c4ed502e6c76d5da9768bba3",
+      "comment": "**背景**：`ROCM_AITER_FA` 后端每个解码步骤都要为非阻塞地构建滑窗解码表（`_build_swa_decode_tables`，qlen 等于 1 的解码），每个滑窗 KV 缓存分组都跑一次、按启动次数受限。**方法**：把这次构建从 10 个 GPU 算子降到 7 个：钳位改成就地执行、去掉 int64 的类型转换（`_swa_block_offsets` 本身就是 int64）。结果逐字节不变。这条起初还想给投机解码的验证（qlen 大于 1）加一个可选的块表裁剪，但只在配合窗口受限的 AITER split 时才有收益；AITER 那边合进的是自带窗口感知的 split（ROCm/aiter#6889，b6c376cfa6），它的 split 只覆盖每条序列窗口内的 tile，于是未裁剪的验证表拿到的 split 与裁剪后相同、裁剪只会多加算子，因此那部分以及 `VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM` 被去掉。**效果**：+5/-4、2 个文件，每次调用约省 16 微秒主机时间（约 28%）。vLLM main 已含那个 split：钉住的 AITER v0.1.29（#66596）里就有 ROCm/aiter#6889。",
+      "sig": "sig-model-performance",
+      "sig_reason": "减少每步元数据构建的算子数量，属解码步骤的主机开销优化。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "aiter",
+        "sliding-window",
+        "metadata",
+        "host-time"
+      ],
+      "pr_number": 63392
+    },
+    {
+      "sha": "d838863e2ba961c6617a1f36c78f52cfbf0fcfc4",
+      "comment": "**背景**：Unlimited-OCR-2 的 DASH 注意力路径（#64016）写死了两处只有 CUDA 才有的依赖，在 Intel XPU 上跑不通：预热加载 DASH 的 rope Triton 内核时报 `ZE_RESULT_ERROR_INVALID_MODULE_UNLINKED`；`flash_dash_attention` 里 import CUDA flash attention 扩展时报 ImportError。**方法**：去掉这两处 CUDA 专属依赖，让该路径能在非 CUDA 的 Triton 后端上运行（在 XPU 上验证）；同时让 `test_unlimited_ocr.py` 在 FlashInfer 未安装时跳过 FLASHINFER 那几组参数化，而不是抛 ModuleNotFoundError。另外把 `test_unlimited_ocr2_excess_markers_survive_preemption` 的 `block_size` 钉回 16：#63231 把默认块大小改成 64 之后，`num_gpu_blocks_override=80` 不再触发抢占，该用例在 XPU 上以 `num_preemptions` 等于 0 断言失败；16 原本就是这个测试设计时的值。**效果**：+24/-12、3 个文件（DASH 注意力算子、测试与 Intel 的多模态 CI 定义）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主要工作是让一条注意力内核路径在非 CUDA 后端上可运行。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "xpu",
+        "dash-attention",
+        "portability"
+      ],
+      "pr_number": 66495
+    },
+    {
+      "sha": "8f0a381fdca1a115837e6360d386a806f336381d",
+      "comment": "**背景**：DeepSeek-V4.1 在 MI355X 上的单内核解码（monokernel）此前只有 K1 用上调优过的接缝（#63027 为 TP2 的 compress-ratio-2 层写的实现，经 #63893 用到 TP4 的 K1、#64152 用到 TP8 的 K2 之前的 K1）。**方法**：在 gfx950 的 TP4 与 TP8 上，让 K2 的 FFN 接缝以及 FFN 启动的接缝也改用那套调优过的接缝；MoE 取路由时先载入偏置再去轮询 logits。输出与 generic 接缝逐位相同。**效果**：+42/-15、5 个文件（单内核的 layer、runner、MoE stage、README 与数值测试）。DeepSeek-V4.1-Flash 在 TP4 开 `--monokernel` 时，并发 1 的解码步短 144 微秒（-2.8%）、并发 4 短 449 微秒（-5.3%）。这是一条叠在 #64152 之上的堆叠 PR，而 #64152 又叠在 #63893 与 #63027 之上：前四个 commit 分别来自这些 PR 的重排，只有最后一个 `3e7bf14c49` 属于本条，评审也只需看这一个 commit。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把已调优的内核接缝扩到 TP4 与 TP8，直接缩短解码步时间。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "monokernel",
+        "dsv4.1",
+        "mi355x",
+        "ffn-seam"
+      ],
+      "pr_number": 64883
+    },
+    {
+      "sha": "318fca3fddcd6950eeb739737eaafb0973e5f34a",
+      "comment": "**背景**：可扩展 KV 缓存会按预热时测到的峰值留一份瞬时预留。FlashInfer 的自动调优在探测各个 tactic 时会一次性撑出一个很高的显存峰值，这个峰值被算进预留里，导致整个服务期间都留着这份本不需要常驻的空间；#56492 之后这表现成 #66193 记录的启动失败。**方法**：把这一次性的自动调优峰值从瞬时预留里排除，同时保留调优之前与之后的那些真实峰值，这样自动调优可以继续开着；另外把保存下来的 worker 字段初始化成 0，与该补丁原有的回退一致、也满足类型检查。**效果**：+54/-12、4 个文件（内核预热、GPU worker 的 warmup 与可扩展缓存计数）。在 32 GB 的 RTX 5090、`--gpu-memory-utilization 0.85` 下恢复了 Qwen3.8-27B-NVFP4 配 MTP3 那个负载的启动。作者明确说明这些显存数字是此前在两个钉住的 vLLM 版本上测得的既有测量结果，本分支（基于 2aca74f916）没有重新跑一遍。",
+      "sig": "sig-core",
+      "sig_reason": "改动在预热阶段的显存记账上，决定 KV 缓存留多少瞬时预留。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "extensible-kv-cache",
+        "warmup",
+        "flashinfer-autotune"
+      ],
+      "pr_number": 66197
+    },
+    {
+      "sha": "d0eca76eb41526910ca3317143ecda26985a1dc9",
+      "comment": "**背景**：MiniMax-M3 的稀疏注意力由闪电索引器加块稀疏 attend 组成。随仓库带的 MSA 内核只针对 SM100，Hopper（SM90）与消费级 Blackwell（SM120/SM121）只能落回 Triton 实现。**方法**：新增一个基于 FlashInfer `msa_ops` 的后端覆盖这两类卡。取代 @yichengj0 的 #48994（只覆盖 SM120/SM121，保留其 commit）并补上 SM90。需要 FlashInfer 0.7.3（pin 的抬升在 #65930）；在更旧的 FlashInfer 上特征探测会保持 Triton 路径，因此两条 PR 的合并顺序无关。**效果**：+891/-9、7 个文件（索引器、稀疏注意力的公共与 NVIDIA 实现、flashinfer 工具层）。H100 上按 MiniMax-M3 TP8 的形状测：一层稀疏注意力在计算图下的解码快 1.02 到 2.13 倍、prefill 快 2.6 到 5.6 倍、解码与 prefill 混合步快 3.5 到 5.0 倍。8 台 H100 与 8 台 H200、MiniMax-M3.1-Flash TP8 带 MTP、并发 1 到 10 下端到端解码步间隔 p50 降 9% 到 22%、首 token 延迟 p50 降 3% 到 19%，GSM8K 精度不变。SM120/SM121 上索引器与 attend 与 Triton 及参考实现对齐（在 #48994 里用 RTX 5080 验过）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为两类显卡换上更快的稀疏注意力内核实现，收益是内核与端到端耗时。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "msa",
+        "flashinfer",
+        "minimax-m3",
+        "sm90"
+      ],
+      "pr_number": 66018
+    },
+    {
+      "sha": "06dbdda4b2b950a0b6083770b6417aa8e9f9ad16",
+      "comment": "**背景**：DeepSeek-V4 的自适应验证（按每步实际情况调整草稿预算）此前在 Intel XPU 上不可用。**方法**：让 XPU 的 DSpark 与稀疏路径支持这条能力，需要索引器与稀疏滑窗 MLA 后端配合改动；给出 8 张 B70 上的完整启动命令：TP8 加专家并行、8192 上下文、编译配置取 FULL_DECODE_ONLY，投机配置用 dspark、注意力后端 FLASH_ATTN、7 个投机 token、 probabilistic 草稿采样并打开 `enable_adaptive_verification`。**效果**：+70/-9、5 个文件（XPU 的 dspark 与稀疏实现、公共的索引器与稀疏滑窗后端），另加一个 ROCm 自适应验证的测试文件。精度用 GSM8K 评测脚本跑，结果以截图给出，正文没有文字化的分数，属于证据偏薄的一条。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "让 XPU 具备投机解码的自适应验证能力，改动集中在草稿与索引器路径。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "xpu",
+        "dspark",
+        "adaptive-verification"
+      ],
+      "pr_number": 62309
+    },
+    {
+      "sha": "bfc1e381135b8cc522ce7597e8da912010243355",
+      "comment": "**背景**：Nemotron 共享专家在 SM10x 上先把 BF16 的 ReLU2 激活算出来、再单独做一次 NVFP4 量化，中间那个 BF16 张量既多一次启动又要落地。**方法**：把原生 BF16 的 ReLU2 与 NVFP4 量化融成一个内核，复用 #59612 引入的消费者、不改 GEMM。**效果**：+474/-1、3 个文件。GB200、Nemotron 共享专家尺寸（K=5376、N=4096）、常规原生编译设置、预热后的计算图、每个形状 8 组配对采样：2048 token 时激活加量化从 17.17 降到 12.98 微秒（1.15 倍）、含 down projection 的 GEMM 从 35.94 降到 31.24；4096 token 时分别从 35.60 降到 24.46（1.25 倍）、74.63 降到 59.85。作者报告激活与量化环节延迟在 2K 到 4K token 区间低 24% 到 31%、算上 down GEMM 低 13% 到 20%。打包值与有效 scale 逐位相同，既有的激活与 LoRA 回退路径保留。",
+      "sig": "sig-quantization",
+      "sig_reason": "融合的对象是 NVFP4 输入量化，收益直接落在量化环节。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "nvfp4",
+        "relu2",
+        "fused-activation-quant"
+      ],
+      "pr_number": 59384
+    },
+    {
+      "sha": "d6cf0684aca86b70351a14d581a1c37b74e21d04",
+      "comment": "**背景**：七个 AMD monokernel（把一个解码层甚至整步 decode 融进一次启动的常驻内核）测试步骤是按测试内容命名、散落在三个文件里，而这七步其实有相同的特征：都是 gfx950 或 gfx942、都是多卡、都会阻塞流水线。这样没人看得出这一组一共花多少机时。**方法**：把它们集中成一个新的 Monokernels 测试区域。这是纯搬迁：步骤定义不改、命令不改、测试文件不动；键名保留，所以 Buildkite 的历史与 flake 统计能跟着过去。**效果**：+184/-166、3 个 YAML：新建 monokernels.yaml 178 行含 7 个步骤，models_basic.yaml 减 131 行移出 6 个步骤，kernels.yaml 减 35 行移出 1 个。是 #67038（把这批步骤钉到明确测试文件）的后续。",
+      "sig": "sig-ci",
+      "sig_reason": "只重组 Buildkite 测试区域的归属，方便看一组步骤的成本。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "buildkite",
+        "monokernel",
+        "test-area"
+      ],
+      "pr_number": 67073
+    },
+    {
+      "sha": "da7520f7fa731f18c046908c652624647f476d32",
+      "comment": "**背景**：多轮多模态强化学习用 `/inference/v1/generate` 时，到第 N 轮提示里已经带着前几轮图像展开后的内容（来自上一次响应给的 `prompt_token_ids` 与 `mm_placeholders`），再加一张带紧凑占位符的新图。当时两种输入必须二选一、都不合用：只给 `content_parts`，处理器会去匹配它遇到的第一个占位符，而那个位置落在早前已展开的片段里，于是提示被静默改坏，除非调用方先把所有旧片段收拢；只给 `features`，新图就没有处理好的数据。**方法**：按与 @DarkLight1337、@hickeyma 讨论的结论，允许两者同时使用，而不是在处理器里识别是否已展开（那是这版 PR 之前的做法）：`features` 携带已经展开、并给出显式范围的历史条目，`content_parts` 携带新内容；只渲染最后一个 features 范围之后的提示，匹配器因此看不到已展开片段。**效果**：+178/-25、6 个文件，含 token-in-token-out 的协议与服务实现、多模态处理器、异常定义与文档。",
+      "sig": "sig-omni",
+      "sig_reason": "解决的是多模态输入在已展开提示上混合传新图像时的匹配正确性。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "multimodal",
+        "token-in-token-out",
+        "rl"
+      ],
+      "pr_number": 57796
+    },
+    {
+      "sha": "92a7c216c0bc4d9613d3d18ce4e1b6beeebf951b",
+      "comment": "**背景**：Intel GPU 的 CI 作业此前把工作目录设在 `/workspace/vllm`，与新镜像约定的路径不一致。**方法**：按讨论结论把 working_dir 改成 `/vllm-workspace/`。**效果**：+32/-29、13 个文件，全部是 `.buildkite/intel_jobs/` 下的 YAML（分布式、入口点、lm_eval、LoRA、杂项、语言模型、多模态、量化等）。PR 正文的 Claims、Validation、Details 三节都是空模板，只有 checklist 段落，没有说明改动后哪些作业验证过。",
+      "sig": "sig-ci",
+      "sig_reason": "只调整 Intel CI 作业里的工作目录路径。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "buildkite",
+        "intel-xpu",
+        "working-dir"
+      ],
+      "pr_number": 66973
+    },
+    {
+      "sha": "3319c629a148c8f7ce088445911d9db4119af134",
+      "comment": "**背景**：MRV2 下默认开启可扩展 KV 缓存。捕获大型计算图（例如多模态编码器图）时需要显存，而预热阶段占用的 KV 块此时还没释放，于是启动直接 CUDA OOM（#65868）。**方法**：在捕获之前先释放预热用的那些块；`extend_kv_cache` 仍在捕获之后按实测到的余量提交缓存大小，这一步与现在一致。稳态不变，只在启动时多一次重新映射。**效果**：+141/-19、7 个文件（可扩展 KV 缓存、计算图工具、模型运行器、自回归草稿器与 worker）。`google/gemma-4-31B-it` 打开 `cudagraph_mm_encoder`、单张 H100、`gpu_memory_utilization=0.95` 下，main 在 `max_model_len` 为 4096 与 8192 时都以 torch 的 OutOfMemoryError 崩在启动，本改动两者都能起服务。只提交空块时捕获的图在缓存重新长大之后依然有效：Qwen3-0.6B 开计算图时贪心输出与关闭可扩展缓存的运行一致。验证基线是 821851eab0、单张 H100 80GB、MRV2。",
+      "sig": "sig-core",
+      "sig_reason": "改动在 worker 启动阶段 KV 显存的释放与重新映射时机上。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "extensible-kv-cache",
+        "cudagraph",
+        "startup-oom"
+      ],
+      "pr_number": 66523
+    },
+    {
+      "sha": "6713d05d6cfcec529394f7bb32ce5ec9a09e7d85",
+      "comment": "**背景**：Triton 3.9 下块 FP8 的 Triton 融合 MoE 编译失败（#66195）：当某个权重 scale 分组正好覆盖整个 N tile 时，代码走的是对 0 维张量做切片。**方法**：这时直接广播这个标量 scale，两种 SWAP_AB 方向都改；保留 #64760 引入的标量载入优化，向量化 scale 的原有路径不动。**效果**：+6/-1、1 个文件。此前报告的验证用的是带同样内核改动的 vLLM a2bcb5657 配 torch 2.15.0 与 Triton 3.9.0、4 台 GB200：未打补丁的镜像在启动阶段就失败，打过补丁的能启动并跑完 8K 输入 1K 输出、并发 1、64、256 的基准。作者说明这是对既有验证的转述，本分支基于 5a763c3649、没有重跑。复现命令给出 Qwen3.8-Flash-Next-FP8 在 TP4、`--language-model-only`、9216 上下文下的启动，原始运行另用了 runai_streamer 加载方式。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修的是 MoE 内核在新 Triton 版本下的编译路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "triton-3.9",
+        "fused-moe",
+        "block-fp8",
+        "scalar-scale"
+      ],
+      "pr_number": 66274
+    },
+    {
+      "sha": "63980fbf1ead0215e2bfaf89da7399895725003a",
+      "comment": "**背景**：在可扩展 KV 缓存下，显式设置的 `gpu_memory_utilization` 是引擎所有用量的硬上限，KV 缓存只能拿上限之内剩下的部分。像 0.9 这种从按估计值定尺寸时代抄来的值会把一段本来空闲的显存挡在缓存之外，而且没有任何提示；显存不足的报错还错误地怪到设备头上（#66192、#66193）。**方法**：给这种情况加一条启动告警，每个节点只记一次：当显式设置高于 0.8、低于 1.0，且至少 1 GiB 实测空闲显存被挡在可扩展 KV 缓存之外时触发，内容写明被挡住的量、并建议除非有别的进程共享这张卡否则不要设这个值。不设、设为 1.0、设为 0.8 或更低，或者那块显存本来就被别的进程占着，都不告警。同时修掉显存错误的措辞：设置低于 1.0 时点名该选项并说明默认值是 1.0。**效果**：+120/-9、4 个文件（KV 缓存规划、可扩展缓存实现，以及启动错误措辞与可扩展缓存两个测试）。",
+      "sig": "sig-core",
+      "sig_reason": "针对引擎配置项在新默认值下的误用给出启动告警与更准确的错误。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "gpu-memory-utilization",
+        "kv-cache-planning",
+        "warning"
+      ],
+      "pr_number": 66704
+    },
+    {
+      "sha": "1d09f2bfdb44a4999831e3a2301c713ccfd878d7",
+      "comment": "**背景**：在 ROCm 用 AITER MLA 加 fp8 KV 缓存时，每个 MLA 解码层的查询准备工作要三次启动：bf16 的 W_UK absorb 用 `torch.bmm`、拼接 q 并做静态 fp8 量化、再用 `repeat_interleave` 把头数补到 asm 内核要求的 16 头。**方法**：当 AITER 提供该层形状对应的调优配置时，把这三步合成一次 AITER Triton 内核 `fused_bf16_bmm_cat_quant_pad_mla`（ROCm/aiter#7171）。依赖该 AITER 改动：没有它时调优配置检查返回 false，原有路径照旧运行。**效果**：+185/-14、5 个文件（AITER 算子封装、MLA 注意力、注意力后端与 AITER MLA 实现）。Kimi-K2.6-MXFP4、TP8、8 张 MI355X、fp8 KV 下：1k/1k 在并发 16、64、128 与 1k/8k 在并发 64 这几组里输出吞吐 +3.2% 到 +7.1%、平均每输出 token 时间 -2.8% 到 -6.2%。解码查询准备从每步 61 层各 5.66 加 4.55 加 5.32 微秒变成每层 4.58 微秒，即 947 微秒降到 279 微秒、每层少两次启动。GSM8K 五 shot 与 GPQA diamond 零 shot 的精度在标准误范围内不变。",
+      "sig": "sig-model-performance",
+      "sig_reason": "三次内核启动合成一次，收益是每步主机与 GPU 时间。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "mla",
+        "aiter",
+        "fused-kernel",
+        "fp8"
+      ],
+      "pr_number": 64560
+    },
+    {
+      "sha": "127dd027d71afe6d349059245c887bb1c80bee1d",
+      "comment": "**背景**：`deep_gemm_mega_moe` 这个 MoE 后端此前只在 SM100 上可用，Hopper 上的 MXFP4 路由专家要跑多条独立内核。**方法**：接进 DeepGEMM 新写的 SM90 FP8 乘 FP4 Mega MoE 内核：它把分发、L1 GEMM、带 FP8 量化的 SwiGLU、L2 GEMM 与合并全部融进一个跨 NVLink 对称内存的常驻内核，功能与 SM100 一致、限定同一个 NVLink 域内。依赖 vllm-project/DeepGEMM#44，该 PR 合入后需要抬 `cmake/external_projects/deepgemm.cmake` 里的 pin；在此之前 SM90 的测试用例跳过。**效果**：+465/-112、16 个文件，含 MegaMoE 实现、megamoe 准备步骤与多组测试（MoE、warmup、Engram 数据并行分片、mHC 内核）。DeepSeek-V4.1-Flash 单机 DP8 加 EP8 下，并发 1 到 1024 的输出吞吐比 main 的默认 MoE 路径高 17% 到 26%、比 main 加 deepep_v2 高 12% 到 19%；两个节点各作一份 DP8 加 EP8 副本时分别高 16% 到 27% 与 10% 到 16%。正文注明是应 Simon 的要求所做。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主要收益来自把 MoE 各阶段融成一个常驻内核，跨卡吞吐提升明显。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "megamoe",
+        "deepgemm",
+        "sm90",
+        "mxfp4"
+      ],
+      "pr_number": 64061
+    },
+    {
+      "sha": "3bc0f430883c575d4076280d8d10d77cd4bfc07c",
+      "comment": "**背景**：设了 `VLLM_BATCH_INVARIANT=1` 之后，MEAN 池化出来的向量并不可复现：同样的请求在两次相同运行之间、以及单独跑与混在批量里跑，得到的位都不一样。`docs/features/batch_invariance.md` 写的是批量不变保证输出确定、且与批量大小和请求顺序无关，与此矛盾（与 #38559 相关）。**方法**：`MeanPool.forward` 原本用 `segment_sums.index_add_(0, segment_ids, hidden_states)` 累加，在 CUDA 上这是原子加、求和顺序每次可能不同；在开启该标志时改成对每条序列自己的行求和。默认路径不变。**效果**：+25/-0、2 个文件（池化方法与测试）。作者给的复现是 A40 上的 intfloat/e5-small：把同样 64 条文本嵌入 5 次，main 上有 44 条向量的位发生变化（第二次运行是 46 条）。",
+      "sig": "sig-core",
+      "sig_reason": "修的是池化层在批量不变开关下的数值确定性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "pooling",
+        "mean-pool",
+        "batch-invariance"
+      ],
+      "pr_number": 60035
+    },
+    {
+      "sha": "2199d6f4885ee91b9e6319d3dfd04f9bd0e8724a",
+      "comment": "**背景**：可扩展 KV 缓存要靠一次定尺寸预热来留瞬时预留，但这次预热测的不是调度器真正能跑出的最大那一步：当 `max_model_len` 小于 `max_num_batched_tokens` 时它漏掉由多个请求凑满预算的步骤；`max_num_seqs` 等于 1 时干脆整个跳过。这是 #66197 的前置——那条的 CI 运行暴露了第一个缺口，`test_flashinfer_replayssm_prefix_cache_mtp` 在 H100 上确定性地以 OOM 失败。**方法**：让定尺寸步覆盖一整份 `max_num_batched_tokens` 的预算，即使单个请求装不下也要靠把 prefill 分到多个请求上来达成；`max_num_seqs=1` 时把这一步作为纯 prefill 步骤跑而不是跳过；提示 logprob 仍在单提示步上测量，避免 `max_logprobs=-1` 时为整个 token 预算留下全词表的 logprob。**效果**：+215/-60、3 个文件（GPU worker 的 warmup 与两组测试）。与 #66197 合起来后，那个用例既把满预算峰值留在预留里、又把 FlashInfer 自动调优的一次性 scratch 峰值排除掉。",
+      "sig": "sig-core",
+      "sig_reason": "修的是预热阶段测出的显存峰值不能代表真实最大步的问题。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "extensible-kv-cache",
+        "warmup",
+        "memory-reserve"
+      ],
+      "pr_number": 66731
+    },
+    {
+      "sha": "73a1377b6bebf27e48d025191cf5e20ea9620a04",
+      "comment": "**背景**：`FlashInferMetadataBuilder` 可能在上一步的注意力内核还没把包装器里页锁定缓冲区中的计划拷走之前就再次调用 FlashInfer 的 `plan()`。结果是上一步的内核拿着下一步的计划运行、越界读到非法内存（#63505）。这个竞态自 #57214 起变得可触发。**方法**：让构建器在再次 plan 之前等那次拷贝完成。等待覆盖 `build()` 里所有会调 `plan()` 的分支：prefill、DCP prefill 以及解码（`fast_plan_decode`，它也会为计算图解码包装器做 plan）；TRTLLM 与 XQA 路径不调 `plan()`，因此既不等待也不记录事件。只有当主机比显卡领先超过一个计划时才真正等待。**效果**：+87/-0、2 个文件（FlashInfer 后端与注意力后端测试）。修掉 Qwen3.8-27B-FP8 在 `--pipeline-parallel-size=3`、开分块 prefill 与前缀缓存时，第一次长冷 prefill 就把引擎打死的 illegal memory access；单卡配异步调度下 2000 次构建里阻塞次数为 0。",
+      "sig": "sig-model-performance",
+      "sig_reason": "竞态发生在注意力后端的元数据构建与主机缓冲区间，属内核路径正确性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "flashinfer",
+        "plan-buffer",
+        "async-scheduling"
+      ],
+      "pr_number": 64165
+    },
+    {
+      "sha": "6dccafffc056c44f84b971258caa57d9f35a1ddc",
+      "comment": "**背景**：DeepSeek-V4 的 DSpark 在 ROCm 上会为草稿侧建出占位的 `embed_tokens` 与 `lm_head` 模块，但这个模型的 AMD 草稿版在稳定状态下并不拥有这些权重：`load_dspark_model()` 直接把目标模型共享的词表模块别名进草稿模型，因此占位分配只是启动期的一次性开销。在 Strix Halo 的 TP2 上这个开销大到值得处理：每个占位约 0.863 GiB 每 rank，两项合计约 1.73 GiB。**方法**：只改 ROCm 实现，不再建这两个占位模块。这与树内已有的做法一致：`vllm/models/kimi_k3/nvidia/dspark_mla.py` 就是把 `has_own_embed_tokens` 与 `has_own_lm_head` 设为 False、两个模块保持为 None、靠草稿加载后的目标模型别名。**效果**：+8/-16、1 个文件，省下约 1.73 GiB 每 rank 的启动期显存峰值，稳态行为不变。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "去掉的是 DSpark 草稿模型不需要的权重占位分配。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "dspark",
+        "rocm",
+        "startup-memory"
+      ],
+      "pr_number": 54820
+    },
+    {
+      "sha": "4ad27d8a73a7046e83a0801c862e7cd55e29fbcb",
+      "comment": "**背景**：#66037 让 Kimi K3.1 的 DFlash 草稿缓存按打包布局存放，为此加了一层槽位映射转换：内核页与草稿槽位之间靠一个 Triton 内核与若干缓冲区来换算，还要在注意力分组键、后端能力标志与上下文槽位管道上多处配合。**方法**：改为在 DFlash 里直接算出已经带打包块跨步的草稿 KV 槽位，于是打包的草稿缓存可以沿用普通的内核页绑定，整套转换层可以删掉：移除 `AttentionGroup.map_to_kernel_slot_mapping` 及其内核与缓冲区、`maps_slot_mapping` 与 `slot_mapped_layers`、注意力分组键的改动、DFlash 上下文槽位管道，以及 `AttentionBackend.writes_kv_cache_from_block_table`。没有给 `AttentionBackend` 或 `AttentionLayerBase` 新增任何属性或开关。**效果**：+87/-200、13 个文件，其中 `vllm/` 目录净 +65/-156。验证在 B300 上用裁减过的 Kimi K3.1 TP4 配 Inferact/Kimi-K3.1-Pro-DSpark-preview、5 个投机 token、固定 seed 7：与 main 一样能服务，抽查输出相同、GSM8K 在重复运行的散布范围内一致。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "改的是草稿 KV 槽位的计算方式，删掉为其服务的一层转换机制。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "dflash",
+        "kimi-k3.1",
+        "kv-slots"
+      ],
+      "pr_number": 66604
+    },
+    {
+      "sha": "772dafd2958bf0557751539f73e123ec4a015f98",
+      "comment": "**背景**：ModelOpt 的混合精度 checkpoint 可以在 `quantized_layers` 里把 token 嵌入标成 `W4A16_NVFP4`，但目前只有 Q8_0 的嵌入能加载（经 b12x）。在 main 上，把 BF16 嵌入重新量化成 NVFP4 的 nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB 加载失败，报两个张量在维度 1 上大小 4096 与 2048 不匹配。**方法**：新增 `ModelOptNvFp4EmbeddingMethod`：保留打包后的表，只对被查到的行反量化——显卡上一个 Triton 内核完成（改编自 `compressed_tensors_embedding.py` 里的 INT 嵌入内核），CPU 上用 torch 实现。**效果**：+305/-2、4 个文件（含新的 NVFP4 嵌入测试与 modelopt 文档）。该模型可以加载并服务：权重从 23.05 GiB 降到 22.33 GiB、KV 缓存多 1.9%；MMLU-Pro 57.90 对 57.19（2100 题，在噪声内）、首 token 与每 token 时间不变。Triton 查表与 torch 路径逐位相同且更快：RTX 6000D、131072 × 4096 的表上，1 到 256 个 token 是 23 微秒对 81 微秒。",
+      "sig": "sig-quantization",
+      "sig_reason": "新增一种 NVFP4 权重量化格式在嵌入层上的加载与计算方式。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "nvfp4",
+        "w4a16",
+        "token-embedding",
+        "modelopt"
+      ],
+      "pr_number": 64767
+    },
+    {
+      "sha": "055f8da959117731038a6bfea00055466cd9cf00",
+      "comment": "**背景**：Rubin 的 nightly 镜像还建在 CUDA 13.4 上，与新的驱动与运行时要求不一致。是 #49735 的一部分。**方法**：最终镜像换成 `nvidia/cuda:13.5.0-base-ubuntu24.04`、按 `cu135` 标签发布；构建阶段仍留在 cuda13.4 的 manylinux builder 与 cu134 的 torch nightly 上，因为 PyTorch 还没有 cuda13.5 的 builder 或 cu135 wheel；`cuda-python` 与 `cuda-bindings` 升到 13.5.0；设 `VLLM_CUDA_COMPATIBILITY_PATH=/usr/local/cuda/compat`，这样开了兼容开关时加载的是镜像里的 13.5 兼容驱动而不是 torch 带的 13.4 那份；文档要求宿主驱动 R620 及以上（R610 上前向兼容驱动会关掉 CUDA 的卡间点对点）。**效果**：+81/-59、7 个文件，涉及发布流水线、镜像构建脚本与元数据参数、依赖与安装文档。验证在 1 节点 4 张 VR200（GR100，SM107，aarch64）、驱动 620.47 上对比本 PR 的 cu135 aarch64 镜像与上游 cu134-nightly。取代 #66887，并致谢 @wangshangsam 的 VR200 测试。",
+      "sig": "sig-ci",
+      "sig_reason": "改动在 nightly 镜像构建与 CUDA 运行时版本的发布配置上。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "rubin",
+        "cuda-13.5",
+        "nightly-image"
+      ],
+      "pr_number": 65765
+    },
+    {
+      "sha": "24a6e0fe58850f2e9f57c97ff9707c2d83e1ab20",
+      "comment": "**背景**：Humming 在 SM100 到 SM119 上的稠密线性层忽略了请求里指定的 FP8 激活，落到 BF16 或 INT8 回退。**方法**：按请求兑现 FP8 激活：Quark 的 MXFP4 与 MXFP6 稠密层支持 FP8 动态激活，包括被换算成 FP8 E4M3 的 MXFP6A8 与 MXFP8 请求，以及 MXFP8 的 group-32 配 E8M0 schema；compressed-tensors 的 MXFP6A8 checkpoint 走同一条路径。MoE 的分组 GEMM 在该架构区间仍保留 BF16 回退；SM90 与 SM120 及以上不变。FP4 请求的门控保留，但其在 SM100 到 SM119 的稠密回退现在统一落到逐 token 的 FP8 E4M3，而不是 SM100 的 INT8 或 SM103 的 BF16。**效果**：+122/-6、4 个文件（humming 量化实现、MoE 与 schema 工具，加一个 MXFP4 配块 FP8 的测试）。B300 上实测解码 GEMM 快 1.4 到 1.9 倍；27B 的 MXFP6A8 checkpoint 在并发 1 到 256 的扫描上每输出 token 时间 p50 降 8% 到 16%，GSM8K 严格匹配从 0.681 到 0.683、Wikitext 困惑度升高 0.060（在既有 CI 容差内）。作者注明与 AI 协作开发。",
+      "sig": "sig-quantization",
+      "sig_reason": "核心是让量化线性层按请求使用 FP8 激活，涉及多种量化 schema。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "humming",
+        "fp8-activation",
+        "mxfp6",
+        "sm100"
+      ],
+      "pr_number": 65077
+    },
+    {
+      "sha": "d74f39c5a60aed2c8a11c2c482cf0ec8a3a2602e",
+      "comment": "**背景**：设了 `VLLM_BATCH_INVARIANT=1` 时，Triton 融合 MoE 内核永远只跑一份固定配置（BLOCK 64x64x32、GROUP_SIZE_M 8、SPLIT_K 1），因为 `get_moe_configs()` 返回 None、而 `get_default_config()` 里没有批量不变用的表。**方法**：加一张小的按架构表，每个专家形状对应一份配置、对所有 M 通用，并在该标志生效时由 `get_default_config()` 查这张表；表里没有的形状继续用固定配置。这些条目是在 GB300（SM 10.3）上为 Qwen3-235B-A22B-FP8、DeepSeek-V3.1、GLM-5.3 的 TP4 块 FP8 形状以及 Qwen3-30B-A3B 的 BF16 形状调出来的。**效果**：+76/-7、2 个文件（批量不变配置表与融合 MoE）。4 台 GB300、基线 2d40c0609f、默认后端选择（该标志下 FP8 的 MoE 选择落到 TRITON）下，标题给出的解码吞吐提升约 +48%。这是纯参数表新增，不改内核实现。",
+      "sig": "sig-model-performance",
+      "sig_reason": "收益来自为批量不变模式补上 MoE 内核的调优参数表。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "moe",
+        "batch-invariant",
+        "blackwell",
+        "tuning"
+      ],
+      "pr_number": 63627
+    },
+    {
+      "sha": "d46cb724ddaeb1146da9c9b882bf7679e049890b",
+      "comment": "**背景**：ROCm 上 `TritonExperts` 处理 PTPC-FP8 的 MoE（例如 Muse Spark）时，SiLU-and-mul 与逐 token FP8 量化分成两个内核，逐专家并行下还会为路由到远端专家的那些行做无用的量化工作。**方法**：把这两步融成一个 Triton 内核，并在专家并行下跳过远端路由的行。写出的每一行都与先 `silu_and_mul` 再 `scaled_fp8_quant` 的结果一致：BF16 下逐位相同，FP16 下相差不超过一个 FP8 步长。**效果**：+387/-0、3 个文件（融合内核与其测试）。EP8、8192 token、单张 MI300X 上两个内核从 867 微秒降到 114 微秒（7.6 倍），TP8 下 1.6 到 1.8 倍。Muse-Spark-Open-816B-A42B 的 PTPC-FP8 在 8 张 MI300X、TP8 加专家并行、1k 到 16k 输入与并发 1 到 64 的扫描上总吞吐 +0.8% 到 +5.7%，8k 与 16k 时首 token 延迟中位低 7% 到 9%；GSM8K 95.45 对基线的 94.84（正负 0.6）。",
+      "sig": "sig-quantization",
+      "sig_reason": "融合的对象是逐 token FP8 输入量化，与激活一起合并成一个内核。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "silu-and-mul",
+        "fp8-quant",
+        "triton-experts",
+        "rocm"
+      ],
+      "pr_number": 63721
+    },
+    {
+      "sha": "5d9470252e947e25e9be42fa2c87bb258e430463",
+      "comment": "**背景**：DeepSeek-V4.1-Flash 在 GB300 上的专用解码（#61868）此前只覆盖目标模型，DSpark 草稿层仍走通用实现。**方法**：当 `decode_backend` 设为 `latency_specialized` 时，让 DSpark 草稿层复用与目标模型同一套解码执行器：融合的全规约加 mHC 内核、注意力与路由专家 GEMM；草稿的采样也走模型自己的 `sample_sequential` 钩子，即 #64442 那个融合的 Markov 循环，外加在小批量时把 Markov 链按词表切到各张量并行 rank 上。全部代码与测试都在 `vllm/models/deepseek_v41/nvidia/` 下，草稿器、模型运行器与其他共享代码不动；开关关闭时完全没有变化。**效果**：+2489/-95、19 个文件，含内核、层与数值三组测试。单托盘 GB300（TP4）配 DSpark 5 个草稿 token、两边都打开开关、对比 main（含 #63921）：批量 1 时解码步短 4.5%、批量 8 短 3.4%、批量 40 短 1.6%；GSM8K 与草稿接受长度在重复运行散布内不变。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "把草稿层接到同一套专用解码执行器上，直接缩短带投机的解码步。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "dspark",
+        "specialized-decode",
+        "gb300",
+        "markov-sampling"
+      ],
+      "pr_number": 61869
+    },
+    {
+      "sha": "f7be53ae746e05ca2c5c5b1b879326945c5a6868",
+      "comment": "**背景**：`LMCacheConnectorV1` 没有把 `shutdown()` 往下传给 LMCache 引擎。结果 SIGTERM 之后 LMCache 的一个线程仍让 EngineCore 存活，超过 `--shutdown-timeout` 后 EngineCore 被强杀（#62808）。**方法**：给 `LMCacheConnectorV1` 加上 `shutdown()`，在其中调用引擎自己的 shutdown，使 worker 侧与调度器侧都会走这段关闭；这与 LMCache 自己那层包装 `LMCacheConnectorV1Dynamic` 的行为一致。**效果**：+38/-0、2 个文件，新增 `test_engine_shutdown_stops_lmcache_threads`，缺该修复时失败、补上后通过，从此不再出现强杀 EngineCore 的日志。作者说明 #62821 做过同样的事但作者在 10 月 27 日未经评审与留言即关闭，因此没有开放的重复 PR；#64924（仍在开放）会移除树内的 LMCache 包与 `use_native`，与本条改到同样两个文件、都在这两处加测试，需要协调。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题出在 KV 连接器的关闭流程上没有把信号传给外部缓存引擎。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "lmcache",
+        "shutdown",
+        "kv-connector"
+      ],
+      "pr_number": 64324
+    },
+    {
+      "sha": "aeadf9252586e9db0e7658312d562036b45cd217",
+      "comment": "**背景**：gfx950 上的 MXFP8 线性层此前只有 Triton 的 `dot_scaled` 实现。**方法**：新增 `AiterFlyDSLMxfp8LinearKernel`，调用 AITER 已调优的 FlyDSL 通用矩阵乘。它排在 ROCm 的 MXFP8 内核列表里 Triton 那条之前，但只在 AITER 调过参的 (N, K) 形状上生效，其余形状仍走 Triton。调优配置来自 ROCm/aiter#6060 与 #7411，都已在 main 钉住的 AITER 版本里；与 #64089 那个 AITER Triton MXFP8 内核不冲突。**效果**：+535/-22、10 个文件（AITER 算子封装、线性内核选择、MXFP8 的 aiter_flydsl 实现、MiniMax-M3 的 AMD 模型与若干内核与契约测试）。MiniMax-M3.1-Flash、TP4、DSpark 7、MI355X 上并发 32 与 64 时，解码步间隔 p50 分别降 4.4% 与 11.1%、吞吐升 2.0% 与 7.7%；M 不小于 32 时多数 M3.1 TP4 形状上单次 GEMM 比 Triton 快 1.1 到 1.9 倍。MiniMax-M3 的融合 MXFP8 量化尾声、单内核解码与 DSpark 草稿内核都保持可用，GSM8K 无精度变化。端到端用 InferenceX 的智能体式 recipe，NVFP4 KV、DBO（两边都带 #63483）、合成接受率 4.04，每个测点 900 秒，并发 64 是两次交换显卡运行的均值。",
+      "sig": "sig-quantization",
+      "sig_reason": "为 MXFP8 权重的线性层换上一份更快的量化 GEMM 实现。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "mxfp8",
+        "flydsl",
+        "aiter",
+        "gfx950"
+      ],
+      "pr_number": 65479
+    },
+    {
+      "sha": "52a9ce94fe29ea0a3d8dde04fdf1c25cdc215164",
+      "comment": "**背景**：自适应的 DSpark 验证需要在各请求之间重新分配草稿 token，因此每个模型都要先有支持变长（ragged）查询的稀疏内核。这是 #51303 那条按模型逐个补齐线的一环。**方法**：给 MiniMax M3 在 ROCm 上的 Triton 索引器与 Triton 稀疏解码路径加上设备侧的变长解码元数据：两种 AMD 索引打分启动策略、融合的 top-k 选择器与稀疏解码都按设备上的 `query_start_loc` 把打包的查询 token 映射回所属请求。**效果**：+718/-60、11 个文件，含索引 top-k、稀疏注意力与 NVFP4 稀疏路径的 AMD 实现及四组内核测试（变长与计算图、索引器上下文并行、前缀 prefill）。范围只到这里：CUDA 后端、AITER 的 MSA 索引器与 AITER 稀疏 PA、ROCm 的 NVFP4 稀疏路径以及索引器上下文并行仍然把设备与 CPU 查询长度不一致报成不支持，选择器因此在那些路径上保持关闭自适应验证；关闭该特性时统一的解码路径不变。在 MI325（gfx942）与 MI355X（gfx950）上验证。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "让某个模型的稀疏内核支持变长查询，是自适应投机验证的前置能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "dspark",
+        "adaptive-verification",
+        "rocm",
+        "varlen"
+      ],
+      "pr_number": 56451
+    },
+    {
+      "sha": "277d49c53ef8f041d7fee7285e58e5f0171c2cc9",
+      "comment": "**背景**：在 Transformers 建模后端上打开 `compile_mm_encoder` 时，如果编码器的前向参数里没有 `torch.Tensor` 或 `torch.FloatTensor` 这种带形状标注的实参，初始化就报「没有找到动态维度」而崩溃。这是 #63635 三个阻塞项里的第一个。**方法**：改为从前向函数签名推断哪些实参是动态的，而不是只依赖已有的类型标注；把一个非张量实参标成动态时现在会报错并点名需要修改的类型标注。**效果**：+109/-12、4 个文件（编译装饰器、后端的多模态与工具模块、后端测试）。15 个编码器不再在初始化崩溃：aria、cohere2_vision、deepseek_vl 与其混合版、gemma3、glmasr、idefics2、idefics3、llava_onevision、minicpmv4_6、minicpmv4_7、moss_transcribe_diarize、paligemma、smolvlm、voxtral；原本已能识别标注的 11 个编码器额外拿到更多动态实参，其中今天在后端上真能跑的只有 InternVL3，输出保持一致。Gemma 4 里没有音频塔的 checkpoint（例如 31B）不再试图去装饰 NoneType。#63635 的第二、第三个阻塞项未动，因此 LLaVA-OneVision 仍会在 Dynamo 里更靠后的位置失败。",
+      "sig": "sig-core",
+      "sig_reason": "修的是编译装饰器如何推断动态维度，属编译基础设施。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "torch-compile",
+        "transformers-backend",
+        "mm-encoder"
+      ],
+      "pr_number": 63636
+    },
+    {
+      "sha": "3f4fbd6fc983a7f7d89b68df4f2add335332dabd",
+      "comment": "**背景**：流水线并行的各级是按本级的注意力后端去解析计算图模式的，因此同一个批量在相邻两级上补零后的行数可能不同。接收方过去用自己的补齐尺寸去拷贝，一旦发送方给出的行数更少就对不上。#65896 之后同机内 TP 等于 1 的流水线并行默认走拷贝引擎传输、会跳过这次拷贝，所以只有流水线仍用 NCCL 时（例如 TP 大于 1 或跨机的流水线并行）才会撞上。**方法**：两级之间的真实 token 行本来就相同、只有补齐是各自本地的，因此改为只传真实的那些行、拷进接收方常驻的中间缓冲，再用接收方自己的补齐尺寸去执行。**效果**：+61/-12、3 个文件。修掉接收级把批量补得比发送级更多时的中间张量尺寸不匹配；用一个端到端的流水线并行加 EAGLE3 回归测试覆盖，比较计算图生成结果与 eager 执行是否一致。另把这条测试接入 distributed 测试区域。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题是流水线并行相邻级之间张量补齐尺寸不一致导致的传输失败。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "pipeline-parallel",
+        "cudagraph",
+        "intermediate-tensors"
+      ],
+      "pr_number": 66465
+    },
+    {
+      "sha": "b32a87094afc8e9ec349107db8526bebd552069d",
+      "comment": "**背景**：走 Transformers 建模后端服务的模型会静默忽略 `--cpu-offload-gb`：整个模型先一次性建在显存里，之后才交给卸载器，等于把要在主机上放的那部分权重也先在显存上过了一遍（#66810）。**方法**：让后端的解码层像原生 `make_layers` 那样逐层构建、每建好一层就交给卸载器。**效果**：+271/-90、5 个文件（后端的 base、fuser、moe、mtp 与基础正确性测试）。解码层及其 MoE 专家对每种卸载器都会被卸载，构建期间的显存峰值只比常驻部分高约一层。实测用 8 层、虚拟权重、`cpu_offload_gb=4` 的构造：tiny-random-LlamaForCausalLM 的峰值超出量从 8.15 层降到约一层。不开卸载时行为不变；MTP 草稿不卸载，与原生草稿一致。未覆盖的部分：多模态模型带这个参数仍然失败（与 main 相同），原因是 `_mark_tower_model` 会在参数还是 meta 状态时把视觉塔包起来，作者留作后续。",
+      "sig": "sig-core",
+      "sig_reason": "让建模后端遵守引擎已有的主机卸载配置，属模型构建与显存管理。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "cpu-offload",
+        "transformers-backend",
+        "model-construction"
+      ],
+      "pr_number": 66419
+    },
+    {
+      "sha": "ace415c06892a6119c88c8c57ed6fd761b722e32",
+      "comment": "**背景**：ROCm 上 DSA 稀疏索引器的 prefill 循环会为长请求的每一个续接子块重新把整份索引器 K 缓存 gather 一遍。元数据构建器早就把这些续接子块标成 `skip_kv_gather=True`，CUDA 侧的实现（`sparse_attn_indexer.py`）也照做，只有 ROCm 这条循环没有那个判断。**方法**：给 ROCm 的循环补上同样的守卫。**效果**：+12/-9、1 个文件。逻辑上只是去掉重复的 K gather，logits 不变：被跳过的那次 gather 会把同样的行写进同一段工作区，中间没有任何东西写过那段。MI300X（gfx942）上 GLM-5.3-FP8、默认的 512 MB logits 预算、预热后的 512K 上下文 prefill：首 token 延迟从 39.2 与 39.8 秒降到 36.3 与 37.2 秒（-7%），进程内每条请求的 K gather 时间从 2.8 秒降到 0.12 秒；把预算收到 64 MB（子块更多）时改善更大。这是 #46478 与 #40049 之后第三次尝试（前两条因过期未合，都源自 #40018），本条补上了它们缺的 MI300X 实测。",
+      "sig": "sig-model-performance",
+      "sig_reason": "去掉稀疏索引器 prefill 中重复的缓存收集，直接缩短首 token 时间。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "dsa-indexer",
+        "rocm",
+        "prefill",
+        "ttft"
+      ],
+      "pr_number": 63878
+    },
+    {
+      "sha": "fe3ed684ce82ac822127facba4183001ac9516ef",
+      "comment": "**背景**：到达 FlashInfer 的查询是 BF16 或 FP16 时，`FlashInferImpl.forward` 仍然把该层的 FP8 查询 scale（`layer._q_scale_float`）传进内核。FlashInfer 会用 softmax scale 去乘它，因此 checkpoint 里的 `q_scale` 不是 1 时注意力结果就是错的（#63043）。**方法**：新增 `FlashInferImpl.get_q_scale(layer, q_data_type)`，只在查询确实是 FP8 时返回层上的 q scale、其他数据类型返回 1.0，并把该后端所有把 q scale 交给 FlashInfer 的地方统一改用它。**效果**：+183/-12、3 个文件（后端实现、FP8 量化与注意力后端测试）。与两个月没有动静的 #53754 相比，这条还把规则应用到缓存下来的 `self.bmm1_scale` 上——SM100 上 trtllm-gen 解码与 TRTLLM prefill 读的就是它。按 #53754 的改法，在 B200 上设 `disable_flashinfer_q_quantization` 时那个端到端 checkpoint 测试仍然输出乱码，新加的两条 TRTLLM 用例也仍然失败。",
+      "sig": "sig-model-performance",
+      "sig_reason": "问题在注意力后端传给内核的缩放系数选择，结果是注意力数值错误。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "flashinfer",
+        "q-scale",
+        "fp8"
+      ],
+      "pr_number": 64329
+    },
+    {
+      "sha": "7cc0a8a2b1ef6888b44973933c8a208e91122229",
+      "comment": "**背景**：autotrust/JEV-27B-VL 的 recipe 只有 NVIDIA 路径，没有 AMD 上验证过的服务配置。**方法**：给 recipe 加 MI355X 支持并把 mi355x 标为 verified：AMD 镜像用 `vllm/vllm-openai-rocm:latest`（v0.33.0）；开启 AITER（`VLLM_ROCM_USE_AITER=1`）并设 `--attention-backend ROCM_AITER_FA`，这样 48 个 GDN 层走 AITER 的 FlyDSL、16 个 head 尺寸 256 的全注意力层走 ROCM_AITER_FA，这个覆盖方式与 Qwen3.6-27B 相同；TP1 下一张 MI355X 装得下 BF16 权重（51.5 GiB），余下 209 GiB 给 KV 缓存。**效果**：+59/-6、1 个 recipe YAML。验证在单张 MI355X 上跑：System 2 加模型卡示例（billing、shipping、tech support）得到 0.9970、0.0000、0.0030、49 个提示 token，与卡片给的 0.9969、0.0000、0.0031、49 一致；图像问题在两种 System 下都答对；opt-in 的 text_only 与 encoder_parallel 两个特性都过，:latest 与 :nightly 两个镜像都验过。",
+      "sig": "other",
+      "sig_reason": "内容是在 recipe 里补一份经过验证的 AMD 服务配置与指南。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "mi355x",
+        "aiter",
+        "jev-27b-vl"
+      ],
+      "pr_number": 66625
+    },
+    {
+      "sha": "adff2e86fb12b1e964426e56600728fce6d401e4",
+      "comment": "**背景**：两个会阻塞合并的 AMD monokernel 步骤选的是整个目录而不是点名测试文件：minimax-m3-monokernel-mi355 在 mi355_4 上限时 45 分钟、跑整个 `models/minimax_m3/amd_specialized_decode`；kimi-k3-specialized-decode-amd 在 mi355_8 上限时 60 分钟、跑整个 `tests/models/kimi_k3/amd_specialized_decode`。`check_test_tethering.py` 把目录选择视为覆盖其下所有文件，于是一旦有人往这两个目录里新放一个测试文件，它合并当天就自动进一个阻塞的多卡步骤，而钩子不会提示——因为目录已经算覆盖了它。评审测试的人不必注意到自己刚给每个 PR 的关键路径加上 20 分钟、还占着 8 卡 agent。**方法**：把测试文件逐个点名，这样往阻塞步骤里加测试会成为 diff 里看得见的一行，钩子也会拒绝没有显式登记的提交。**效果**：+50/-8、2 个文件（test-amd.yaml 与 models_basic.yaml），是 #67038 之前的一次范围收窄，后续 #67073 把这批步骤归入独立的 Monokernels 测试区域。",
+      "sig": "sig-ci",
+      "sig_reason": "收紧 CI 步骤的测试选取方式，让新增测试必须显式登记。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "buildkite",
+        "test-tethering",
+        "monokernel"
+      ],
+      "pr_number": 67038
+    },
+    {
+      "sha": "dd07002d2d20ddd315914504ad0f92734688a509",
+      "comment": "**背景**：ricursiveAI/Ripple-65B-Preview 还没有在 AMD 上验证过的服务配置。**方法**：把默认变体设为 AMD 用 BF16——默认的 NVFP4 checkpoint 在 ROCm 上只能通过 `EmulationNvFp4LinearKernel` 跑，比 BF16 慢；投机解码的 AMD 覆盖沿用同一份 DFlash2 配置但把 `--max-model-len` 降到 1048576，因为单卡放 BF16 权重时 2M 上下文下草稿模型的 KV 缓存放不下（需要 168.8 GiB、可用 151.5 GiB，估计最大约 186.9 万）；新增一节 AMD 单卡 BF16 指南给出 docker 运行命令。**效果**：+37/-2、1 个 recipe YAML。验证在单张 MI355X、nightly 镜像、TP1、默认 ROCM_ATTN 后端下进行：聊天加 `--reasoning-parser ripple`（推理放在 reasoning_content 里、没有思考标记泄漏）与 `--tool-call-parser ripple`（工具调用、工具结果回填、流式工具调用）都通过，开与不开 DFlash2 两种情况都验过。",
+      "sig": "other",
+      "sig_reason": "为某个模型补一份经 AMD 验证的 recipe 配置与说明。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "ripple-65b",
+        "mi355x"
+      ],
+      "pr_number": 66721
+    },
+    {
+      "sha": "bc11b62ca8203aff20440a84c601864531a8df75",
+      "comment": "**背景**：GLM-5.3-Flash 自动选择 FP8 KV 缓存时，dflash 草稿模型会退回 BF16 存自己的 KV，草稿窗口按 TP4 与 2048 个 token 计算时很占显存。**方法**：让草稿继承目标模型选定的 FP8 KV 缓存。改动只有删掉 7 行（一处把草稿强制回 BF16 的处理）。**效果**：0/-7、1 个文件（模型配置钩子）。在 TP4、完整 2048 token 草稿窗口、48 条并发请求下，每卡少放 790 MiB 的草稿 KV 数据。作者在正文里提到其他草稿模型情况相同、可以去掉同样的处理。给出的测试命令是 TP4、fp8 KV、`incoai/GLM-5.3-Flash-DFlash2` 七个投机 token 的一套服务与 AIME25 评测、以及小输入大输出的基准别名，但没有贴出运行结果数字。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "让草稿模型的 KV 缓存跟随目标模型的量化设置，收益是显存占用。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "dflash",
+        "fp8-kv-cache",
+        "glm-5.3-flash"
+      ],
+      "pr_number": 66292
+    },
+    {
+      "sha": "e8783e54132a2847e62ff67ba6a5bd21f9a59700",
+      "comment": "**背景**：inclusionAI/Ming-3.0-asr-tiny 这个语音识别模型没有在 AMD 上验证过的服务路径。**方法**：给默认变体加 AMD 覆盖，镜像用 `vllm/vllm-openai-rocm:nightly`——nightly 里已经带 torchaudio 与 torchcodec，因此不需要额外的 torchaudio 依赖步骤；注意这里用的是 nightly 而不是 latest，因为 0.33.0 的 latest 镜像里还没有 Ming 这个模型；新增一节 AMD 单卡 BF16 指南，docker 命令里包含 n-gram logits 处理器。**效果**：+25/-1、1 个 recipe YAML。验证在单张 MI355X、nightly 镜像、默认 ROCm 后端（TRITON_MLA 与 Triton MoE）下进行：英文、普通话与带上下文的音频片段都能得出指南里的转写，带主题与热词的上下文片段在接口与离线两种调用下都返回「同囚」；流式、response_format 取 text、context_chunks 与 audio_chunk_frames 都可用；翻译、时间戳以及几种分块选项组合会被正确拒绝。",
+      "sig": "other",
+      "sig_reason": "只补一个语音模型在 AMD 上经验证的 recipe 服务路径。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "asr",
+        "mi355x",
+        "ming-3.0"
+      ],
+      "pr_number": 66689
+    },
+    {
+      "sha": "c64134cbc4f67f6ce348050d877d5d5475d79a75",
+      "comment": "**背景**：`reshape_and_cache` 在单个 token 要写的 16 字节块超过 512 个时会漏掉一部分 KV 头不写，于是 `ROCM_ATTN` 后端对例如 32 个 KV 头乘 head 尺寸 192 或 256 的 bf16 形状会静默读到陈旧的 KV 数据（#62697 的 Pattern B）。**方法**：在内核里恢复按线程步长推进的循环，使任何 `num_kv_heads * head_size` 都能写全；此前只要每 token 字节数超过 8192，第 512 个块之后的部分就被跳过。同时加回归测试。**效果**：+57/-1、2 个文件。用报告者给的脚本，#62697 里 Pattern B 的三个失败用例现在与 `TRITON_ATTN` 一致（最大误差小于等于 0.0006，此前是 0.097 到 0.196）；其他测试结果没有变化，每 token 不超过 512 块的形状没有性能变化。验证都在单张 MI355X（gfx950）。作者说明 Pattern A（gfx1201 上块大小 528 时的解码读取问题）是另一件事，本条没有处理。",
+      "sig": "sig-model-performance",
+      "sig_reason": "内核写缓存时漏行导致注意力读到脏数据，属内核正确性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "reshape-and-cache",
+        "rocm",
+        "kv-heads"
+      ],
+      "pr_number": 64087
+    },
+    {
+      "sha": "a7948445cc244475903f33169d65b12fe9bd6562",
+      "comment": "**背景**：#49141 有两份报告，根因相同：checkpoint 里以未量化形式存储的 MoE 专家被分配了一个量化的 MoE 方法，于是张量形状对不上。触发点都是 MTP（投机解码草稿层）——对 Qwen3.5-35B-A3B 做的 AMD Quark 与社区 GPTQ 量化都只量化了 40 个 transformer 层，MTP 层的专家仍是 bf16，因此主模型能加载、只有草稿失败。MXFP4 那份报的是 w2 维度 256 与 512 不匹配：hidden 2048、moe_intermediate 512，Quark MXFP4 把 w2 按 fp4 打包成 (E, 2048, 256)，而未量化的那份权重是 (E, 2048, 512)。**方法**：在 AutoGPTQ 的方法选择里判断专家权重是否真的被量化，未被量化的路由专家保持不量化，不再套用量化方法。**效果**：+193/-1、3 个文件（auto_gptq 实现、gptq 工具与 AutoGPTQ 测试）。GPTQ 量化的 MoE 模型带 MTP 草稿时能正常加载。",
+      "sig": "sig-quantization",
+      "sig_reason": "核心是量化方法不该套在本未量化的专家权重上。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "autogptq",
+        "moe-experts",
+        "mtp"
+      ],
+      "pr_number": 49539
+    },
+    {
+      "sha": "c3d1ce62b0f11d814696ff022259e70edb3046b5",
+      "comment": "**背景**：多模态 PrefixLM（图像段双向、文本段因果）的批量在 FlashInfer 上拿不到原生支持。此前这类批次要么落回其它后端，要么需要显式构造一个大掩码。**方法**：接进 FlashInfer 的多模态前缀批量 prefill 包装器（FlashInfer #5189，自 0.7.1 起已发布，main 钉的版本里就有）：从请求元数据里为每个查询构造一对起止范围，判断该路径是否可用，再调用包装器——它的注意力变体在每个 KV 块上按「因果且滑窗 或 多模态前缀」取值。没有生成任何随查询长度乘键长度规模的掩码，范围只是一个 int32、形状 (N, 2) 的缓冲区，16384 个 token 时 128 KiB；prefill 仍要遍历整个矩形，因此省下的是显存而不是计算量。包装器仍在常规 prefill 路径旁边并列，而不是取代它：纯文本批量、解码，以及那些在前向时才把范围清空的层（例如 Gemma 4 的全注意力分组）继续用 trtllm-gen 或 FA3。**效果**：+270/-13、3 个文件（FlashInfer 后端、后端选择测试与多模态前缀 LM 生成测试）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主要工作是让注意力后端原生支持一种新的掩码形态并省掉大掩码显存。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "flashinfer",
+        "mm-prefix-lm",
+        "multimodal",
+        "attention-backend"
+      ],
+      "pr_number": 46558
+    },
+    {
+      "sha": "62529d6a2d22586c72c19aaf993840f4e064a680",
+      "comment": "**背景**：#66417 之后仍有遗漏：把 SigLIP2 的文本以 messages 形式送 `/v1/embeddings`，得到的向量与同一文本以 input 形式送入时不同。SigLIP2 的 checkpoint 报 `model_type` 为 siglip，却复用 Gemma 的分词器，而那份分词器自带 Gemma 的对话模板；模板优先级上「分词器自带」高于 vLLM 预定义的备用模板，于是文本被包进 Gemma 的用户回合标记里、还丢了结束符（「a photo of a cat」从 6 个 token 变成 11 个）。**方法**：允许被点名的模型类型优先使用 vLLM 预定义模板而不是 Hub 上随分词器发的模板，并且只对 siglip 打开——#66417 加的那份 SigLIP 模板给出的 token 与分词器自己的一致；显式传 `--chat-template` 仍然优先。顺带修 NaFlex 的 checkpoint（`model_type` 为 siglip2）：它们不发对话模板，但原先落到 basic 模板那份备用上、丢掉分词器会加的结束符（6 个 token 变 5 个），现在同样用 SigLIP 模板。**效果**：+48/-5、4 个文件（渲染器、模板包与注册表、双编码器在线接口测试）。",
+      "sig": "sig-core",
+      "sig_reason": "改的是模板优先级与注册表机制，决定文本被渲染成什么 token。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "chat-template",
+        "siglip",
+        "renderer"
+      ],
+      "pr_number": 66624
+    }
+  ]
+}
