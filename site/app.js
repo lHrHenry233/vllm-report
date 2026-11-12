@@ -430,17 +430,23 @@
     s = s.replace(/^### (.+)$/gm, '<h4>$1</h4>');
     s = s.replace(/^## (.+)$/gm, '<h3>$1</h3>');
     s = s.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-    s = s.replace(/^- (.+)$/gm, '<li>$1</li>');
-    s = s.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
-    s = s.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-    s = s.replace(/(?:<li>.*<\/li>\n?)+/g, function (match) {
-      if (match.indexOf('<ul>') === -1) {
-        return '<ol>' + match + '</ol>';
-      }
-      return match;
+    s = s.replace(/(?:^|\n)((?:- [^\n]+\n?)+)/g, function (_, block) {
+      var items = block.replace(/\n$/, '').split('\n').map(function (l) {
+        return '<li>' + l.slice(2) + '</li>';
+      }).join('');
+      return '<ul>' + items + '</ul>';
+    });
+    s = s.replace(/(?:^|\n)((?:\d+\. [^\n]+\n?)+)/g, function (_, block) {
+      var items = block.replace(/\n$/, '').split('\n').map(function (l) {
+        return '<li>' + l.replace(/^\d+\. /, '') + '</li>';
+      }).join('');
+      return '<ol>' + items + '</ol>';
     });
     s = s.replace(/\n\n/g, '</p><p>');
     s = s.replace(/\n/g, '<br>');
+    s = s.replace(/<br>(<h[234]|<ul|<ol)/g, '$1');
+    s = s.replace(/(<\/ul>|<\/ol>|<\/h[234]>)<br>/g, '$1');
+    s = s.replace(/<p><\/p>/g, '');
     if (!s.startsWith('<')) {
       s = '<p>' + s + '</p>';
     }

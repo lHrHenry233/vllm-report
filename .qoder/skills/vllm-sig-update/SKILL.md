@@ -79,8 +79,8 @@ For each pending date, write `data/vllm/analysis/<date>.json`:
   "date": "<date>",
   "repo": "vllm-project/vllm",
   "generated_at": "<now, ISO 8601 UTC+8>",
-  "daily_summary": "<当日整体摘要，中文 3-5 句，提炼主线方向和关键变更>",
-  "sig_summaries": { "<sig-id>": "<该 SIG 当日变更重点，中文 2-4 句，提炼背景/方法/效果>" },
+  "daily_summary": "<当日整体摘要，结构化 markdown：今日概览 / 今日重点（平台→模型两层）/ 需要关注，总长约 800-1400 字>",
+  "sig_summaries": { "<sig-id>": "<该 SIG 当日变更重点，中文 3-5 句、约 150-350 字，最重要的变化放最前>" },
   "commits": [
     {
       "sha": "<full sha>",
@@ -94,6 +94,19 @@ For each pending date, write `data/vllm/analysis/<date>.json`:
 }
 ```
 
+写作风格（所有中文产出都必须遵守，2026-11-11 起生效）：
+- 读起来像工程师给同事讲 PR，不是论文摘要。**一句说一件事**：
+  一个句子最多两个分句，能用句号断开的不用逗号/分号硬连。
+- 主语明确、动词直接；长定语拆成短句，先说事物再交代来历。
+- 用自然连接词（「之前」「现在」「不过」「代价是」）；禁止压缩黑话
+  （「收口」「口径」「落点」「横切面」「归一」「成环」等），换成直白说法。
+- **给足上下文，不假设读者懂 vLLM 内部**：每条讲清「这是什么、之前什么
+  问题、现在怎样、为什么值得关注」。内部缩写首次出现要展开或带一句解释
+  （如 PP→流水线并行、PCP→prefill 上下文并行、mono→单内核 decode 路径）；
+  「解锁」「放宽」「追平」这类动词必须带上宾语和原因，不能只说半截。
+- 事实优先：保留 PR 号、性能数字、验证结论、风险点；不堆砌次要精确值，
+  不写套话，不复述标题。
+
 Analysis depth — the `comment` field should cover:
 - **背景** (Background): What problem or motivation drove this change?
   Draw from the PR description's Purpose/Background section.
@@ -104,6 +117,7 @@ Analysis depth — the `comment` field should cover:
   results section.
 - Write as a structured paragraph using markdown:
   `**背景**：... **方法**：... **效果**：...`
+  每段 1-3 个短句，全文约 100-200 汉字。
 - For trivial commits (CI config, test-only, docs), a shorter comment
   covering background + effect in 1-2 sentences is acceptable.
 - If no PR description is available (no associated PR), base the analysis
@@ -125,11 +139,19 @@ Rules:
   source), title + paths + stats from the digest, and the patch in
   `data/vllm/commits/<date>.json` for ambiguous or high-impact commits.
   Never fabricate detail you did not verify.
-- `sig_summaries`: only SIGs that have commits that day; 2-4 sentences
-  each, synthesizing key developments (not just listing commits).
-  Highlight trends, conflicts, and notable impacts.
-- `daily_summary`: 3-5 sentences, highlighting the day's main direction,
-  key changes, and any risks or follow-ups to watch.
+- `sig_summaries`: only SIGs that have commits that day; 3-5 sentences
+  each (~150-350 字), synthesizing key developments (not just listing
+  commits). 最重要的 1-2 个变化放最前并带 PR 号，其余按方向一句带过。
+- `daily_summary`: 结构化 markdown，总长约 800-1400 字，让读者 30 秒
+  抓住当天重点（尤其单日 50+ 条的大日子）。固定三段：
+  `**今日概览**：` 2-3 句讲清当天基调（条数、主要方向、风险水平）；
+  `**今日重点**：` **按平台 → 模型两层分组**：平台用加粗独占一行
+  （`**AMD / ROCm**`、`**NVIDIA**`、`**Intel XPU**`、`**跨平台 / 引擎通用**`，
+  按当天重要性排序、无内容的平台不写），平台下每条亮点用
+  `- **模型名或主题**：1-2 句`（带 PR 号），模型名如 Kimi K3.1、
+  DeepSeek-V4.1；平台无关的引擎/前端工作归「跨平台 / 引擎通用」；
+  `**需要关注**：` 1-3 条风险、破坏性变更或证据不足的条目（带 PR 号）。
+  禁止把全部提交揉进一个长段落。
 - Days with many commits: write the file in batches (Write then
   SearchReplace to append) to stay within output limits.
 
