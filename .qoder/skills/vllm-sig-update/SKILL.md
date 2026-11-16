@@ -80,7 +80,7 @@ For each pending date, write `data/vllm/analysis/<date>.json`:
   "repo": "vllm-project/vllm",
   "generated_at": "<now, ISO 8601 UTC+8>",
   "daily_summary": "<当日整体摘要，结构化 markdown：今日概览 / 今日重点（平台→模型两层）/ 需要关注，总长约 800-1400 字>",
-  "sig_summaries": { "<sig-id>": "<该 SIG 当日变更重点，中文 3-5 句、约 150-350 字，最重要的变化放最前>" },
+  "sig_summaries": { "<sig-id>": "<该 SIG 当日变更重点，中文 3-6 句、约 150-400 字：一句定基调，再按硬件平台或模型分组，最重要的变化放最前>" },
   "commits": [
     {
       "sha": "<full sha>",
@@ -139,9 +139,13 @@ Rules:
   source), title + paths + stats from the digest, and the patch in
   `data/vllm/commits/<date>.json` for ambiguous or high-impact commits.
   Never fabricate detail you did not verify.
-- `sig_summaries`: only SIGs that have commits that day; 3-5 sentences
-  each (~150-350 字), synthesizing key developments (not just listing
-  commits). 最重要的 1-2 个变化放最前并带 PR 号，其余按方向一句带过。
+- `sig_summaries`: only SIGs that have commits that day; ~150-400 字 each,
+  synthesizing key developments (not just listing commits). 组织方式与
+  `daily_summary` 一致，**按硬件平台或模型分组**，不要按提交顺序流水：
+  第一句定基调（条数 + 当天这条线在做什么），之后用短行
+  `- **平台或模型**：1-2 句`（如 `- **AMD / ROCm**：…`、
+  `- **DeepSeek-V4.1**：…`、`- **Rust 前端**：…`），行内带 PR 号。
+  最重要的 1-2 组放最前；零散小修合并成一行，不逐条列。
 - `daily_summary`: 结构化 markdown，总长约 800-1400 字，让读者 30 秒
   抓住当天重点（尤其单日 50+ 条的大日子）。固定三段：
   `**今日概览**：` 2-3 句讲清当天基调（条数、主要方向、风险水平）；
