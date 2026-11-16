@@ -1,19 +1,175 @@
 {
   "date": "2026-11-12",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-11-16T11:38:31+08:00",
-  "daily_summary": "**今日概览**：全天 79 条。bugfix 29 条、performance 21 条，新功能 11 条。三条线最占分量：把 AMD 显卡上的量化与 MoE 内核做快、把 MegaMoE 和专用解码推到 Hopper、把可扩展 KV 缓存的显存记账问题一次修完。高风险 3 条（#65932、#60321、#61869）。\n\n**今日重点**：\n\n### AMD / ROCm\n- **MiniMax-M3.1**：一天三项。MXFP8 线性层改走 AITER 调优过的 FlyDSL 通用矩阵乘（#65479，只在 AITER 有调参的形状上生效，其余仍用 Triton），MI355X、TP4、并发 64 时解码步间隔 p50 降 11.1%、吞吐升 7.7%；给 ROCm 的 Triton 索引器与稀疏解码加变长查询支持（#56451），这是这个模型能开自适应 DSpark 验证的前提；SiLU-and-mul 与逐 token FP8 量化合成一个内核（#63721），EP8 单卡 8192 token 时两个内核从 867 微秒降到 114 微秒。\n- **DeepSeek-V4 / V4.1**：新增逐张量 scale 的 FP8 KV 缓存（#66036，每 token 512 字节），同样显存多 12.5% 容量、输出吞吐最高 +7.6%，四个精度基准无退步；另一条给无旋转位置编码的稀疏 MLA 加 MXFP4 打包 KV（#60321，高风险，每 token 272 字节），容量是 bf16 的 3.76 倍，注意力结果与反量化后按 bf16 存逐位相同。\n- **两处静默错误**：`reshape_and_cache` 在单 token 需要写的块超过 512 个时漏写 KV 头（#64087），此前 32 个 KV 头乘 192 的 bf16 形状会读到陈旧数据，最大误差 0.097 到 0.196；稀疏索引器的 prefill 循环没听 `skip_kv_gather`（#63878），续接子块重复收集整份 K 缓存，补上守卫后 512K 上下文首 token 延迟降 7%、单请求收集时间从 2.8 秒降到 0.12 秒。\n- **CI 结构**：把两个阻塞的 monokernel 步骤从「选整个目录」改成点名测试文件（#67038）——按目录选会让新加的测试直接进一个占 8 卡、60 分钟的阻塞步骤，而钩子不报警；再把七个同类步骤集中成独立的 Monokernels 测试区域（#67073）。三份 AMD 验证过的 recipe 同一天进来（#66625、#66721、#66689）。\n\n### NVIDIA\n- **DeepSeek-V4.1**：DSpark 草稿层接进 GB300 的专用解码（#61869，高风险，+2489 行）。草稿与目标模型共用融合的全规约加 mHC、注意力与专家 GEMM，采样也走模型的 `sample_sequential` 钩子；批量 1 与 8 的解码步分别短 4.5% 与 3.4%，GSM8K 与草稿接受长度不变。\n- **GLM-5.3 / GLM-5.3-Flash**：MegaMoE 下 Hopper 三选。FlashInfer 的 SM90 块 FP8 MegaMoE（#62603）把分发、两个专家 GEMM 与合并融在一起，8 台 H200 上解码吞吐 +11% 到 +18%；DeepGEMM 的 SM90 FP8 乘 FP4 内核支持 MXFP4 路由专家（#64061，单机高 17% 到 26%），但要等 DeepGEMM 那边合入后抬 pin；未量化（BF16）的 checkpoint 也能走 MegaMoE（#67040），8 张 B200 并发 128 下 prefill 总吞吐 +40%。另外把 mHC 步骤合成一次 FlashInfer 融合内核（#65521）——它需要带实验性内核源码的 FlashInfer，只装 PyPI wheel 时内核建不起来、静默留在 TileLang。\n- **FlashInfer 后端的三个问题**：让多模态 PrefixLM 批次留在原生后端（#46558），用每查询一对起止范围代替大掩码，省下的是显存；修元数据构建器在上一步内核还没取走计划就再次 plan 造成的越界读（#64165）；修查询是 BF16 或 FP16 时仍把层上的 FP8 q_scale 传进内核（#64329）。\n\n### Intel XPU\n- 自适应 DSpark 验证来到 XPU 的 DeepSeek-V4（#62309，8 张 B70 起服务），但精度结果只给了截图；两个被跳过的 Intel 测试重新纳入 CI（#62656 在 main 那批里、#66978 把提示加长到能跨过 64 token 的块边界）。\n\n### 跨平台 / 引擎通用\n- **可扩展 KV 缓存的显存账**（5 项连修）：定尺寸预热现在测的是调度器真正能跑出的最大步（#66731）；FlashInfer 自动调优的一次性峰值不再计入瞬时预留（#66197）；捕获计算图之前先释放预热占的 KV 块（#66523，此前大编码器图直接让启动 OOM）；显式设了 `gpu_memory_utilization` 因而把空闲显存挡在缓存之外时启动告警（#66704）；文档、基准、CI 与测试里那些从旧默认值时代抄来的 0.9 被删掉（#67071，153 文件）。\n- **Rust 前端**：不带引擎的渲染器支持多模态与 LoRA（#65993）；MiniMax M3 的工具参数边生成边流出（#66531）、并按 token 身份识别标记（#66767，此前正文里引用这套写法会被当成标签）；引擎永久失败时按 Python 的做法退出，方便进程管理器重启（#66773）。\n- **并发与输入正确性**：多个渲染 worker 共用一个分词器，导致并发请求按别人的长度截断（#65932，高风险，此前约 16% 到 17% 的并发请求受影响且不报错）；视频帧预算被别的模态扣减，使四类模型拒绝放得下的纯视频提示（#66608）；Unlimited-OCR-2 的多页请求不进处理器缓存（#66638）；SigLIP2 复用 Gemma 分词器被套上 Gemma 模板、丢掉结束符（#66624）。\n\n**需要关注**：\n- 三条高风险各代表一条线：#65932 的跨请求截断竞态、#60321 的 948 行新 KV 格式、#61869 的 2489 行草稿专用解码。\n- 依赖没落地或要额外安装：#64061 等 DeepGEMM 的 SM90 改动；#65521 需要非 PyPI 的 FlashInfer；#64560 需要含 ROCm/aiter#7171 的 AITER。\n- 证据偏薄：#62309 精度只有截图、#66292 只给命令没有运行数字、#66973 与 #67035 没有端到端数据。",
+  "generated_at": "2026-11-16T12:07:38+08:00",
+  "daily_summary": "**今日概览**：全天 90 条。bugfix 37 条、performance 21 条，新功能 13 条。三条线最占分量：把 AMD 显卡上的量化与 MoE 内核做快、把 MegaMoE 和专用解码推到 Hopper、把可扩展 KV 缓存的显存记账问题一次修完。高风险 3 条（#65932、#60321、#61869）。\n\n**今日重点**：\n\n### AMD / ROCm\n- **MiniMax-M3.1**：一天三项。MXFP8 线性层改走 AITER 调优过的 FlyDSL 通用矩阵乘（#65479，只在 AITER 有调参的形状上生效，其余仍用 Triton），MI355X、TP4、并发 64 时解码步间隔 p50 降 11.1%、吞吐升 7.7%；给 ROCm 的 Triton 索引器与稀疏解码加变长查询支持（#56451），这是这个模型能开自适应 DSpark 验证的前提；SiLU-and-mul 与逐 token FP8 量化合成一个内核（#63721），EP8 单卡 8192 token 时两个内核从 867 微秒降到 114 微秒。\n- **DeepSeek-V4 / V4.1**：新增逐张量 scale 的 FP8 KV 缓存（#66036，每 token 512 字节），同样显存多 12.5% 容量、输出吞吐最高 +7.6%，四个精度基准无退步；另一条给无旋转位置编码的稀疏 MLA 加 MXFP4 打包 KV（#60321，高风险，每 token 272 字节），容量是 bf16 的 3.76 倍，注意力结果与反量化后按 bf16 存逐位相同。\n- **两处静默错误**：`reshape_and_cache` 在单 token 需要写的块超过 512 个时漏写 KV 头（#64087），此前 32 个 KV 头乘 192 的 bf16 形状会读到陈旧数据，最大误差 0.097 到 0.196；稀疏索引器的 prefill 循环没听 `skip_kv_gather`（#63878），续接子块重复收集整份 K 缓存，补上守卫后 512K 上下文首 token 延迟降 7%、单请求收集时间从 2.8 秒降到 0.12 秒。\n- **CI 结构**：把两个阻塞的 monokernel 步骤从「选整个目录」改成点名测试文件（#67038）——按目录选会让新加的测试直接进一个占 8 卡、60 分钟的阻塞步骤，而钩子不报警；再把七个同类步骤集中成独立的 Monokernels 测试区域（#67073）。三份 AMD 验证过的 recipe 同一天进来（#66625、#66721、#66689）。\n\n### NVIDIA\n- **DeepSeek-V4.1**：DSpark 草稿层接进 GB300 的专用解码（#61869，高风险，+2489 行）。草稿与目标模型共用融合的全规约加 mHC、注意力与专家 GEMM，采样也走模型的 `sample_sequential` 钩子；批量 1 与 8 的解码步分别短 4.5% 与 3.4%，GSM8K 与草稿接受长度不变。\n- **GLM-5.3 / GLM-5.3-Flash**：MegaMoE 下 Hopper 三选。FlashInfer 的 SM90 块 FP8 MegaMoE（#62603）把分发、两个专家 GEMM 与合并融在一起，8 台 H200 上解码吞吐 +11% 到 +18%；DeepGEMM 的 SM90 FP8 乘 FP4 内核支持 MXFP4 路由专家（#64061，单机高 17% 到 26%），但要等 DeepGEMM 那边合入后抬 pin；未量化（BF16）的 checkpoint 也能走 MegaMoE（#67040），8 张 B200 并发 128 下 prefill 总吞吐 +40%。另外把 mHC 步骤合成一次 FlashInfer 融合内核（#65521）——它需要带实验性内核源码的 FlashInfer，只装 PyPI wheel 时内核建不起来、静默留在 TileLang。\n- **FlashInfer 后端的三个问题**：让多模态 PrefixLM 批次留在原生后端（#46558），用每查询一对起止范围代替大掩码，省下的是显存；修元数据构建器在上一步内核还没取走计划就再次 plan 造成的越界读（#64165）；修查询是 BF16 或 FP16 时仍把层上的 FP8 q_scale 传进内核（#64329）。\n\n### Intel XPU\n- 自适应 DSpark 验证来到 XPU 的 DeepSeek-V4（#62309，8 张 B70 起服务），但精度结果只给了截图；两个被跳过的 Intel 测试重新纳入 CI（#62656 在 main 那批里、#66978 把提示加长到能跨过 64 token 的块边界）。\n\n### 跨平台 / 引擎通用\n- **可扩展 KV 缓存的显存账**（5 项连修）：定尺寸预热现在测的是调度器真正能跑出的最大步（#66731）；FlashInfer 自动调优的一次性峰值不再计入瞬时预留（#66197）；捕获计算图之前先释放预热占的 KV 块（#66523，此前大编码器图直接让启动 OOM）；显式设了 `gpu_memory_utilization` 因而把空闲显存挡在缓存之外时启动告警（#66704）；文档、基准、CI 与测试里那些从旧默认值时代抄来的 0.9 被删掉（#67071，153 文件）。\n- **Rust 前端**：不带引擎的渲染器支持多模态与 LoRA（#65993）；MiniMax M3 的工具参数边生成边流出（#66531）、并按 token 身份识别标记（#66767，此前正文里引用这套写法会被当成标签）；引擎永久失败时按 Python 的做法退出，方便进程管理器重启（#66773）。\n- **分层 KV 与投机解码继续补齐**：前瞻块哈希现在对所有连接器生效——先改掉仍会丢块的 UMBP 与 HiSparse，再删掉基类上的能力检查（#65448）；异步专家重排的间隔改从最后一层提交时起算，周期超出时点名最慢的专家并行 rank（#64485）；混合模型在分离式上下文并行下重新可用上部分尾部卸载（#58619）；ARC 逐出对在跑请求改成从尾部开始，重放前缀命中从 4096 升到 8016 个 token（#67098）；必需分组未命中时清掉过期的 pending，让请求直接重算而不是多等一轮（#67152）。\n- **Mamba2 的 ReplaySSM 配投机解码不再只认 FlashInfer**：补上 Triton 的验证与实体化内核、按同一套环形缓冲约定实现，追踪器生命周期改用 `use_replayssm_trackers` 判断（#66318）。\n- **两处启动阻塞**：`--moe-backend deep_gemm_mega_moe` 在 H20 上因走进 locality map 初始化而失败，改成只在 SM100 调用清理（#67225）；带预计算多模态嵌入且开编码器计算图时一条请求就能打崩引擎，这类批量改走 eager（#65535）。\n- **并发与输入正确性**：多个渲染 worker 共用一个分词器，导致并发请求按别人的长度截断（#65932，高风险，此前约 16% 到 17% 的并发请求受影响且不报错）；视频帧预算被别的模态扣减，使四类模型拒绝放得下的纯视频提示（#66608）；Unlimited-OCR-2 的多页请求不进处理器缓存（#66638）；SigLIP2 复用 Gemma 分词器被套上 Gemma 模板、丢掉结束符（#66624）。\n\n**需要关注**：\n- 三条高风险各代表一条线：#65932 的跨请求截断竞态、#60321 的 948 行新 KV 格式、#61869 的 2489 行草稿专用解码。\n- 依赖没落地或要额外安装：#64061 等 DeepGEMM 的 SM90 改动；#65521 需要非 PyPI 的 FlashInfer；#64560 需要含 ROCm/aiter#7171 的 AITER。\n- 证据偏薄：#62309 精度只给截图；#66292 只有命令没有运行数字；#67175 抬 FlashMLA 取 SM90 小头 ETAP 稀疏 prefill、验证一节是空的；#67225 给了一条服务命令但没贴结果；#66973 与 #67035 没有端到端数据。",
   "sig_summaries": {
-    "sig-core": "**并发正确性**是今天最该看的一条：多个渲染 worker 共用一个 HF 快速分词器，带不同 `truncate_prompt_tokens` 的并发请求会被按别人的长度截断，静默影响约 16% 到 17% 的请求（#65932，高风险）；MEAN 池化在批量不变开关下也不可复现（#60035）。\n- **显存与加载**：#66561 把 `max_split_size_mb` 从 20 改成 21，Kimi-K3-REAP 在 8 张 B200 上的加载从约 700 秒降到 96.8 秒、分配器 OOM 重试从约 96.4 万次归零；#66419 让 Transformers 建模后端真正执行 `--cpu-offload-gb`（此前静默无效，多模态塔仍不覆盖）。\n- **接口错误处理**：空 messages 提前拒成 400（#66489）、未知角色改成 ValueError 从而映射成 400（#66848）、run-batch 报出行号（#65029）、SageMaker 端点与对应 v1 接口同错同处理（#66777）、Rust 服务在引擎永久失败时退出（#66773）。\n- **前端与结构**：Rust 无引擎渲染器支持多模态与 LoRA（#65993）；`RoutedScaleMode` 枚举替掉两个布尔参数（#66859）；模型支持面上删掉 TeleChat2/3（#67035）并让 DomynEdge 允许滑窗与全注意力层混排（#66819）。",
+    "sig-core": "- **虚拟输入填错**（#64530）：MRV2 在 `randomize_inputs` 下给接收 `inputs_embeds` 的模型送的是预分配的全零缓冲。全零嵌入时 GLM-5.3-Flash 的 65536 行路由里只有 1 行不同，而 FlashInfer 的 trtllm-gen MoE 调优器按调用方给的 `topk_ids` 重放，等于所有解码尺寸的桶都在同一份负载上调参。改成填入随机 id 对应的嵌入，覆盖自动调优、数据并行虚拟批量、弹性专家并行与 SSM 回放预热。\n- **请求优先级**（#67008）：分离式的 `/inference/v1/generate` 只看请求体的 priority、不读 `X-Vllm-Priority` 头，与耦合接口行为不一致；统一到 `_get_priority`，并把四个接口的取值收进 Rust 前端用的 int32 区间、越界返回 400。\n- **并发正确性**：多个渲染 worker 共用一个分词器，并发请求被按别人的长度截断（#65932，高风险）；MEAN 池化在批量不变下不可复现（#60035）。\n- **显存与加载**：`max_split_size_mb` 从 20 改 21，Kimi-K3-REAP 加载从约 700 秒降到 96.8 秒、OOM 重试从约 96.4 万次归零（#66561）；建模后端遵守 `--cpu-offload-gb`（#66419，多模态塔仍未覆盖）。\n- **接口错误处理**：#66489、#66848、#65029、#66777、#66773；另有 `RoutedScaleMode` 替掉两个布尔参数（#66859）、删除 TeleChat2 与 3（#67035）、DomynEdge 允许滑窗与全注意力层混排（#66819）。",
     "sig-ci": "- **Buildkite 结构**：两个阻塞的 AMD monokernel 步骤改成点名测试文件（#67038），七个同类步骤集中成 Monokernels 测试区域（#67073）；MiniMax-M3 宽专家并行的评测单元把 token 预算收到预fill 2048、解码 64，因为 AITER 的 MXFP8 MoE 内核按 `--max-num-batched-tokens` 定填充缓冲区，默认 131072 行让每步都为整块付费，评测从约 1 小时 37 分降到几分钟（#66646）。\n- **镜像**：Rubin 的 nightly 从 CUDA 13.4 移到 13.5（#65765），构建阶段仍留在 13.4 的 builder，因为 PyTorch 还没有 13.5 产物；文档要求宿主驱动 R620 以上。\n- **测试条件**：XPU 的两处修正是加长提示以跨过 64 token 块边界（#66978）与给需要 lmcache 的用例加跳过标记（#66924，XPU 镜像没装这个可选依赖）。",
-    "sig-model-performance": "- **AMD / ROCm**：稀疏索引器 prefill 跳过续接子块的 K 收集，512K 上下文首 token 延迟降 7%（#63878）；`reshape_and_cache` 超过 512 块时漏写 KV 头，此前会静默读陈旧缓存（#64087）；解码头数补到 AITER 原生档，MI355X 上内核快 1.83 到 2.43 倍（#54899）；W_UK absorb、q 拼接加 FP8 量化、头补齐三次启动合成一个内核，每步查询准备从 947 微秒降到 279（#64560）。\n- **NVIDIA / Hopper**：MegaMoE 三连——FlashInfer SM90 块 FP8（#62603，解码吞吐 +11% 到 +18%）、DeepGEMM SM90 FP8 乘 FP4（#64061，单机高 17% 到 26%）、BF16 未量化权重（#67040，prefill 总吞吐 +40%）；MiniMax-M3 的稀疏注意力补上 SM90 与 SM120/SM121 的 FlashInfer 后端（#66018，prefill 快 2.6 到 5.6 倍）。\n- **跨平台**：批量不变模式的融合 MoE 补上按架构的调优表，此前永远跑同一份固定配置，GB300 上解码吞吐约 +48%（#63627）；Mamba2 的 prefill 可选 FlashInfer 融合扫描（#61501）；消费级 Blackwell 拿到 FlashInfer 的 cudnn BF16 路径（#59025）。\n- **两处数值正确性**：plan 缓冲竞态造成越界读（#64165）、查询非 FP8 时仍传入层上的 FP8 q_scale（#64329）。",
-    "sig-large-scale-serving": "- **LMCache**：实现 `KVCacheAccess.EXPORTS_FD`，让可扩展 KV 缓存以 POSIX 文件描述符导出，`use_vmm_api` 下的 MP 连接器能按层导入（#66674，要求可扩展缓存开启，否则拒绝启动）；连接器把 `shutdown()` 传下去，此前一个 LMCache 线程拖住 EngineCore 直到被强杀（#64324）。\n- **分层卸载的建立成本**：共享 CPU 区域拆成多个文件、调度器侧不再逐页预先触页，512 GiB 那一级从 167 到 175 秒降到 59 秒（#66391）；只声明 DeepSeek V4.1 的 KV 与压缩器状态在张量并行各 rank 上重复，就让既有的主机共享卸载路径生效——8 台 H100 上请求每秒从 0.961 升到 5.785、p95 首 token 延迟从 11.30 秒降到 0.95 秒（#65373）。\n- **传输与并行**：Mooncake 存储把存在性检查失败当错误、不再发一次注定无用的 PUT（#67080）；分离部署代理把流式响应的 `media_type` 一律写成 JSON，导致按 Content-Type 解析的基准工具把首 token 延迟报成端到端总时长（#67150）；流水线并行相邻级计算图补齐行数不同时只传真实行（#66465）。",
-    "sig-spec-decode": "- **DeepSeek-V4.1 / GB300**：DSpark 草稿层接进专用解码执行器（#61869，高风险），批量 1 与 8 的解码步分别短 4.5% 与 3.4%。\n- **Kimi K3.1**：DFlash 直接算出已含打包块跨步的草稿 KV 槽位，于是删掉整层槽位映射转换与后端的一个能力标志，`vllm/` 净 +65/-156（#66604）。\n- **MiniMax M3（ROCm）**：Triton 索引器与稀疏解码加上设备侧变长元数据，是该模型能开自适应验证的前提；CUDA 与 AITER 各路径仍报不支持（#56451）。\n- **GLM-5.3-Flash**：dflash 草稿继承自动选定的 FP8 KV 缓存，TP4、2048 token 草稿窗口、48 并发下每卡少 790 MiB（#66292）。\n- **XPU 与 ROCm**：自适应验证来到 XPU 的 DeepSeek-V4（#62309，精度只给截图）；ROCm 上去掉 DSpark 草稿并不拥有的 `embed_tokens` 与 `lm_head` 占位，启动期每 rank 少约 1.73 GiB（#54820）。",
+    "sig-model-performance": "- **两处启动阻塞与新内核**：`--moe-backend deep_gemm_mega_moe` 在 SM90（H20）上会走进 locality map 初始化并触发 DeepGEMM 的断言，改成只在 SM100 调用 `destroy_localizer()`（#67225）；抬 FlashMLA 的 pin 以取上游 SM90 小查询头（8、16、32 头，`d_qk` 512 与 576）的 ETAP 稀疏 prefill 内核（#67175，验证一节为空）。\n- **AMD / ROCm**：稀疏索引器 prefill 跳过续接子块的 K 收集，512K 上下文首 token 延迟降 7%（#63878）；`reshape_and_cache` 单 token 超过 512 块时漏写 KV 头，此前会静默读陈旧缓存（#64087）；解码头数补到 AITER 原生档，内核快 1.83 到 2.43 倍（#54899）；W_UK absorb、q 拼接加 FP8 量化、头补齐合成一个内核，每步查询准备从 947 微秒降到 279（#64560）。\n- **NVIDIA / Hopper**：MegaMoE 三连——FlashInfer SM90 块 FP8（#62603）、DeepGEMM SM90 FP8 乘 FP4（#64061）、BF16 未量化权重（#67040，prefill 总吞吐 +40%）；MiniMax-M3 稀疏注意力补 SM90 与 SM120/SM121 的 FlashInfer 后端（#66018）。\n- **跨平台**：批量不变的融合 MoE 补上按架构调优表，此前只跑一份固定配置（#63627）；Mamba2 prefill 的 FlashInfer 融合扫描（#61501）；消费级 Blackwell 的 cudnn BF16 路径（#59025）；两处数值正确性问题见 #64165 与 #64329。",
+    "sig-large-scale-serving": "- **前瞻块哈希全面生效**（#65448）：#64096 让块哈希覆盖接下来的 L 个 token，前缀命中因此同时证明块边界处的草稿 KV 可复用，但没声明能力标志的连接器仍退回 L=0 并沿用旧的 EAGLE 尾块丢弃。本条先改掉自己的复用路径仍会丢块的 UMBP 与 HiSparse，再从基类、各处覆写与 MultiConnector 删掉这个检查，并修掉两处忽略大于 1 的哈希前瞻的缓存边界（多模块 MTP）。\n- **异步专家重排**（#64485）：重排计数器原先只在周期开始时清零，周期比 `step_interval` 长时会出现负的「还剩几步」，并在上个周期最后一层提交的那一步就启动下次重排；改成从提交时起算、日志记在途进度，超出时点名最慢的专家并行 rank。\n- **分层 KV 的三处细节**：混合模型在分离式上下文并行下，全注意力块被放大而循环状态块不分片，导致部分尾部卸载整体关闭、且所有分组共用一个物理块索引（#58619 补上守卫与逐分组寻址）；ARC 对在跑请求优先逐出靠前块，使保留的块再也命中不到，改为按 token 位置从尾部逐出，常驻但不可达的块从 252 降到 0、前缀命中 4096 升到 8016（#67098）；必需分组未命中时过期的 pending 让请求白等一轮，改成清掉后直接重算（#67152）。\n- **既有的两条**：树外连接器要能声明自己会注册 KV 显存（#66605）；流水线并行相邻级计算图补齐行数不一致时只传真实行（#66465）。",
+    "sig-spec-decode": "- **Mamba2 / ReplaySSM**（#66318，+990 行）：带投机的 ReplaySSM 此前只有 FlashInfer 后端可用，本条补上 Triton 的验证与实体化内核（变长验证窗口、分页槽位、填充行；一次启动覆盖所有层的前缀快照），并把追踪器生命周期、元数据构建、块拷贝与预热统一改由 `use_replayssm_trackers` 判断；同时加了这个组合在 MI355 上的 LM Eval 作业。\n- **前瞻块哈希**（#65448）：连接器一侧补齐，使前缀命中能连带证明草稿 KV 可复用。\n- **DeepSeek-V4.1 / GB300**：DSpark 草稿层接进专用解码执行器（#61869，高风险），批量 1 与 8 的解码步分别短 4.5% 与 3.4%。\n- **Kimi K3.1**：DFlash 直接算出已含打包块跨步的草稿 KV 槽位，删掉整层槽位映射转换（#66604）。\n- **其他**：MiniMax M3 在 ROCm 上补齐变长稀疏内核以打开自适应验证（#56451）；GLM-5.3-Flash 的 dflash 草稿继承 FP8 KV 缓存、每卡少 790 MiB（#66292）；XPU 上的自适应验证（#62309，精度只给截图）；ROCm 上去掉 DSpark 并不拥有的词表占位模块（#54820）。",
     "sig-quantization": "- **KV 缓存格式（AMD）**：gfx950 上新增逐张量 scale 的 FP8 KV，每 token 512 字节、容量多 12.5%、输出吞吐最高 +7.6%（#66036）；另一条给无旋转位置编码的稀疏 MLA 加 MXFP4 打包，每 token 272 字节、容量 3.76 倍，结果与 bf16 反量化逐位相同（#60321，高风险）。\n- **权重加载**：ModelOpt 的 NVFP4 W4A16 嵌入可加载，只对被查到的行反量化，让此前形状对不上的 Nemotron Bolt 起服务、权重少 0.72 GiB（#64767）；AutoGPTQ 不再把量化方法套在本未量化的路由专家上——Qwen3.5 量化版只有 MTP 草稿层专家仍是 bf16（#49539）；`lut_b_moe` 补进 ROCm 白名单，对应测试自加入起从未通过（#66876）。\n- **激活与量化融合**：Humming 稠密线性层按请求使用 FP8 激活，B300 上解码 GEMM 快 1.4 到 1.9 倍、GSM8K 0.681 到 0.683（#65077）；Nemotron 共享专家的 BF16 ReLU2 与 NVFP4 量化融合，4096 token 时该环节快 1.25 倍、打包值逐位相同（#59384）；MXFP8 线性改用 AITER 调优的 FlyDSL GEMM（#65479）。",
-    "sig-omni": "- **视频输入的预算与缓存**：`get_num_frames_with_most_features` 改成只接收视频数量，此前八个模型会把别的模态占用的 token 从每条视频的帧预算里减掉，导致 GLM-4.1V、Ovis2.5、InternVL、Intern-S1 拒绝放得下 `max_model_len` 的纯视频提示；改后 MiniCPM-V、MiniCPM-o 与 Nemotron Nano VL 失去这部分扣减（#66608）。Unlimited-OCR-2 的多页请求现在逐页进处理器缓存，只按 UUID 重发的请求不再失败（#66638）。\n- **工具结果与渲染协议**：Inkling 渲染器把工具结果压成纯文本，里面带截图就报错、且图片留在历史里让后续每轮都失败（#66891）。`/inference/v1/generate` 允许同时给出已展开的 `features` 与新内容的 `content_parts`，只渲染最后一个范围之后的提示，这是多轮多模态强化学习需要的组合（#57796）。",
+    "sig-omni": "- **预计算嵌入与编码器计算图冲突**（#65535）：同时开 `enable_mm_embeds` 与 `cudagraph_mm_encoder` 时，一条带预计算图像或视频嵌入的请求就把引擎打崩——这类批量没有像素可喂给计算图，条目挑选越过了它自己的假设。改成走 eager，像素输入仍重放计算图；在 L40S 上撤掉修复后新测试死在图像嵌入那一步。\n- **视频输入的预算与缓存**：`get_num_frames_with_most_features` 改成只接收视频数量，此前八个模型会把别的模态占用的 token 从每条视频的帧预算里减掉，导致 GLM-4.1V、Ovis2.5、InternVL、Intern-S1 拒绝放得下 `max_model_len` 的纯视频提示（#66608）；Unlimited-OCR-2 的多页请求现在逐页进处理器缓存（#66638）。\n- **渲染协议**：Inkling 把工具结果压成纯文本，里面带截图会报错且图片留在历史里让后续每轮都失败（#66891）；`/inference/v1/generate` 允许已展开的 `features` 与新内容 `content_parts` 同时给（#57796），是多轮多模态强化学习需要的组合。",
     "other": "- **AMD 单卡验证的 recipe**：JEV-27B-VL 开 AITER 后 48 个 GDN 层走 FlyDSL、16 个全注意力层走 ROCM_AITER_FA，单卡装下 51.5 GiB 权重（#66625）；Ripple-65B-Preview 的默认变体改成 BF16，因为 NVFP4 在 ROCm 上只能走模拟内核、比 BF16 慢，同时把上下文降到 1048576（2M 时草稿 KV 放不下）（#66721）；Ming-3.0-asr-tiny 用 nightly 镜像，因为 latest 里还没有这个模型（#66689）。\n- **外部基准预设**：MiniMax-M3.1-Flash 的 GB300 Dynamo AgentX 预设从第 4631 号赛道同步到第 4998 号，两档都设 `--stream-interval 20`（赛道要求 20 到 60、vLLM 默认 1）（#67184）。"
   },
   "commits": [
+    {
+      "sha": "e509ffb94361c36cbecf02801225089253fc0d49",
+      "comment": "**背景**：Mamba2 的 ReplaySSM（把状态缓存在环形缓冲里、按步回放以免重复写大状态）配投机解码时只有 FlashInfer 后端能用，也就是只有 CUDA 的支持。**方法**：补 Triton 的验证与实体化内核，遵循同一套环形缓冲约定，这样由 runner 持有的 ReplaySSM 追踪器可以同时驱动两种后端。新增 `selective_state_update_replayssm_spec`（变长验证窗口、分页槽位、填充行）与 `replayssm_materialize`（一次启动覆盖所有层，用于对齐模式的前缀快照）。配置上引入 `VllmConfig.use_replayssm_trackers`，V1 与 V2 运行器的追踪器生命周期、元数据构建、块拷贝与预热都改用它作判断，而不是原来的 `use_flashinfer_replayssm`；FlashInfer 专有的部分（scratch、自动调优、bf16 对齐检查、16 行上限）不动。**效果**：+990/-113、23 个文件，含内核与元数据测试、LM Eval 的 MI355 镜像作业（带 MTP）以及自动前缀缓存文档。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "让 Mamba2 的 ReplaySSM 在投机解码下也能走 Triton 后端，属草稿验证路径能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "replayssm",
+        "mamba2",
+        "spec-decode",
+        "triton"
+      ],
+      "pr_number": 66318
+    },
+    {
+      "sha": "f0787a9ab838d1df96300c517bf109ef140b4598",
+      "comment": "**背景**：#64096 让块哈希覆盖接下来的 `num_hash_lookahead_tokens` 个 token（记为 L），这样前缀命中同时能证明块边界处的草稿 KV 也可以复用，但只对 EAGLE、EAGLE3 与 MTP 生效；没有声明 `supports_lookahead_block_hashes` 的连接器仍退回 L=0 并沿用旧的 EAGLE 尾块丢弃。**方法**：把这次迁移收尾。先改掉自己的复用路径仍会丢块的两个连接器（UMBP 与 HiSparse），再从基类、各处覆写以及 MultiConnector 上删掉这个能力检查，让前瞻哈希对所有连接器一致生效——核心此前从没问过连接器是否支持丢弃、它自己在本地命中上丢弃，各连接器也自行处理复用。另有一个提交修掉两处缓存边界忽略大于 1 的哈希前瞻（多模块 MTP）。**效果**：+443/-74、21 个文件，覆盖 KV 缓存工具与前缀缓存、分层与连接器多组测试，基类与工厂接口同步调整。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "让所有 KV 连接器统一支持前瞻块哈希，属分层缓存与投机解码协作。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-connector",
+        "lookahead-block-hashes",
+        "spec-decode"
+      ],
+      "pr_number": 65448
+    },
+    {
+      "sha": "031725855711e4160d9920ef5074f451c3bb4e91",
+      "comment": "**背景**：开 `randomize_inputs` 时，MRV2（新版模型运行器）的虚拟运行会随机化 `input_ids`（#58411），但接收 `inputs_embeds` 的模型拿到的是预分配好的全零嵌入缓冲，等于这些模型的虚拟运行看到的全是零向量（V1 自 #30472 起就填随机 token 的嵌入）。**方法**：在设定 `randomize_inputs` 的虚拟运行里，把随机 id 对应的嵌入填进那块缓冲，覆盖 FlashInfer 自动调优、`VLLM_RANDOMIZE_DP_DUMMY_INPUTS` 的性能分析与数据并行虚拟批量、弹性专家并行以及 SSM 回放预热。**效果**：+69/-8、4 个文件（模型运行器、默认与接口两份模型状态、MRV2 测试）。对 MoE 的影响最直接：全零嵌入时 GLM-5.3-Flash 的 65536 行里只有 1 行 top-8 是不同的，即每层所有 token 路由到同一批专家；而 FlashInfer 的 trtllm-gen MoE 调优器在数据并行加专家并行下会按调用方给的 `topk_ids` 重放，于是所有解码尺寸的桶都在这一份负载上调参、挑中大 tile 配置。",
+      "sig": "sig-core",
+      "sig_reason": "修的是模型运行器虚拟输入构造错误，进而影响内核调参与性能分析。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner-v2",
+        "dummy-inputs",
+        "autotune"
+      ],
+      "pr_number": 64530
+    },
+    {
+      "sha": "02ed6dc75a0bcf4a0d9ff2824f223e0fb7031420",
+      "comment": "**背景**：分离式（scale-out）服务里，`/inference/v1/generate` 对带 `X-Vllm-Priority: -10` 头的请求按请求体里的优先级调度、且不报错，而耦合的 `/v1/completions` 是让头覆盖请求体；`ServingTokens.serve_tokens` 只把 `request.priority` 传给引擎，从不读这个头（#67007）。**方法**：改用 `GenerateBaseServing._get_priority` 解析优先级，与耦合的 Completions、Chat Completions、Responses 三个 API 一致；按评审要求把这四个 API 的头与请求体 `priority` 统一收到 Rust 前端使用的 int32 区间（负的 2 的 31 次方到 2 的 31 次方减 1），超出范围返回 400。**效果**：+143/-14、10 个文件（生成基类与三个 OpenAI 接口的协议与服务实现、两份文档、分离式 token 服务测试）。在启用优先级调度的引擎上，带 `-10` 头的 generate 请求现在会排在队列中优先级 0 的请求之前，行为与耦合的 completions 相同；头与请求体同时给时以头为准。",
+      "sig": "sig-core",
+      "sig_reason": "统一的是接口对请求优先级来源的解析规则，属 API 行为一致性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "priority-scheduling",
+        "scale-out",
+        "api"
+      ],
+      "pr_number": 67008
+    },
+    {
+      "sha": "3f96f6b923a0f1e5671b026a8ab75465c49838fb",
+      "comment": "**背景**：SM90 上小查询头数的稀疏 prefill 走不到 FlashMLA 的 ETAP 路径。**方法**：把 FlashMLA 的 pin 从 847ef308 抬到 b18ed744，引入上游 FlashMLA#37 的 SM90 小头 ETAP 稀疏 prefill 内核，通过更新依赖 pin 让它接进现有的 CUDA 翻译单元。**效果**：+1/-1、1 个 cmake 文件，覆盖 8、16、32 个查询头且支持 `d_qk` 为 512 与 576 的情形。PR 正文的 Validation 与 Details 两节是空的，只有未勾选的清单模板，没有给出提速数字。",
+      "sig": "sig-model-performance",
+      "sig_reason": "抬依赖版本以取上游新的稀疏 prefill 内核能力，收益在内核侧。",
+      "tags": [
+        "dependency-bump",
+        "low-risk",
+        "flashmla",
+        "sm90",
+        "sparse-prefill"
+      ],
+      "pr_number": 67175
+    },
+    {
+      "sha": "fa211f2de248ae79e22cee83712a0d12ee7ffc43",
+      "comment": "**背景**：异步专家负载再平衡（EPLB）只在开始一个周期时清零重排计数器。于是一个周期若比 `step_interval` 还长，日志里会出现负的「距离下次重排还有多少步」，并且下一次重排会在上一个周期的最后一层提交的那一步里就启动，背靠背连着跑。**方法**：把间隔改为从最后一层提交时起算，日志改成记录在途进度而不是剩余步数。周期超出时，用告警点名最慢的专家并行 rank；若是各 rank 在传输里互相等待，则把涉及的 rank 全部列出。**效果**：+219/-19、4 个文件（并行配置、异步 worker、eplb 状态与工具测试）。在 `step_interval` 不小于 `window_size`（默认 3000 与 1000）时，下次重排用到的每一行负载窗口都是在提交之后记录下来的，不论该周期跑了多久；在 main 上，周期长度超过 `step_interval - window_size` 就会让窗口数据落到错误的专家上。相关背景见 #57883（会显示负数计数的停滞）、#60685 与 #60686（负载窗口记错专家）、#57905。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "异步专家重排的调度间隔与统计窗口归属，属专家并行的运行机制。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "eplb",
+        "expert-parallel",
+        "async-rearrangement"
+      ],
+      "pr_number": 64485
+    },
+    {
+      "sha": "d0c2036061e3d00a2c333093362b6e8cc2a24d34",
+      "comment": "**背景**：在 H20（SM90）上用 `--moe-backend deep_gemm_mega_moe` 启动会失败：初始化走进了 locality map 的构造路径，DeepGEMM 那边的断言 `tpcs.size(0) % 2 == 0` 不成立。**方法**：只在 SM100 上调用 `destroy_localizer()`，SM90 跳过这段清理；SM100 上原有的 localizer 清理行为保持不变。**效果**：+3/-1、1 个文件（DeepGEMM MegaMoE 实现）。这是一条让 Hopper 能用上 MegaMoE 后端的启动阻塞修复；作者给出的验证是一条完整的 DeepSeek-V4.1-Flash 服务命令（TP2 乘数据并行 2、专家并行、dspark 自适应验证、instanttensor 加载），正文没有贴运行结果，并带上 DeepGEMM 侧关于 MLOPart 的用户警告信息。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修的是 MegaMoE 后端在特定架构上的初始化失败，属 MoE 内核路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "megamoe",
+        "deepgemm",
+        "sm90"
+      ],
+      "pr_number": 67225
+    },
+    {
+      "sha": "b4b0b96fffb62bf4f86287c91c3e2c4d2503895f",
+      "comment": "**背景**：同时开启 `enable_mm_embeds`（允许客户端直接给处理好的多模态嵌入）与 `cudagraph_mm_encoder`（多模态编码器用计算图）时，一条带预计算图像或视频嵌入的请求会把引擎打崩（#65531）。**方法**：把带嵌入的批量改走 eager 路径——这些请求没有像素可喂给图，`select_encoder_cudagraph_items` 在挑图要重放的条目时越过了它自己的假设；像素输入仍然照常重放计算图，不带某个模态嵌入键的批量完全不变。**效果**：+110/-1、5 个文件（编码器计算图实现、GPU 侧 encoder runner，以及 Qwen2-VL、编码器计算图与 encoder runner 三组测试）。验证在单张 L40S（48 GB）、torch 2.14.0+cu130、FlashInfer 0.7.3、main 的 83630ab85 上进行，作者说明由于 #63373 已删掉 V1 运行器，这些结果都来自 V2；把修复撤回去后新加的 GPU 测试会在图像嵌入那一步失败，视频嵌入的调用甚至执行不到。",
+      "sig": "sig-omni",
+      "sig_reason": "修的是多模态预计算嵌入与编码器计算图冲突导致的引擎崩溃。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "mm-embeds",
+        "encoder-cudagraph",
+        "qwen2-vl"
+      ],
+      "pr_number": 65535
+    },
+    {
+      "sha": "8a36f080e2a28a91137d86ef503eab6e37d0a9d4",
+      "comment": "**背景**：卸载连接器的部分尾部（partial-tail）存储要求 `supports_partial_tail` 同时满足只有一种分组块大小且 `decode_context_parallel_size` 等于 1。在分离式上下文并行（DCP）下，全注意力组的卸载块是注意力块的 dcp 倍，而循环状态块不分片（DCP 8 时是 12288 对 1536：注意力组在 `build_offloading_config` 与 `resolve_dcp_kv_block_size` 里被放大，`MambaManager.__init__` 又把循环状态的缩放还原），于是这两个条件都不成立，混合模型在 DCP 下整个特性被关闭。存储路径还有个问题：所有分组共用一个物理块索引（`boundary // self._partial_tail_block_size`），块大小不同之后就定位错，而且块大小是从 `kv_group_configs[0]` 读的，那一项并不一定是全注意力组。**方法**：这是 #57216 按 @orozery 评审拆出的第二部分（两分之二），加上 DCP 的存储守卫与逐分组寻址，并把其中的 -1 情况收进来、复用 `alignment_tokens`。**效果**：+427/-31、3 个文件（卸载连接器调度器、其单元测试与卸载用法文档），混合模型在 DCP 下也能用上部分尾部卸载。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "解决混合注意力模型在上下文并行下的分层 KV 存储寻址与门控。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "dcp",
+        "hybrid-models",
+        "partial-tail"
+      ],
+      "pr_number": 58619
+    },
+    {
+      "sha": "19812fa0be0ae219004e25c25ed10126a07a8bb5",
+      "comment": "**背景**：CPU 卸载层用 ARC 策略时，仍在运行的请求它靠前的块会被优先逐出，而留下的块反而命中不了——查询要求从第 0 个块起连续的前缀。#61050 已经为 LRU 修过同样的问题，ARC 漏掉了。**方法**：让 ARC 也像 LRU 一样，对在跑请求的块按 token 位置从尾部开始逐出。**效果**：+237/-8、2 个文件（ARC 策略与 CPU 管理器测试）。在复现场景里，常驻但无法命中的块从 252 降到 0，重放时的前缀命中从 4096 个 token 升到 8016 个，与 LRU 持平。已有的 `test_unfinished_lru_prefix_survives_pressure_across_store_batches` 在 main 上以 `cache_policy=\"arc\"` 跑时 6 组参数全失败；现在它与 `test_unfinished_backfill_orders_by_token_position` 对两种策略都跑，另外新增 5 个 ARC 用例，main 上失败的 11 个 ARC 用例全部通过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "分层缓存的逐出策略顺序决定前缀能否命中，属缓存管理正确性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "arc",
+        "eviction-order"
+      ],
+      "pr_number": 67098
+    },
+    {
+      "sha": "82915781df4a163de021d3f2fc329a10c0215b42",
+      "comment": "**背景**：部分尾部的边界需要多个分组的 KV 时，只要某个必需分组返回未命中，这个边界就不可用。但查询会把早前某个分组观察到的 pending 结果保留下来；如果没有别的边界能命中、也没有别的 pending 状态要求等待，这条过期的 pending 会让请求再多等一个调度轮次，而不是直接去重算缺失的前缀。**方法**：在被拒绝的边界上因未命中而清掉 pending；其他可用边界的 pending 状态与所有在途的卸载工作保持不变。**效果**：+27/-3、2 个文件（卸载连接器调度器与其单元测试）。回归覆盖先 `RETRY` 或 `HIT_PENDING`、随后 `HIT` 与 `MISS` 两种走向：基线 2 failed、31 passed，修复后 33 passed；该测试文件里所有标成 CPU 的用例也一并跑过。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题在分层 KV 查询里过期 pending 状态导致的无谓等待。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-offload",
+        "partial-tail",
+        "pending-state"
+      ],
+      "pr_number": 67152
+    },
     {
       "sha": "b6f417fcd1c291b0cbb013579e7c697ace4e4e0a",
       "comment": "**背景**：`get_num_frames_with_most_features(seq_len, mm_counts)` 接收的是所有模态的计数，八个模型用它把别的模态占掉的 token 从每条视频的帧预算里减掉。可逐条预算是一次只看一条内容的，于是 GLM-4.1V/4.5V、Ovis2.5、InternVL、Intern-S1 会拒绝一条只含视频、其实完全放得进 `max_model_len` 的提示，报超出预分配的编码器缓存大小。**方法**：按评审建议把这个方法改成只接收视频数量，即 `get_num_frames_with_most_features(seq_len, num_videos)`，从此任何模型都无法再从视频预算里减别的模态。**效果**：+154/-131、25 个文件，19 处定义与全部调用点同步改。逐条视频预算现在与 GLM-4.1V/4.5V、Ovis2.5、InternVL、Intern-S1 做性能分析时用的视频虚拟输入一致，与 ERNIE-4.5-VL 的纯视频预算一致；MiniCPM-V、MiniCPM-o（原先还减音频）与 Nemotron Nano VL 失去这部分扣减，属于行为变化，测试覆盖也相应改了这四类模型的处理用例。",
