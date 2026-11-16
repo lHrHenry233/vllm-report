@@ -1,0 +1,350 @@
+{
+  "date": "2026-11-15",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-16T12:42:15+08:00",
+  "daily_summary": "## 今日概览\n24 条提交。当天最集中在 AMD：DeepSeek-V4.1 的 MXFP8 稠密 GEMM 与 mHC seam 换到 AITER 调优实现，int64 行偏移修掉张量并行 8 的启动崩溃，流水线并行阶段交接改用 SDMA 拷贝引擎。另一条线是 Transformers 5.23 与 Qwen2 迁移留下的连锁问题（XPU 的 MXFP8 linear、gte-Qwen2 测试、导入即初始化 CUDA）。CI 7 条，几乎都在修 nightly 与 L4 分片。\n\n## 今日重点\n\n### AMD / ROCm\n- **DeepSeek-V4.1**：数据并行 8 注意力加专家并行 8（张量并行 1 的稠密 linear）在 8 张 MI355X 上原来把 32x32 分块 MXFP8 linear 跑在没有张量并行 1 调优的 Triton block32 GEMM 上，只到峰值的 21-31%；改跑 AITER 的 FlyDSL GEMM 并按 M 查表后，prefill 每步 189.8 → 106.7 ms、decode 4544 → 2822 微秒，端到端 26,714 tok/s/GPU（上一版相对 main +11.1%）（#67377）。K-cache gather kernel 的 int32 行偏移在超过 2^31 元素时把行写到 workspace 外约 4 GiB，导致自适应 DSpark 验证下张量并行 8 三次启动三次崩溃，改 int64 修掉（#65926）。融合 delayed mHC seam 从 AITER 的两启动 Triton 换成 HIP Mega-MHC 单启动，单个 seam 省 16-41%，摊到并发 256 的解码步只剩约 1%，服务 A/B 在噪声内（#65992）。\n- **流水线并行**：加 --pp-sdma-handoff，把每步中间张量的交接从发送方 CU 上的 blit kernel 改到两个 SDMA 拷贝引擎（接收方分配 3 个 slot 经 CUDA IPC 共享）。此前一个 8192^3 的 bf16 GEMM 在拷 201 MiB 张量时慢 5.1 倍。默认关闭，仅限 MI355X 上单机、张量并行 1、流水线并行 2、eager（#65658）。\n\n### 跨平台 / 引擎通用\n- **Transformers 迁移连锁**：XPU 的 MXFP8 linear 只接受 2 维输入，后端传 3 维激活会让引擎初始化报 Expected output_s.dim() == 2，改成展平再还原（#66494）；gte-Qwen2 的 remote 代码没有 vllm 注意力实现，测试改用内置 Qwen2 类加载（#67716）；导入 vllm.models.muse_spark 的任何子模块都会连带导入 NVIDIA 模型、触发 FlashInfer 在导入时初始化 CUDA，改成惰性解析，这也是一直偶发的 Cannot re-initialize CUDA in forked subprocess 的根因（#67691）。\n- **并行与通信**：--moe-backend deep_gemm 的 DeepGEMM 与 Triton 两个专家类放开 FlashInfer NVLink 单边/双边 all2all，并修掉此前让这些组合失败的双边专家 id 缺陷（此前那条 IMA 注释找不到任何 issue 或复现）（#67592）；模型运行器 V2 上双批次重叠扩展到纯张量并行，超过阈值的步骤切成两个微批、all-reduce 跑在通信流上（#63483）。\n- **Rust 前端**：/inference/v1/generate 支持 n > 1，提示与媒体只准备一次、以 n 个子请求扇出，子 id 与种子推进与 Python 的 ParentRequest 一致（#66878）；llm-multimodal 版本升级并适配 Muse Spark 与 Step3-VL 的 processor（#67670）。\n- **基准与启动边界**：--load-format dummy 的 FP8 权重改为在全范围取随机有限码，此前 ±1 让 GB200 上的大 prefill 步骤比真实权重快最多 11%（#67693）；_dummy_run 把 dummy 批次约束在 num_reqs * max_model_len 之内，修掉 warmup 越界读块表造成的启动崩溃（#67545）；slot mapping 行距补到 16 个元素，使 --max-num-batched-tokens 可取任意值（#66401）。\n- **KV 卸载**：fs tier 的 store 作业只上报真正写过的块，避免「很大且瞬间完成」的假写入污染背压 EMA（#63524）。\n\n### Intel XPU\n除上面的 MXFP8 linear 输入维度外，把 FLASH_ATTN_MLA 枚举注册到 XPUFlashAttnMLABackend——此前测试在 XPU 上解析到 CUDA 实现并失败，注册后 627 passed（#64255）。\n\n### 多模态\n- 编码器缓存容量做成独立配置 --encoder-cache-size：max_encoder_input_tokens 是每步计算预算，encoder_cache_size 是跨请求常驻的容量，此前两者绑死，文档解析这类对同一张图发两条请求的场景超过上限就要整图重编码（#65534）。\n- 音频的时长与解码字节上限把 0 当成硬顶，与文档「设 0 关闭」相反，现在三个后端一致地把 0 视为关闭，请求级字节预算仍生效（#67611）。\n\n## 需要关注\n- #67693 改变 dummy 权重的取值分布，任何依赖 ±1 小数值做逐 token 比对的测试都要显式收紧范围（#67753 就是这么修的），dummy 权重基准的绝对数字也会随之变化。\n- #67592 放开了此前被标注为会触发非法内存访问、但查不到复现的 MoE 与 all2all 组合，遇到异常时值得回到该组合排查。\n- #65658 的 --pp-sdma-handoff 与 #63483 的纯张量并行 DBO 都有严格适用条件（前者限 MI355X、单机、TP1×PP2、eager），条件不满足时 worker 在初始化阶段直接报错。\n",
+  "sig_summaries": {
+    "sig-core": "6 条，围绕 dummy 执行与导入行为。\n- **dummy 与启动边界**：--load-format dummy 的 FP8 权重改为全范围随机有限码，让计算受限步骤的 dummy 计时贴近真实权重（#67693）；_dummy_run 把批次约束在 num_reqs * max_model_len 内，修掉 warmup 越界读块表导致的启动崩溃（#67545）；slot mapping 行距补到 16 个元素，DeepSeek-V4 的 --max-num-batched-tokens 不再要求 8 的倍数（#66401）。\n- **导入与依赖**：vllm.models.muse_spark 改成惰性解析模型类，导入子模块不再初始化 CUDA（#67691）；Rust 侧 llm-multimodal 升级并适配 Muse Spark 与 Step3-VL 的 processor（#67670）。\n- **前端接口**：/inference/v1/generate 支持 n > 1，复用 OpenAI 路由已有的并行采样路径，提示与媒体只准备一次（#66878）。\n",
+    "sig-ci": "7 条，全部是 nightly 与分片红灯。\n- **Transformers 迁移造成**：gte-Qwen2 的 remote 代码没有 vllm 注意力实现，测试改为 trust_remote_code=False（#67716）；dummy FP8 权重全范围填充让 HiSparse 的 5 个 e2e 用例在并不逐位等价的通路间比较贪心 token 时随机翻转，测试内把 8 位浮点参数收回 ±1（#67753）；#63106 新增的 pipeline_relay 未出现在手工构造的测试桩里，补一个 None（#67636）。\n- **资源与竞态**：multi_process_parallel 的 Ray 集群改为按 rank 数给 CPU，避免按主机 224 个 CPU 起空闲 worker 把下一个测试的 head node 饿到 GCS 超时（#67391）；P2P 生命周期 e2e 测试的 ZMQ 控制端口保留到 tier 真正 bind 之后再放，消除 Address already in use（#67607）。\n- **确定性**：derender 一致性测试在夹具里打开 VLLM_BATCH_INVARIANT，固定种子与 top_k=1 挡不住批量相关的 BF16 分数变化（#67742）；NIXL EP 导入测试去掉上游已删除的 Config（#67574）。\n",
+    "sig-model-performance": "4 条，AMD 三条、Intel 一条。\n- **DeepSeek-V4.1 / MI355X**：稠密 MXFP8 linear 与 grouped wo_a BMM 改跑 AITER 调优的 FlyDSL GEMM，按 M 查表选择，并把 MXFP8 激活量化做成约 2 倍快、输出逐位相同，prefill 每步 1.78 倍、decode 1.61 倍，端到端相对 main 约 +11%（#67377）；融合 delayed mHC seam 换成 AITER 的 HIP Mega-MHC 单启动，每 seam 省 16-41%，但占解码步约 1%，服务 A/B 在噪声内（#65992）；K-cache gather kernel 的行偏移改 int64，修掉超过 2^31 元素时写到 workspace 外约 4 GiB 造成的张量并行 8 启动崩溃（#65926）。\n- **XPU**：把 FLASH_ATTN_MLA 枚举注册到 XPUFlashAttnMLABackend，此前该后端在 XPU 上解析到 CUDA 实现，注册后 test_mla_backends.py 627 passed（#64255）。\n",
+    "sig-large-scale-serving": "4 条，都是并行执行与 KV 传输的组合放开。\n- **专家并行**：--moe-backend deep_gemm 落到 TritonOrDeepGemmExperts，它要求 DeepGEMM 与 Triton 两个专家类都接受并行配置，而两者都拒绝 FlashInfer NVLink 单边/双边 all2all；本 PR 放开并修掉双边专家 id 缺陷（#67592）。\n- **通信与计算重叠**：模型运行器 V2 上双批次重叠支持纯张量并行（无 DP/EP），超过 --dbo-prefill-token-threshold 的步骤切两个微批、TP all-reduce 变成通信流上的微批交接；ROCm 侧通信流设高优先级并预热 hipBLASLt handle（#63483）。\n- **流水线交接**：ROCm 上加 --pp-sdma-handoff，用两个 SDMA 拷贝引擎替代占用 CU 的 blit kernel，接收方 3 个 slot 经 CUDA IPC 共享（#65658）。\n- **分层卸载**：fs tier 的 store 作业只上报真正写过的块，整批已在盘上时报 0，背压检测器据此跳过（#63524）。\n",
+    "sig-omni": "2 条。\n- **编码器缓存容量**：SchedulerConfig.encoder_cache_size 过去只能从 max_num_batched_tokens 推导，本 PR 加 --encoder-cache-size（不设时行为不变）。两者是不同量：每步计算预算与跨请求常驻容量，后者决定同一张图的后续请求能否跳过编码器；此前跨请求复用被限制在 max_num_batched_tokens / tokens_per_item 个条目（#65534）。\n- **音频解码上限**：VLLM_MAX_AUDIO_DECODE_DURATION_S 与 VLLM_MAX_AUDIO_DECODE_BYTES 设 0 现在在 SoundFile、PyAV、TorchCodec 上一致地表示关闭该限制，与 docs/usage/security.md 的承诺相符，请求级 VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES 仍然生效（#67611）。\n",
+    "sig-quantization": "1 条。\n- **XPU MXFP8 linear**：Transformers 建模后端给 linear 层传 3 维激活，而 XPU 上的 per_token_group_fp8_quant 只接受 2 维，引擎初始化报 Expected output_s.dim() == 2；本 PR 先展平成 2 维、输出再还原前面的维度，与其他 MXFP8 kernel 一致，修复 XPU 上的 test_mxfp8_generation[moe_transformers]（#66494）。\n"
+  },
+  "commits": [
+    {
+      "sha": "dadf740edf4e5339afcfc6ae39df6a6a9dbf1548",
+      "comment": "DeepSeek-V4.1 的 K-cache gather kernel 用 int32 计算每个输出行的偏移，一个 prefill gather 分块超过 2^31 个元素之后，行会被写到 workspace 外约 4 GiB 的位置。MI355X 上这会让带 DSpark 自适应验证的 DeepSeek-V4.1 在张量并行 8 启动时直接崩溃（三次里三次失败）。本 PR 把偏移改成 int64 计算，覆盖 cache_utils.py 里的 fp8、fp8 one-pass 与 MXFP8 三个 gather kernel。NVIDIA 预期不受影响：CUDA 上 fp8/MXFP8 走 CuteDSL 的 gather（NVFP4 本来就是 int64），这些 kernel 在那里只是回退路径，2^31 以下的偏移不变。新增的 kernel 测试写入超过 2^31 个输出元素的行，没有该修复时失败。修复 #65925。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修 AMD 上 DeepSeek-V4.1 gather kernel 的行偏移位宽，避免越界写导致启动崩溃。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "deepseek-v41",
+        "int64-index"
+      ],
+      "pr_number": 65926
+    },
+    {
+      "sha": "9fbe012bd78bc46471013541e04bb9f0cfc84b80",
+      "comment": "gfx950 上 DeepSeek-V4.1 的融合 delayed mHC seam 原来跑 AITER 的两启动 Triton 实现（#58655），本 PR 换成 AITER 的 HIP Mega-MHC 单启动（ROCm/aiter#6520，自 AITER v0.1.27 起可用，main 现钉 v0.1.29）。覆盖范围包括今天 Triton seam 服务的所有 seam，也包含 #59802 放到侧流上执行的那批 gate。microbenchmark 上每个 seam 省 16-41%；但这个量级摊到关键路径就很小：profiled serving 窗口里约占并发 256 一个解码步的 1%、4096 token prefill 步的 1.6-1.9%，每臂 3 次重复的服务 A/B（并发 1 到 256、解码与 prefill 为主两类）都落在运行间噪声内。相关：#58655 加入 Triton seam、#59802 让 gate 与注意力 FFN 重叠、#60153 是一个给 gfx942 加 seam 的草稿；FlyDSL 版 Mega-mHC 在 ROCm/aiter#6179。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把 mHC seam 合并成一次 AITER HIP 启动，降低每步 kernel 开销。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "mhc",
+        "kernel-fusion"
+      ],
+      "pr_number": 65992
+    },
+    {
+      "sha": "8657860cd37d2ba777851b5fe4e026828ded402f",
+      "comment": "--moe-backend deep_gemm 映射到 TritonOrDeepGemmExperts 这个回退用的专家类，它要求 DeepGemmExperts 与 TritonExperts 都接受当前并行配置，而两者都拒绝 FlashInfer NVLink 的单边与双边 all2all。DeepGEMM 那条限制带着一条注释：发现该组合有 IMA（非法内存访问），需要排查（#32567 加入）；Triton 那条没有说明。作者没有找到对应的 issue 或复现。本 PR 放开两个类使用单边与双边 kernel，并修掉此前让这些组合失败的双边专家 id 缺陷。测试计划：GLM-5.3 FP8 在 2x4 GB300 上做 DEP8、flashinfer_nvlink_one_sided、同步 pynccl 的 EPLB（16 个冗余专家）、--max-num-batched-tokens 448、64 组，跑约 30k 入 / 6k 出、24 轮的 agentic rollout 基准，并做 KV cache 灌满前后的 GSM8K（123 题贪心）对比。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "放开 DeepGEMM 与 Triton 的 block-FP8 MoE 与 NVLink all2all 的组合，属专家并行通信配置。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "moe",
+        "all2all",
+        "expert-parallel"
+      ],
+      "pr_number": 67592
+    },
+    {
+      "sha": "261042baa696a1412816508e6189587606bc64a7",
+      "comment": "SchedulerConfig.encoder_cache_size 一直是从 max_num_batched_tokens 推出来的、Field(init=False)，并带着一条「做成可配置」的 TODO；本 PR 加 --encoder-cache-size，不设时保持现有推导、行为不变。两者是不同的量：max_encoder_input_tokens 是每步的计算预算，encoder_cache_size 是让编码器输出跨请求常驻的容量，决定后续同一张图的请求能否跳过编码器（EncoderCacheManager.check_and_update_cache）。代价是跨请求复用目前被限制在 max_num_batched_tokens / tokens_per_item 个条目、无法单独抬高；生产里的文档解析对同一张图发两条请求，超过这个上限第二条就要整图重编码。新设置还要求修 profile：get_encoder_budget() 取 min(compute, cache)，它决定构造多少 dummy 条目。",
+      "sig": "sig-omni",
+      "sig_reason": "把编码器输出缓存容量做成独立配置，影响跨请求的多模态编码器复用。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "encoder-cache",
+        "scheduler",
+        "config"
+      ],
+      "pr_number": 65534
+    },
+    {
+      "sha": "1489434bd56a33c068b946eca3a24804e28859b8",
+      "comment": "#67693 让 dummy loader 用整个 FP8 范围内的随机码填充 8 位浮点参数，数值放大约 130 倍。此后 :nvidia: (H200 MIG 18GB) E2E Core 分片 1/2 从构建 102833 起每个 main 构建都失败，test_hisparse.py 的 5 个用例全挂，例如 test_hisparse_terminal_prefix_reuse 断言 [113452] == [88396]。这些用例跑一个缩小版 DeepSeek-V3.2，在并不逐位等价的通路之间比较贪心 token：冷启动对恢复的前缀缓存、批式对单条、两个引擎之间。权重放大后 dummy 模型的 logits 接近平手，kernel 级噪声就能翻转 token，连冷通路的结果在不同构建之间都不一致（#67693 自己的构建 102832 也是这样失败）。本 PR 在该测试文件里加一个 autouse fixture，对 8 位浮点参数传 low=-1、high=1，即 loader 文档里写明的那条退出全范围填充的开关。只改测试。",
+      "sig": "sig-ci",
+      "sig_reason": "只把 e2e 测试的随机权重范围收紧，消除与实现无关的贪心 token 翻转。",
+      "tags": [
+        "test",
+        "low-risk",
+        "hisparse",
+        "dummy-weights",
+        "flaky"
+      ],
+      "pr_number": 67753
+    },
+    {
+      "sha": "ca8952a9bf3ee6dcbc4a2eec432f37a451524e1f",
+      "comment": "tests/v1/kv_offload/tiering/test_p2p_lifecycle_e2e.py 在 :amd: (MI355 DPX) V1 KV Offload 作业里偶发 ZMQError: Address already in use。原因是测试夹具提前释放了自己预留的 ZMQ 控制端口，引擎随后 bind 时那个端口已被别的东西占用（构建 102329 是 consumer 在 127.0.0.1:59279 上 bind 失败，101771 是 spawn 出的 producer bind 43813 失败、随后 180 秒 _queue.Empty）。本 PR 让每个端口从夹具 setup 一直保留到 teardown，即 tier 真正 bind 之后再放。不改生产代码、超时或检查逻辑。在 MI355X 上用 flock 加一个轮换 8000 个临时 loopback 监听者的干扰进程验证：改动前 3 次跑 3 次失败，改动后通过。",
+      "sig": "sig-ci",
+      "sig_reason": "只修测试夹具的端口预留时机，消除 AMD 分片的偶发地址冲突。",
+      "tags": [
+        "test",
+        "low-risk",
+        "kv-offload",
+        "port-race",
+        "zmq"
+      ],
+      "pr_number": 67607
+    },
+    {
+      "sha": "5039f736e612ae637099eba3fa645031d416ef53",
+      "comment": "derender 一致性测试要在相互独立的 couple 与 inline 两种生成之间逐 token 比较，这需要批量不变性：固定种子加 top_k=1 并不能阻止批量相关的 BF16 分数变化翻转 token。main CI 102812 与 #65534 的 PR CI 102838 上都观察到该问题。本 PR 在 derender parity 的 server fixture 里设 VLLM_BATCH_INVARIANT=1，保留两个 n=2 参数化与全部现有断言，作用域只在测试夹具内。GB200 上的 FA2 负载复现显示默认模式 4 对里 4 对不一致、批量不变模式 4 对全一致（用叠加的 Python 源码与镜像自带编译扩展，非完全等同 CI 环境）。作者注明 H200 用例与整个模块尚未用该补丁验证，因此保持 draft 状态。",
+      "sig": "sig-ci",
+      "sig_reason": "只在测试夹具里打开批量不变模式，让逐 token 比对可复现。",
+      "tags": [
+        "test",
+        "low-risk",
+        "batch-invariance",
+        "derender",
+        "flaky"
+      ],
+      "pr_number": 67742
+    },
+    {
+      "sha": "6a587fedcd834d94f7f41b37a7dc715f0fde3202",
+      "comment": "导入 vllm.models.muse_spark 的任何子模块（例如 common.vision）都会连带导入 NVIDIA 的 Muse Spark 模型，它 import FlashInfer，而 FlashInfer 在导入时就初始化 CUDA。本 PR 把该包的模型类改成惰性解析，做法与 vllm.models.inkling 相同。效果：导入 common.vision（以及收集 tests/models/multimodal/generation/test_muse_vision_encoders.py）不再在导入进程里初始化 CUDA，这就移除了 (L4) Distributed Models 分片 2/4 里 test_mm_prefix_lm_pipeline_parallel 偶发 Cannot re-initialize CUDA in forked subprocess 的根因（main 上构建 102677-102780 反复出现；#67637 只是给那个测试改用 spawn worker 绕过）。模型加载行为不变：注册表与 from vllm.models.muse_spark import 解析到同样的类，ROCm 上仍选 amd、其余仍选 nvidia。",
+      "sig": "sig-core",
+      "sig_reason": "改包的导入结构，避免导入即初始化 CUDA，属引擎初始化行为。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "lazy-import",
+        "cuda-init",
+        "muse-spark"
+      ],
+      "pr_number": 67691
+    },
+    {
+      "sha": "4244a09e4d403d688c43dad19b895ec95ee2fa18",
+      "comment": "流水线并行下每步的中间张量通过 NCCL send/recv 从一个 stage 交给下一个。在 ROCm 上这个 peer 拷贝是发送方 CU 上的一个 blit kernel，会拖慢发送方紧接着的计算：发送方一个 8192^3 的 bf16 GEMM，在往下一张卡拷 201 MiB 张量期间慢 5.1 倍。MiniMax-M3.1-Flash 的张量并行 1、流水线并行 2 prefill 里，16384 token 的一步在两个 stage 的计算路径上都要交好几个这样的张量。本 PR 加一个 opt-in 的 SDMA 拷贝引擎交接 --pp-sdma-handoff（ParallelConfig.pp_sdma_handoff，默认关）：接收 stage 分配 3 个 slot 并通过 CUDA IPC 与发送方共享，发送方一个线程等本步 event 之后把每个张量拷进该步的 slot，用两个 SDMA 引擎、不占 CU。适用范围限定在 gfx950（MI355X）上单机两 stage、张量并行 1、流水线并行 2、eager（cudagraph_mode NONE）；设了 flag 但条件不满足时 worker 在初始化阶段报错。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "用 SDMA 拷贝引擎替代占用计算单元的流水线并行阶段交接，属跨阶段数据传输。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "pipeline-parallel",
+        "sdma"
+      ],
+      "pr_number": 65658
+    },
+    {
+      "sha": "730194d2362716c47648d06e172c91bcdace3b32",
+      "comment": "nixl_ep 里的 Config 符号已被移除，NIXL 1.6.0 也不会有它，tests/v1/kv_connector/nixl_integration/test_nixl_imports.py 因此失败。本 PR 把该导入检查改掉，一行、只动测试。",
+      "sig": "sig-ci",
+      "sig_reason": "只更新测试里对 NIXL EP 模块符号的检查，使其跟上库变更。",
+      "tags": [
+        "test",
+        "low-risk",
+        "nixl",
+        "import-check"
+      ],
+      "pr_number": 67574
+    },
+    {
+      "sha": "b575d74ff95d490fdd71eca82931f9806a6b2877",
+      "comment": "fs tier 的块文件按内容哈希命名，因此磁盘上已有的前缀再次 store 时 _store_block 会跳过写。但作业仍然把整批都记进 transfer_bytes，并且几微秒就完成，背压检测器于是每次都看到一次「很大且瞬间完成」的写入，把它喂进 EMA。本 PR 让该 tier 只上报真正写过的块：transfer_bytes 只计写入的块，整批都已在盘上时为 0，而 BackpressureDetector.update 本来就忽略 num_bytes <= 0 的更新，这些作业因此不再进入 EMA。盘上字节、作业成功判定、查询结果与 KV 事件都不变，C 扩展路径与纯 Python 路径上报同一套计数。新增 test_store_reports_only_newly_written_blocks：依次 store [1,2]、[2,3]、再 [1,2]，检查上报为 2、1、0 个块，并确认块 2 的文件从未被重写。涉及 csrc/fs_io.cpp 与 tiering 的 io/manager。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修分层 KV 卸载的文件层上报口径，避免虚假写入把背压判断带偏。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "backpressure",
+        "fs-tier"
+      ],
+      "pr_number": 63524
+    },
+    {
+      "sha": "85217ffebbab2905386bac2e38566e09912da25a",
+      "comment": "Rust 前端的 token-in/token-out 路由 /inference/v1/generate 过去遇到 sampling_params.n > 1 就报 Only n=1 is supported.，而 Python 路由会为每个样本返回一个 choice。需要一条提示多个样本的客户端（例如 RL rollout）只能发 n 次请求，每次都重复提示处理与多模态预处理。本 PR 复用 Rust 前端 OpenAI 路由已有的并行采样路径支持 n > 1：提示与媒体只准备一次，再以 n 个子引擎请求经共享的 generate_prepared_n 路径提交；与 Python 的 ParentRequest 一致，子请求 id 形如 {index}_{request_id}，带种子的请求给每个子请求 seed + index（回绕），使样本之间不同但可复现，seed 为 -1 时仍不带种子。非流式下所有 choice 并发收集、按 index 顺序在一次响应里返回，提示级字段合并。",
+      "sig": "sig-core",
+      "sig_reason": "给 Rust 生成路由补上并行采样能力，属前端 API 覆盖范围。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "parallel-sampling",
+        "generate-route"
+      ],
+      "pr_number": 66878
+    },
+    {
+      "sha": "9bc16ae6a34b1e0fe260e8d12b98568478bf38c3",
+      "comment": "Transformers 建模后端会给 vLLM 的 linear 层传 3 维激活，而 XPU 上的 per_token_group_fp8_quant 只接受 2 维输入，引擎初始化因此失败，报 Expected output_s.dim() == 2。本 PR 在 XPU 的 MXFP8 linear kernel 里先把输入展平成 2 维、算完再还原前面的维度，与其他 MXFP8 linear kernel 的做法一致。修复 XPU 上的 test_mxfp8_generation[moe_transformers]。",
+      "sig": "sig-quantization",
+      "sig_reason": "让 XPU 的 MXFP8 linear 接受高维激活，属量化 kernel 输入约定。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "xpu",
+        "mxfp8",
+        "linear"
+      ],
+      "pr_number": 66494
+    },
+    {
+      "sha": "a58360ca30e84c70a89a676a38b3779a9fe9f110",
+      "comment": "Qwen2 迁到 Transformers 建模后端后，gte-Qwen2 这条路径仍然加载 checkpoint 自带的 remote modeling_qwen.py，而那份代码的注意力类表里没有 vllm 这一项，config._attn_implementation 为 vllm 时查不到，报 KeyError: vllm。test_non_causal_models[half-Alibaba-NLP/gte-Qwen2-1.5B-instruct] 因此在 AMD MI355 与 NVIDIA H200 两个 nightly Extended Pooling 作业上从构建 102826 起一直失败。本 PR 把该用例改成 trust_remote_code=False，用 Transformers 内置的 Qwen2 类加载。B200 上在构建 102826 对应的 commit 加 Transformers 5.23.0 复现：改前 1 failed，改后 3 passed。",
+      "sig": "sig-ci",
+      "sig_reason": "只调整测试加载参考模型的方式，让两个 nightly 池化作业恢复通过。",
+      "tags": [
+        "test",
+        "low-risk",
+        "pooling",
+        "trust-remote-code",
+        "nightly"
+      ],
+      "pr_number": 67716
+    },
+    {
+      "sha": "4388bec9295a82de7e8ff6fa58c904346a8374aa",
+      "comment": "docs/usage/security.md 写的是把媒体上限设成 0 表示关闭该限制，但音频的时长上限与解码字节上限把 0 当成硬顶。本 PR 让 0 在 SoundFile、PyAV、TorchCodec 三个后端上一致地关闭对应的每段音频限制，同时保留请求级的解码字节预算：VLLM_MAX_AUDIO_DECODE_DURATION_S=0 与 VLLM_MAX_AUDIO_DECODE_BYTES=0 关闭各自限制，VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES 在每段字节限制关闭时仍然生效，默认值与正数行为不变。DGX Spark（aarch64、Python 3.12.3）上 tests/multimodal/media/test_audio.py 37 passed；把 0 归一化关掉后新增的 9 个回归用例全部按原行为失败。",
+      "sig": "sig-omni",
+      "sig_reason": "对齐音频解码上限中 0 的语义，使文档承诺与实际限制行为一致。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "audio",
+        "media-limits"
+      ],
+      "pr_number": 67611
+    },
+    {
+      "sha": "6c7e48049332df0c22412fc782a90518d7ff1a2e",
+      "comment": "升级 Rust 侧的 llm-multimodal 依赖版本以取回上游改动，并适配其接口：multimodal/image.rs、video.rs、Muse Spark 与 Step3-VL 两个 processor 随之调整。共 8 个文件、+61/−27。PR 描述本身只写了升级理由，未给验证数据。",
+      "sig": "sig-core",
+      "sig_reason": "更新 Rust 前端多模态处理依赖版本并适配调用。",
+      "tags": [
+        "dependency-bump",
+        "low-risk",
+        "rust-frontend",
+        "multimodal"
+      ],
+      "pr_number": 67670
+    },
+    {
+      "sha": "27a441ca4cc86623cac90b1977c8f0ca786fcfeb",
+      "comment": ":nvidia: (B200) [Nightly] Distributed 里 test_mnnvl_multimem_reduce_scatter[2] 偶发 RuntimeError: Timed out waiting for file /tmp/ray/session_*/gcs_server_port_*，最近 12 次 nightly 中 2 次出现（含 102057，见 #67307）。原因是 multi_process_parallel 每次 ray.init 都让 Ray 按主机 CPU 数起空闲 worker 进程，B200 pod 上是 224 个，把下一个测试的 Ray head node 饿到 CPU 不够、GCS 启动超时。本 PR 让本地 Ray 集群以 num_cpus=world_size 启动，即每个 rank 一个 CPU。25 个调用方都用 @ray.remote(num_gpus=1, max_calls=1) 的默认 1 CPU 目标、也不起嵌套任务，所以 world_size 个 CPU 正好够，rank 任务本身不变。验证在诊断 PR #67339 的 B200 CI 上跑多次该文件并采样主机与容器状态。",
+      "sig": "sig-ci",
+      "sig_reason": "只约束测试启动 Ray 集群时的 CPU 数，消除 nightly 分布式作业的超时。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ray",
+        "nightly",
+        "cpu-quota"
+      ],
+      "pr_number": 67391
+    },
+    {
+      "sha": "9d8c9806617e623f10d7aec523a56214f21513ea",
+      "comment": "DeepSeek-V4.1-Flash 以数据并行 8 注意力加专家并行 8 MoE（张量并行 1 的稠密 linear）跑在 8 张 MI355X 上时，32x32 分块的 MXFP8 linear 走 Triton 的 block32 GEMM；这个 GEMM 没有张量并行 1 的调优（落到 _default_config），只到 MXFP8 峰值的 21-31%。本 PR 在开启 AITER 的 gfx950 上把这些 linear 与 grouped 的 wo_a BMM 改跑 AITER 调优过的 FlyDSL GEMM，由 AITER 按 M 从调优表里选；同时把 MXFP8 激活量化做得约 2 倍快，输出逐位相同。端到端（InferenceX aiperf agentic，并发 256，DSpark 5 token）吞吐 26,714 tok/s/GPU、P90 交互性 4.61 tok/s/user，与该 PR 上一版（27,385 / 4.60）在噪声内，上一版相对 main 是 +11.1% / +10.9%。离线稠密 GEMM 按每步调用次数加权：prefill 每步 189.8 → 106.7 ms（1.78x），decode 4544 → 2822 微秒（1.61x）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把 ROCm 上的 MXFP8 稠密 GEMM 与激活量化切到调优实现，提升每步吞吐。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "mxfp8",
+        "flydsl",
+        "gemm"
+      ],
+      "pr_number": 67377
+    },
+    {
+      "sha": "a16bfee11b92f1809628a8bd1f4bd70cdcb9b576",
+      "comment": "--load-format dummy 生成的 FP8 权重过去只在 ±1 里取值，在功率受限的 GPU 上，用 dummy 权重给计算受限步骤计时会比真实权重快很多，基准失真。本 PR 改成在整个 FP8 范围内取随机有限码。GB200 上 DeepSeek-V4.1-Flash DEP4 的大 prefill 步骤原本比真实权重快最多 11%，改后落在运行间噪声内。显式传 low/high 时仍按均匀分布采样；FP8 值始终有限（四种 float8 dtype 都不产生 NaN/Inf 码）、按种子可复现、就地填充，不再需要 FP16 中转张量。验证取 24 个真实 serving prefill 步骤（最忙 DP rank 870 到 49K token）用 vllm bench forward 在三套权重下计时：原 dummy 平均偏差 -11.4%（1 万 token 以上步骤约 -10%），本 PR 平均 |diff| 1.57%、偏差 +0.94%、最差 3.1%；同样步骤换节点重跑相差 0.9%。这也是 #67753 那个测试需要收紧权重范围的原因。",
+      "sig": "sig-core",
+      "sig_reason": "改变 dummy 权重的取值分布，使不带真实权重的基准贴近真实功耗行为。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "dummy-weights",
+        "benchmark",
+        "fp8"
+      ],
+      "pr_number": 67693
+    },
+    {
+      "sha": "5e51c0ca1041168de7aa9e096982aebaeebabd38",
+      "comment": "M3.1（#63232，模型本体已随 #64111 进 main）里 ROCm 引擎部分单独拆出：在模型运行器 V2 上让纯张量并行（单个数据并行 rank、无专家并行）也做双批次重叠。开启 --enable-dbo 且 --tensor-parallel-size 大于 1、没有 DP/EP 时（VLLM_USE_V2_MODEL_RUNNER=1），超过 --dbo-prefill-token-threshold 的步骤会切成两个微批，每个微批的 TP all-reduce 跑在通信流上、同时另一个微批在计算，all-reduce 于是变成微批之间的交接。多模态模型在该模式下允许，视觉编码器在切分之外运行；推测解码下的 DBO 自 #61464 起在所有模式可用。ROCm 侧把通信流设为高优先级，并用一次 hipBLASLt handle 预热修掉相关问题。#44677 是同一目标在模型运行器 V1 上的做法。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "把双批次重叠扩展到纯张量并行，属通信与计算重叠的并行执行能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "dbo",
+        "tensor-parallel",
+        "comm-overlap"
+      ],
+      "pr_number": 63483
+    },
+    {
+      "sha": "cb71f581322c7fd4c136cb7a80f00d6b85625b0f",
+      "comment": "(L4) [Nightly] Distributed DP Extended 从 nightly 102740 起失败：test_engram_table_shared_across_dp_replicas 的 [1] 与 [2] 两个参数化都报 AttributeError: DeepseekV4Model object has no attribute pipeline_relay（vllm/models/deepseek_v41/nvidia/model.py:1288）。#63106 支持任意流水线切分时加了 self.pipeline_relay，非最后一个流水线 rank 在 forward 里会读它；该测试用 __new__ 建模型再手工设属性，桩对象因此缺这个字段。最后一次通过是 102573（cfee9bc），不含 #63106。本 PR 在桩里设 model.pipeline_relay = None——不需要中继时真实值就是 None，forward 本来也用 if self.pipeline_relay is not None 守卫。只改测试。",
+      "sig": "sig-ci",
+      "sig_reason": "给测试桩补上新增字段，让 AMD 之外的 nightly 分布式作业恢复通过。",
+      "tags": [
+        "test",
+        "low-risk",
+        "stub",
+        "pipeline-parallel",
+        "nightly"
+      ],
+      "pr_number": 67636
+    },
+    {
+      "sha": "640c349c94d7538031325a6d29ff5a0b51234e7a",
+      "comment": "_dummy_run 可能构造出长于 max_model_len 的 dummy 请求，warmup 时注意力于是会读块表行之外的块 id，足以让引擎启动崩掉。本 PR 把 dummy 批次上限约束在 num_reqs * max_model_len 个 token。行为变化：max_num_batched_tokens 大于 max_num_seqs * max_model_len 时 warmup 不再越界读块表；例如 --max-model-len 2048 --max-num-seqs 1 --max-num-batched-tokens 8192 的启动崩溃被修掉，test_auto_fit_max_model_len_rejects_oversized_input 里 FlashAttnFwdSm90 报 CUDBG_EXCEPTION_WARP_MMU_FAULT 的那个潜在越界读也一并解决。上限不适用的配置跑与之前相同的 dummy 批次。单张 H200、JackFram/llama-160m、main 在 379a8487a 上验证，并给出不涉及 auto-fit 的最小复现。是 #49751 的后续。",
+      "sig": "sig-core",
+      "sig_reason": "约束预热 dummy 批次的长度，消除块表越界读导致的启动失败。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "dummy-run",
+        "block-table",
+        "warmup"
+      ],
+      "pr_number": 67545
+    },
+    {
+      "sha": "bb23c0a81779ba733923a7dab9b840b4e533f6a5",
+      "comment": "XPU 上打开了 FLASH_ATTN_MLA 之后，XPUPlatform 会选 XPUFlashAttnMLABackend，但枚举到实现类的注册表里没有这条映射：tests/v1/attention/test_mla_backends.py 用 AttentionBackendEnum.get_class() 解析后端，在 XPU 上拿到的是 CUDA 的 FlashAttnMLABackend，于是跑了 CUDA 实现并失败，报 1 backend(s) failed: AttentionBackendEnum.FLASH_ATTN_MLA。本 PR 在 vllm/platforms/xpu.py 里把枚举注册到 XPU 的实现类。改后 pytest tests/v1/attention/test_mla_backends.py 为 627 passed、6 skipped（869 秒）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "补上 Intel 平台 MLA 后端注册，使该注意力后端在 XPU 上真正被选中。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "xpu",
+        "mla",
+        "backend-registration"
+      ],
+      "pr_number": 64255
+    },
+    {
+      "sha": "d2f92859b4c62434a2c111036ebe62cb0e9de243",
+      "comment": "模型运行器 V2 把所有 KV cache 分组的 slot mapping 放在一个 [num_kv_cache_groups, max_num_batched_tokens] 的 int64 张量里。DeepSeek-V4 的 CuTe DSL compressor 声明 slot_mapping 需要 64 字节对齐（每个元素 8 字节，因此要求 max_num_batched_tokens 是 8 的倍数），--max-num-batched-tokens 1500 或 2500 这类取值会在引擎初始化时报 Misaligned Tensor data on argument #3。本 PR 把 slot mapping 缓冲的行距补到 16 个元素，使每一行起始都 128 字节对齐，布局本身不变。改后 DeepSeek-V4 的 --max-num-batched-tokens 可以取任意值。GSM8K 在 H20 与 DGX Spark 上端到端验证。",
+      "sig": "sig-core",
+      "sig_reason": "修 KV slot 映射缓冲的行对齐，使任意批量上限可用。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "slot-mapping",
+        "alignment",
+        "deepseek-v4"
+      ],
+      "pr_number": 66401
+    }
+  ]
+}
