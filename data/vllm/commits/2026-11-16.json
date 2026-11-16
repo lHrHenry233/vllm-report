@@ -4,6 +4,279 @@
   "branch": "main",
   "commits": [
     {
+      "sha": "c02ebf136ed70dd6d9cc7b8858d27f8660f418de",
+      "author": {
+        "name": "Yan Ma",
+        "email": "yan.ma@intel.com"
+      },
+      "date": "2026-11-16T12:07:34+08:00",
+      "message": "[XPU] quick fix for lora test workspace (#67824)\n\nSigned-off-by: Yan Ma <yan.ma@intel.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "777288d2eb129baacda26d446d18b31d6e518ba1"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 1,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": ".buildkite/intel_jobs/lora_intel.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -151,7 +151,7 @@ steps:\n   device: intel_gpu_k8s\n   num_devices: 2\n   resource_claim_template: b70-2\n-  working_dir: \"/workspace/vllm/\"\n+  working_dir: \"/vllm-workspace/\"\n   env:\n     VLLM_TEST_DEVICE: \"xpu\"\n   source_file_dependencies:\n"
+        }
+      ]
+    },
+    {
+      "sha": "777288d2eb129baacda26d446d18b31d6e518ba1",
+      "author": {
+        "name": "Yibo Liu",
+        "email": "yibol9768@gmail.com"
+      },
+      "date": "2026-11-16T12:01:42+08:00",
+      "message": "[Bugfix][Multimodal] Llama 4: honor per-request max_patches (#67813)\n\nSigned-off-by: Yibo Liu <yibol9768@gmail.com>",
+      "parents": [
+        "4d6df3fad69f7f80b78309855a6396881b23ad88"
+      ],
+      "stats": {
+        "total_additions": 65,
+        "total_deletions": 6,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/models/multimodal/processing/test_mllama4.py",
+          "status": "modified",
+          "additions": 47,
+          "deletions": 0,
+          "patch": "@@ -9,6 +9,7 @@ from transformers import Llama4Config\n \n from vllm.multimodal import MULTIMODAL_REGISTRY\n \n+from ....conftest import ImageTestAssets\n from ...utils import build_model_context\n \n \n@@ -54,3 +55,49 @@ def test_profiling(model_id: str, max_model_len: int):\n     assert total_tokens == sum(\n         placeholder.length for placeholder in mm_inputs[\"mm_placeholders\"][\"image\"]\n     )\n+\n+\n+@pytest.mark.parametrize(\"model_id\", [\"meta-llama/Llama-Guard-4-12B\"])\n+@pytest.mark.parametrize(\n+    \"mm_processor_kwargs\",\n+    [\n+        {},\n+        {\"max_patches\": 8},\n+        {\"images_kwargs\": {\"max_patches\": 4}},\n+    ],\n+)\n+@pytest.mark.parametrize(\"kwargs_on_init\", [True, False])\n+def test_processor_override(\n+    image_assets: ImageTestAssets,\n+    model_id: str,\n+    mm_processor_kwargs: dict[str, object],\n+    kwargs_on_init: bool,\n+):\n+    ctx = build_model_context(\n+        model_id,\n+        mm_processor_kwargs=mm_processor_kwargs if kwargs_on_init else None,\n+        limit_mm_per_prompt={\"image\": 1},\n+    )\n+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)\n+    hf_processor_mm_kwargs = {} if kwargs_on_init else mm_processor_kwargs\n+\n+    prompt = processor.dummy_inputs.get_dummy_text({\"image\": 1}) + \"Describe.\"\n+    mm_data = {\"image\": [image_assets[0].pil_image.resize((1024, 768))]}\n+    processed_inputs = processor(\n+        prompt,\n+        mm_items=processor.info.parse_mm_data(mm_data),\n+        hf_processor_mm_kwargs=hf_processor_mm_kwargs,\n+    )\n+\n+    hf_processor = processor.info.get_hf_processor(**hf_processor_mm_kwargs)\n+    hf_processed_inputs = hf_processor(\n+        text=prompt,\n+        images=mm_data[\"image\"],\n+        **processor.info.ctx.get_merged_mm_kwargs(hf_processor_mm_kwargs),\n+    )\n+    assert processed_inputs[\"prompt_token_ids\"] == hf_processed_inputs[\"input_ids\"][0]\n+\n+    mm_kwargs = processed_inputs[\"mm_kwargs\"].get_data()\n+    patches_per_image = mm_kwargs[\"patches_per_image\"]\n+    assert isinstance(patches_per_image, torch.Tensor)\n+    assert patches_per_image.sum() == len(mm_kwargs[\"pixel_values\"])"
+        },
+        {
+          "filename": "vllm/model_executor/models/mllama4.py",
+          "status": "modified",
+          "additions": 18,
+          "deletions": 6,
+          "patch": "@@ -559,9 +559,22 @@ class Mllama4ProcessingInfo(BaseProcessingInfo):\n         ds_ratio = int(round(1.0 / (vision_config.pixel_shuffle_ratio**2)))\n         return (image_size // patch_size) ** 2 // ds_ratio\n \n-    def get_max_num_tiles(self) -> int:\n+    def get_images_kwargs(\n+        self,\n+        mm_processor_kwargs: Mapping[str, object] | None = None,\n+    ) -> dict[str, Any]:\n         image_processor = self.get_hf_processor().image_processor\n-        return image_processor.max_patches\n+        merged_mm_kwargs = self._merge_and_resolve_mm_processor_kwargs(\n+            mm_processor_kwargs or {}\n+        )\n+        return {\n+            \"max_patches\": image_processor.max_patches,\n+            \"resize_to_max_canvas\": image_processor.resize_to_max_canvas,\n+            **merged_mm_kwargs.get(\"images_kwargs\", {}),\n+        }\n+\n+    def get_max_num_tiles(self) -> int:\n+        return self.get_images_kwargs()[\"max_patches\"]\n \n     def get_image_size_with_most_features(self) -> ImageSize:\n         vision_config = self.get_hf_config().vision_config\n@@ -583,8 +596,7 @@ class Mllama4MultiModalProcessor(BaseMultiModalProcessor[Mllama4ProcessingInfo])\n         if not mm_data:\n             return processed_data\n \n-        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)\n-        image_processor = processor.image_processor\n+        images_kwargs = self.info.get_images_kwargs(hf_processor_mm_kwargs)\n         vision_config = self.info.get_hf_config().vision_config\n \n         if processed_data.get(\"pixel_values\") is not None:\n@@ -598,7 +610,7 @@ class Mllama4MultiModalProcessor(BaseMultiModalProcessor[Mllama4ProcessingInfo])\n \n             tile_size = vision_config.image_size\n             possible_resolutions = find_supported_resolutions(\n-                max_num_chunks=self.info.get_max_num_tiles(),\n+                max_num_chunks=images_kwargs[\"max_patches\"],\n                 patch_size=SizeDict(height=tile_size, width=tile_size),\n             )\n             best_fit_sizes = []\n@@ -608,7 +620,7 @@ class Mllama4MultiModalProcessor(BaseMultiModalProcessor[Mllama4ProcessingInfo])\n                     get_best_fit(\n                         (image.size[1], image.size[0]),\n                         torch.tensor(possible_resolutions),\n-                        resize_to_max_canvas=image_processor.resize_to_max_canvas,\n+                        resize_to_max_canvas=images_kwargs[\"resize_to_max_canvas\"],\n                     )\n                 )\n             # TODO tile height/width do not necessarily need to match\n"
+        }
+      ]
+    },
+    {
+      "sha": "4d6df3fad69f7f80b78309855a6396881b23ad88",
+      "author": {
+        "name": "Yosef W. Alemneh",
+        "email": "37704356+rasyosef@users.noreply.github.com"
+      },
+      "date": "2026-11-16T11:56:51+08:00",
+      "message": "[Model] Add EAGLE-3 / DSpark support (aux hidden states) for Lfm3ForCausalLM (#66323)\n\nSigned-off-by: Yosef W. Alemneh <37704356+rasyosef@users.noreply.github.com>",
+      "parents": [
+        "2f70c32d07af8063b632cb67fa160b3fd19ea90b"
+      ],
+      "stats": {
+        "total_additions": 34,
+        "total_deletions": 4,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/models/lfm3.py",
+          "status": "modified",
+          "additions": 34,
+          "deletions": 4,
+          "patch": "@@ -38,8 +38,10 @@ from vllm.sequence import IntermediateTensors\n from vllm.transformers_utils.configs.lfm3 import Lfm3Config\n \n from .interfaces import (\n+    EagleModelMixin,\n     HasInnerState,\n     IsHybrid,\n+    SupportsEagle3,\n     SupportsLoRA,\n     SupportsPP,\n     SupportsQuant,\n@@ -265,7 +267,9 @@ class Lfm3DecoderLayer(nn.Module):\n \n \n @support_torch_compile\n-class Lfm3Model(nn.Module):\n+class Lfm3Model(nn.Module, EagleModelMixin):\n+    supports_aux_hidden_states_over_pp = True\n+\n     # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision\n     # with the inner .conv.conv child, see Lfm2Model.\n     hf_to_vllm_mapper = WeightsMapper(\n@@ -341,14 +345,34 @@ class Lfm3Model(nn.Module):\n             hidden_states = intermediate_tensors[\"hidden_states\"]\n             residual = intermediate_tensors[\"residual\"]\n \n-        for layer in islice(self.layers, self.start_layer, self.end_layer):\n+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)\n+\n+        aux_hidden_states: list[torch.Tensor] = []\n+        if get_pp_group().is_first_rank:\n+            self._maybe_add_hidden_state(\n+                aux_hidden_states, self.start_layer, hidden_states, residual\n+            )\n+        for idx, layer in enumerate(\n+            islice(self.layers, self.start_layer, self.end_layer),\n+            start=self.start_layer,\n+        ):\n             hidden_states, residual = layer(positions, hidden_states, residual)\n+            self._maybe_add_hidden_state(\n+                aux_hidden_states, idx + 1, hidden_states, residual\n+            )\n \n         if not get_pp_group().is_last_rank:\n             return IntermediateTensors(\n-                {\"hidden_states\": hidden_states, \"residual\": residual}\n+                {\n+                    \"hidden_states\": hidden_states,\n+                    \"residual\": residual,\n+                    **self.pack_local_aux_hidden_states(aux_hidden_states),\n+                }\n             )\n         hidden_states, _ = self.embedding_norm(hidden_states, residual)\n+        aux_hidden_states = remote_aux + aux_hidden_states\n+        if len(aux_hidden_states) > 0:\n+            return hidden_states, aux_hidden_states\n         return hidden_states\n \n     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n@@ -374,7 +398,13 @@ def _short_conv_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, ...]:\n \n \n class Lfm3ForCausalLM(\n-    nn.Module, HasInnerState, SupportsLoRA, SupportsPP, IsHybrid, SupportsQuant\n+    nn.Module,\n+    HasInnerState,\n+    SupportsLoRA,\n+    SupportsPP,\n+    IsHybrid,\n+    SupportsQuant,\n+    SupportsEagle3,\n ):\n     packed_modules_mapping = {\n         \"qkv_proj\": [\"q_proj\", \"k_proj\", \"v_proj\"],\n"
+        }
+      ]
+    },
+    {
+      "sha": "2f70c32d07af8063b632cb67fa160b3fd19ea90b",
+      "author": {
+        "name": "Subhash Polisetti",
+        "email": "49185065+subhashpolisetti@users.noreply.github.com"
+      },
+      "date": "2026-11-16T11:50:08+08:00",
+      "message": "[Bugfix][Multimodal] Profile ERNIE-4.5-VL with the largest admitted video (#66937)\n\nSigned-off-by: subhash polisetti <subhashr161347@gmail.com>",
+      "parents": [
+        "d1911f711c07a9c4ceb05c993166b00ed4866497"
+      ],
+      "stats": {
+        "total_additions": 145,
+        "total_deletions": 21,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/models/multimodal/processing/test_video_budget.py",
+          "status": "modified",
+          "additions": 76,
+          "deletions": 0,
+          "patch": "@@ -1,9 +1,12 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import numpy as np\n import pytest\n \n from vllm.multimodal import MULTIMODAL_REGISTRY\n from vllm.multimodal.encoder_budget import get_mm_max_toks_per_item\n+from vllm.multimodal.processing.context import TimingContext\n+from vllm.multimodal.processing.inputs import ProcessorInputs\n \n from ...utils import build_model_context\n \n@@ -15,6 +18,7 @@ from ...utils import build_model_context\n         (\"AIDC-AI/Ovis2.5-2B\", 32768),\n         (\"OpenGVLab/InternVL3-1B\", 16384),\n         (\"internlm/Intern-S1\", 16384),\n+        (\"baidu/ERNIE-4.5-VL-28B-A3B-PT\", 32768),\n     ],\n )\n def test_video_budget_matches_profiled_video(model_id: str, max_model_len: int):\n@@ -48,3 +52,75 @@ def test_video_budget_ignores_image_count(model_id: str, max_model_len: int):\n     video_only = get_mm_max_toks_per_item(processor, {\"video\": 1}, None)\n \n     assert with_image[\"video\"] == video_only[\"video\"]\n+\n+\n+ERNIE = \"baidu/ERNIE-4.5-VL-28B-A3B-PT\"\n+\n+\n+def _video_embeds(outputs) -> int:\n+    return sum(p.get_num_embeds() for p in outputs[\"mm_placeholders\"][\"video\"])\n+\n+\n+@pytest.mark.parametrize(\n+    (\"hint_width\", \"hint_height\", \"width\", \"height\", \"mm_processor_kwargs\"),\n+    [\n+        (1288, 728, 1288, 728, None),\n+        (728, 1288, 728, 1288, None),\n+        (1288, None, 1288, 728, None),\n+        (None, 1288, 728, 1288, None),\n+        (1920, None, 1288, 728, None),\n+        (1920, 1080, 1288, 728, None),\n+        (896, None, 896, 448, {\"video_min_pixels\": 401408, \"video_max_pixels\": 401408}),\n+    ],\n+)\n+def test_ernie45_vl_dummy_video_follows_size_hint(\n+    hint_width: int | None,\n+    hint_height: int | None,\n+    width: int,\n+    height: int,\n+    mm_processor_kwargs: dict | None,\n+):\n+    hint = {\"count\": 1, \"num_frames\": 2, \"width\": hint_width, \"height\": hint_height}\n+    ctx = build_model_context(\n+        ERNIE,\n+        model_config_kwargs={\"max_model_len\": 32768},\n+        mm_processor_kwargs=mm_processor_kwargs,\n+        limit_mm_per_prompt={\n+            \"image\": 1,\n+            \"video\": {k: v for k, v in hint.items() if v is not None},\n+        },\n+    )\n+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)\n+\n+    frames = np.zeros((2, height, width, 3), dtype=np.uint8)\n+    metadata = {\n+        \"fps\": 2.0,\n+        \"duration\": 1.0,\n+        \"total_num_frames\": 2,\n+        \"frames_indices\": [0, 1],\n+        \"video_backend\": \"opencv\",\n+        \"do_sample_frames\": False,\n+    }\n+    inputs = ProcessorInputs(\n+        prompt=processor.info.get_tokenizer().encode(\"<|video@placeholder|>\"),\n+        mm_data_items=processor.info.parse_mm_data({\"video\": [(frames, metadata)]}),\n+    )\n+    real = processor.apply(inputs, TimingContext(enabled=False))\n+    dummy = processor.get_dummy_mm_inputs({\"video\": 1})\n+\n+    assert _video_embeds(dummy) == _video_embeds(real)\n+\n+\n+def test_ernie45_vl_video_budget_ignores_image_pixel_limit():\n+    ctx = build_model_context(\n+        ERNIE,\n+        model_config_kwargs={\"max_model_len\": 2048},\n+        mm_processor_kwargs={\"max_pixels\": 153664},\n+        limit_mm_per_prompt={\"image\": 1, \"video\": 1},\n+    )\n+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)\n+\n+    budget = get_mm_max_toks_per_item(processor, {\"image\": 1, \"video\": 1}, None)\n+    dummy = processor.get_dummy_mm_inputs({\"video\": 1})\n+\n+    assert budget[\"video\"] == _video_embeds(dummy)"
+        },
+        {
+          "filename": "vllm/model_executor/models/ernie45_vl.py",
+          "status": "modified",
+          "additions": 69,
+          "deletions": 21,
+          "patch": "@@ -1005,6 +1005,60 @@ class Ernie4_5_VLProcessingInfo(BaseProcessingInfo):\n         )\n         return max_image_size\n \n+    def _get_video_pixel_limits(self) -> tuple[int, int]:\n+        hf_processor = self.get_hf_processor()\n+        if self.ctx.model_config.trust_remote_code:\n+            return hf_processor.video_min_pixels, hf_processor.video_max_pixels\n+        size = hf_processor.video_processor.size\n+        return size[\"shortest_edge\"], size[\"longest_edge\"]\n+\n+    def _get_video_resize_factor(self) -> int:\n+        hf_config = self.get_hf_config()\n+        return hf_config.vision_config.patch_size * hf_config.spatial_conv_size\n+\n+    def get_video_frame_size(self, width: int, height: int) -> ImageSize:\n+        min_pixels, max_pixels = self._get_video_pixel_limits()\n+        resized_height, resized_width = smart_resize(\n+            height=height,\n+            width=width,\n+            factor=self._get_video_resize_factor(),\n+            min_pixels=min_pixels,\n+            max_pixels=max_pixels,\n+        )\n+        return ImageSize(width=resized_width, height=resized_height)\n+\n+    def get_video_size_with_most_features(\n+        self, max_width: int | None = None, max_height: int | None = None\n+    ) -> ImageSize:\n+        factor = self._get_video_resize_factor()\n+        min_pixels, max_pixels = self._get_video_pixel_limits()\n+        max_cells = max_pixels // factor**2\n+        max_cols = max(round(max_width / factor), 1) if max_width else max_cells\n+        max_rows = max(round(max_height / factor), 1) if max_height else max_cells\n+        grids = [\n+            (rows, cols)\n+            for rows in range(1, min(max_rows, max_cells) + 1)\n+            if (cols := min(max_cols, max_cells // rows)) >= 1\n+            and max(rows, cols) <= 200 * min(rows, cols)\n+        ]\n+        rows, cols = max(grids, key=lambda grid: (grid[0] * grid[1], min(grid)))\n+        if rows * cols * factor**2 < min_pixels:\n+            return self.get_video_frame_size(\n+                max_width or cols * factor, max_height or rows * factor\n+            )\n+        return ImageSize(width=cols * factor, height=rows * factor)\n+\n+    def _get_num_video_tokens_for_size(self, size: ImageSize, num_frames: int) -> int:\n+        _, num_video_tokens = self._get_vision_info(\n+            image_width=size.width,\n+            image_height=size.height,\n+            num_frames=num_frames,\n+            do_resize=False,\n+            image_processor=self.get_image_processor(),\n+            mm_kwargs={},\n+        )\n+        return num_video_tokens\n+\n     def get_max_image_tokens(self) -> int:\n         image_processor = self.get_image_processor()\n         target_width, target_height = self.get_image_size_with_most_features()\n@@ -1018,19 +1072,14 @@ class Ernie4_5_VLProcessingInfo(BaseProcessingInfo):\n         return num_image_tokens\n \n     def _get_max_video_frames(self, max_tokens: int) -> int:\n-        image_processor = self.get_image_processor()\n-        target_width, target_height = self.get_image_size_with_most_features()\n+        video_size = self.get_video_size_with_most_features()\n \n         num_frames = 0\n \n         while True:\n             next_num_frames = num_frames + 1\n-            next_max_tokens = self.get_num_video_tokens(\n-                image_width=target_width,\n-                image_height=target_height,\n-                num_frames=next_num_frames,\n-                image_processor=image_processor,\n-                mm_kwargs={},\n+            next_max_tokens = self._get_num_video_tokens_for_size(\n+                video_size, next_num_frames\n             )\n \n             if next_max_tokens > max_tokens:\n@@ -1059,17 +1108,9 @@ class Ernie4_5_VLProcessingInfo(BaseProcessingInfo):\n         seq_len: int,\n         mm_counts: Mapping[str, int],\n     ) -> int:\n-        image_processor = self.get_image_processor()\n-        target_width, target_height = self.get_image_size_with_most_features()\n-\n-        return self.get_num_video_tokens(\n-            image_width=target_width,\n-            image_height=target_height,\n-            num_frames=self.get_num_frames_with_most_features(\n-                seq_len, mm_counts.get(\"video\", 0)\n-            ),\n-            image_processor=image_processor,\n-            mm_kwargs={},\n+        return self._get_num_video_tokens_for_size(\n+            self.get_video_size_with_most_features(),\n+            self.get_num_frames_with_most_features(seq_len, mm_counts.get(\"video\", 0)),\n         )\n \n \n@@ -1279,6 +1320,13 @@ class Ernie4_5_VLDummyInputsBuilder(BaseDummyInputsBuilder[Ernie4_5_VLProcessing\n         mm_options: MultiModalDummyOptions,\n     ) -> MultiModalDataDict:\n         target_width, target_height = self.info.get_image_size_with_most_features()\n+        video_overrides = mm_options.get(\"video\")\n+        if isinstance(video_overrides, VideoDummyOptions):\n+            video_size = self.info.get_video_size_with_most_features(\n+                video_overrides.width, video_overrides.height\n+            )\n+        else:\n+            video_size = self.info.get_video_size_with_most_features()\n         target_num_frames = self.info.get_num_frames_with_most_features(\n             seq_len, mm_counts.get(\"video\", 0)\n         )\n@@ -1291,8 +1339,8 @@ class Ernie4_5_VLDummyInputsBuilder(BaseDummyInputsBuilder[Ernie4_5_VLProcessing\n                 overrides=mm_options.get(\"image\"),\n             ),\n             \"video\": self._get_dummy_videos(\n-                width=target_width,\n-                height=target_height,\n+                width=video_size.width,\n+                height=video_size.height,\n                 num_frames=target_num_frames,\n                 num_videos=mm_counts.get(\"video\", 0),\n                 overrides=mm_options.get(\"video\"),\n"
+        }
+      ]
+    },
+    {
+      "sha": "d1911f711c07a9c4ceb05c993166b00ed4866497",
+      "author": {
+        "name": "Leizhen Zhang",
+        "email": "35493221+LeizhenZhang@users.noreply.github.com"
+      },
+      "date": "2026-11-16T11:48:31+08:00",
+      "message": "[Bugfix][Security] Check the uncompressed size of embedding archives before torch.load (#67316)\n\nSigned-off-by: LeizhenZhang <zhangleizhen645@gmail.com>",
+      "parents": [
+        "5b028fb8369dff6e5e8ba06d911d9ec98210fb51"
+      ],
+      "stats": {
+        "total_additions": 118,
+        "total_deletions": 3,
+        "files_changed": 7
+      },
+      "files": [
+        {
+          "filename": "docs/usage/security.md",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -100,7 +100,7 @@ denial of service:\n | `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` | `25` | Maximum compressed filesize in MB for a single audio file. Enforced on all audio inputs (multimodal chat URLs, speech-to-text uploads, data: URLs, and local file paths) before decoding begins. |\n | `VLLM_MAX_AUDIO_DECODE_DURATION_S` | `600` | Maximum decoded audio duration in seconds. Prevents compressed audio from expanding into gigabytes of float32 PCM. |\n | `VLLM_MAX_AUDIO_DECODE_BYTES` | `268435456` (256 MiB) | Maximum float32 PCM bytes that audio decoding may allocate. Guards against sample-rate forgery where an inflated header sample rate bypasses the duration guard while the actual frame count causes a multi-GiB allocation. |\n-| `VLLM_MAX_EMBED_DECODE_BYTES` | `2147483648` (2 GiB) | Maximum bytes a client-supplied embedding payload (`prompt_embeds`, `image_embeds`, `audio_embeds`, `video_embeds`) may allocate once densified. A sparse tensor carries its own declared shape, so a payload of a few hundred bytes can expand into hundreds of GiB. Checked before `to_dense()`, so the memory is never allocated. Set to `0` to disable. |\n+| `VLLM_MAX_EMBED_DECODE_BYTES` | `2147483648` (2 GiB) | Maximum bytes a client-supplied embedding payload (`prompt_embeds`, `image_embeds`, `audio_embeds`, `video_embeds`) may allocate once densified. A sparse tensor carries its own declared shape, so a payload of a few hundred bytes can expand into hundreds of GiB, and a `torch.save` archive can deflate-compress its storages. The uncompressed archive size is checked before `torch.load` and the dense size before `to_dense()`, so the memory is never allocated. Set to `0` to disable. |\n \n Setting any of these to `0` disables the corresponding limit. This is **not\n recommended** for deployments exposed to untrusted users, as it removes the"
+        },
+        {
+          "filename": "tests/renderers/test_sparse_tensor_validation.py",
+          "status": "modified",
+          "additions": 65,
+          "deletions": 0,
+          "patch": "@@ -11,6 +11,7 @@ bounded by `VLLM_MAX_EMBED_DECODE_BYTES` instead.\n \"\"\"\n \n import io\n+import zipfile\n \n import numpy as np\n import pybase64 as base64\n@@ -532,3 +533,67 @@ class TestEmbeddingDecodeSizeLimit:\n         encoded = _encode_tensor(tensor)\n \n         assert torch.equal(io_cls().load_base64(\"\", encoded.decode(\"utf-8\")), tensor)\n+\n+\n+def _encode_deflated(tensor: torch.Tensor) -> bytes:\n+    \"\"\"`torch.save` a tensor, then deflate-compress every archive entry.\"\"\"\n+    buffer = io.BytesIO()\n+    torch.save(tensor, buffer)\n+    source = zipfile.ZipFile(buffer)\n+    packed = io.BytesIO()\n+    with zipfile.ZipFile(packed, \"w\") as archive:\n+        for info in source.infolist():\n+            archive.writestr(\n+                info.filename,\n+                source.read(info.filename),\n+                compress_type=zipfile.ZIP_DEFLATED,\n+            )\n+    return base64.b64encode(packed.getvalue())\n+\n+\n+# `torch.save` writes the whole storage of a view. One row of a 3 MiB zeros\n+# storage passes every shape check and deflates to a few KiB.\n+COMPRESSED_LIMIT_BYTES = 64 * 1024\n+\n+\n+@pytest.fixture\n+def compressed_decode_limit(monkeypatch: pytest.MonkeyPatch) -> None:\n+    monkeypatch.setenv(\"VLLM_MAX_EMBED_DECODE_BYTES\", str(COMPRESSED_LIMIT_BYTES))\n+\n+\n+def _view_of_large_storage() -> bytes:\n+    encoded = _encode_deflated(torch.zeros(1024, 768)[:1])\n+    assert len(encoded) < COMPRESSED_LIMIT_BYTES\n+    return encoded\n+\n+\n+class TestCompressedStorageLimit:\n+    \"\"\"`torch.load` inflates compressed storages in full before returning.\"\"\"\n+\n+    def test_prompt_embeds_rejects_view_of_large_storage(\n+        self, model_config, compressed_decode_limit\n+    ):\n+        with pytest.raises(VLLMValidationError, match=\"VLLM_MAX_EMBED_DECODE_BYTES\"):\n+            safe_load_prompt_embeds(model_config, _view_of_large_storage())\n+\n+    @pytest.mark.parametrize(\"io_cls,parameter\", EMBEDDING_MEDIA_IO)\n+    def test_media_io_rejects_view_of_large_storage(\n+        self, io_cls, parameter, compressed_decode_limit\n+    ):\n+        encoded = _view_of_large_storage().decode(\"utf-8\")\n+\n+        with pytest.raises(VLLMValidationError, match=parameter):\n+            io_cls().load_base64(\"\", encoded)\n+\n+    def test_deflated_tensor_within_limit_accepted(\n+        self, model_config, compressed_decode_limit\n+    ):\n+        tensor = torch.randn(10, 768)\n+\n+        loaded = safe_load_prompt_embeds(model_config, _encode_deflated(tensor))\n+\n+        assert torch.equal(loaded, tensor)\n+\n+    def test_unreadable_archive_rejected(self, model_config):\n+        with pytest.raises(VLLMValidationError, match=\"prompt_embeds\"):\n+            safe_load_prompt_embeds(model_config, base64.b64encode(b\"PK\\x03\\x04\"))"
+        },
+        {
+          "filename": "vllm/multimodal/media/audio.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -20,6 +20,7 @@ from vllm.utils.mem_constants import MiB_bytes\n from vllm.utils.serial_utils import tensor2base64\n from vllm.utils.sparse_utils import (\n     check_sparse_tensor_invariants_threadsafe,\n+    check_torch_archive_size,\n     safe_to_dense,\n )\n \n@@ -713,6 +714,7 @@ class AudioEmbeddingMediaIO(MediaIO[torch.Tensor]):\n         super().__init__()\n \n     def load_bytes(self, data: bytes) -> torch.Tensor:\n+        check_torch_archive_size(data, parameter=\"audio_embeds\")\n         buffer = BytesIO(data)\n         with check_sparse_tensor_invariants_threadsafe():\n             tensor = torch.load(buffer, weights_only=True)"
+        },
+        {
+          "filename": "vllm/multimodal/media/image.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -13,6 +13,7 @@ import vllm.envs as envs\n from vllm.utils.serial_utils import numpy2tensor, tensor2base64\n from vllm.utils.sparse_utils import (\n     check_sparse_tensor_invariants_threadsafe,\n+    check_torch_archive_size,\n     safe_to_dense,\n )\n \n@@ -149,6 +150,7 @@ class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):\n         super().__init__()\n \n     def _load_pickled_torch(self, data: bytes) -> torch.Tensor:\n+        check_torch_archive_size(data, parameter=\"image_embeds\")\n         buffer = BytesIO(data)\n         with check_sparse_tensor_invariants_threadsafe():\n             tensor = torch.load(buffer, weights_only=True)"
+        },
+        {
+          "filename": "vllm/multimodal/media/video.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -16,6 +16,7 @@ from vllm.logger import init_logger\n from vllm.utils.serial_utils import numpy2tensor, tensor2base64\n from vllm.utils.sparse_utils import (\n     check_sparse_tensor_invariants_threadsafe,\n+    check_torch_archive_size,\n     safe_to_dense,\n )\n \n@@ -244,6 +245,7 @@ class VideoEmbeddingMediaIO(MediaIO[torch.Tensor]):\n         super().__init__()\n \n     def _load_pickled_torch(self, data: bytes) -> torch.Tensor:\n+        check_torch_archive_size(data, parameter=\"video_embeds\")\n         buffer = BytesIO(data)\n         with check_sparse_tensor_invariants_threadsafe():\n             tensor = torch.load(buffer, weights_only=True)"
+        },
+        {
+          "filename": "vllm/renderers/embed_utils.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -10,6 +10,7 @@ from vllm.exceptions import VLLMValidationError\n from vllm.utils.async_utils import make_async\n from vllm.utils.sparse_utils import (\n     check_sparse_tensor_invariants_threadsafe,\n+    check_torch_archive_size,\n     safe_to_dense,\n )\n \n@@ -51,6 +52,7 @@ def safe_load_prompt_embeds(\n     # Decoded outside the try below so that a body which is not base64 keeps\n     # raising binascii.Error, which is a ValueError and already answered 400.\n     payload: Final = pybase64.b64decode(embed, validate=True)\n+    check_torch_archive_size(payload, parameter=\"prompt_embeds\")\n \n     with check_sparse_tensor_invariants_threadsafe():\n         try:"
+        },
+        {
+          "filename": "vllm/utils/sparse_utils.py",
+          "status": "modified",
+          "additions": 44,
+          "deletions": 2,
+          "patch": "@@ -3,8 +3,10 @@\n \"\"\"Safe deserialization helpers for client-supplied embedding tensors.\n \n `check_sparse_tensor_invariants_threadsafe()` is a thread-safe wrapper for\n-sparse tensor invariant validation. `safe_to_dense()` bounds the memory a\n-deserialized tensor may allocate when densified.\n+sparse tensor invariant validation. `check_torch_archive_size()` bounds the\n+memory `torch.load` allocates for the tensor storages of a payload.\n+`safe_to_dense()` bounds the memory a deserialized tensor may allocate when\n+densified.\n \n PyTorch's `torch.sparse.check_sparse_tensor_invariants()` context manager\n manipulates a **process-global** flag (save/enable/restore). When multiple\n@@ -18,6 +20,8 @@ which serializes access behind a lock.\n \n import contextlib\n import threading\n+import zipfile\n+from io import BytesIO\n \n import torch\n \n@@ -34,6 +38,44 @@ def check_sparse_tensor_invariants_threadsafe():\n         yield\n \n \n+_ZIP_LOCAL_FILE_HEADER = b\"PK\\x03\\x04\"\n+\n+\n+def check_torch_archive_size(payload: bytes, *, parameter: str) -> None:\n+    \"\"\"Bound the bytes `torch.load` inflates from a client-supplied payload.\n+\n+    `torch.save` writes a zip archive, and `torch.load` reads each tensor\n+    storage entry into memory at the uncompressed size recorded in the\n+    archive. Entries may be deflate-compressed, so a few MiB of zeros can\n+    declare a storage of many GiB. That allocation happens inside\n+    `torch.load`, before `safe_to_dense()` sees the tensor, and a small view\n+    of a large storage keeps the whole storage alive. Reject archives whose\n+    entries add up to more than `VLLM_MAX_EMBED_DECODE_BYTES` before loading.\n+    \"\"\"\n+    max_bytes = envs.VLLM_MAX_EMBED_DECODE_BYTES\n+    if max_bytes <= 0 or payload[:4] != _ZIP_LOCAL_FILE_HEADER:\n+        return\n+\n+    try:\n+        with zipfile.ZipFile(BytesIO(payload)) as archive:\n+            inflated_bytes = sum(info.file_size for info in archive.infolist())\n+    except (zipfile.BadZipFile, ValueError) as exc:\n+        raise VLLMValidationError(\n+            f\"`{parameter}` payload is not a readable torch.save archive.\",\n+            parameter=parameter,\n+        ) from exc\n+\n+    if inflated_bytes > max_bytes:\n+        raise VLLMValidationError(\n+            f\"`{parameter}` payload inflates to {inflated_bytes} bytes \"\n+            f\"({inflated_bytes / MiB_bytes:.0f} MiB) when loaded, exceeding \"\n+            f\"the {max_bytes} byte limit. Set VLLM_MAX_EMBED_DECODE_BYTES to \"\n+            f\"increase this limit.\",\n+            parameter=parameter,\n+            value=inflated_bytes,\n+        )\n+\n+\n def safe_to_dense(tensor: object, *, parameter: str) -> torch.Tensor:\n     \"\"\"Densify a client-supplied embedding tensor within a memory budget.\n \n"
+        }
+      ]
+    },
+    {
+      "sha": "5b028fb8369dff6e5e8ba06d911d9ec98210fb51",
+      "author": {
+        "name": "Wei Zhao",
+        "email": "51183510+wzhao18@users.noreply.github.com"
+      },
+      "date": "2026-11-16T11:43:43+08:00",
+      "message": "[Perf][Mamba] Optimize prefill splits for mid-block resume (3 forward passes to 1) (#66938)\n\nSigned-off-by: wzhao18 <wzhao18.sz@gmail.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "7a558a78654fe95efb59a98ad7bc89b77071a7a5"
+      ],
+      "stats": {
+        "total_additions": 293,
+        "total_deletions": 7,
+        "files_changed": 5
+      },
+      "files": [
+        {
+          "filename": "tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py",
+          "status": "modified",
+          "additions": 125,
+          "deletions": 0,
+          "patch": "@@ -687,6 +687,131 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():\n     assert num_computed == 112\n \n \n+def _resume_mid_block(retention_interval, prompt_len):\n+    \"\"\"A 100-token prompt caches state@96, mid Mamba block 1 (block 64); a\n+    request extending it to `prompt_len` hits there.\"\"\"\n+    manager = make_full_mamba_manager(\n+        dcp_world_size=1,\n+        hash_block_size=16,\n+        full_block_size=16,\n+        mamba_block_size=64,\n+        num_blocks=64,\n+        num_prefill_checkpoint_blocks=1,\n+    )\n+    manager.coordinator.retention_interval = retention_interval\n+    owner = make_request(\"owner\", list(range(100)), 16, sha256)\n+    assert manager.allocate_slots(owner, 100) is not None\n+    manager.free(owner)\n+    manager.new_step_starts()\n+    request = make_request(\"resume\", list(range(prompt_len)), 16, sha256)\n+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)\n+    assert num_computed == 96\n+    return manager, request, computed_blocks\n+\n+\n+def _mamba_split(request, num_new_tokens, num_local_computed_tokens):\n+    scheduler = SimpleNamespace(\n+        block_size=64,\n+        cache_config=SimpleNamespace(block_size=64),\n+        hash_block_size=16,\n+        max_num_scheduled_tokens=8192,\n+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),\n+        use_eagle_block_drop=False,\n+        num_hash_lookahead_tokens=0,\n+        mamba_partial_cache_hit=True,\n+        mamba_shared_prefix_checkpoint=False,\n+        mamba_has_prefill_checkpoint_blocks=True,\n+        mamba_prefill_checkpoint_alignment=16,\n+    )\n+    return Scheduler._mamba_block_aligned_split(\n+        scheduler, request, num_new_tokens, num_local_computed_tokens\n+    )\n+\n+\n+@pytest.mark.parametrize(\"retention_interval\", [None, 0])\n+def test_mid_block_resume_exports_checkpoint_into_resumed_block(retention_interval):\n+    \"\"\"Resuming at 96 and ending in the next block (150) runs in one step: the\n+    checkpoint (144) goes into the resumed block, which the worker reads into\n+    the running block before the forward, and is keyed at 144, never as the\n+    block's end state (128).\"\"\"\n+    manager, request, computed_blocks = _resume_mid_block(retention_interval, 150)\n+    assert _mamba_split(request, 54, 96) == 54\n+    assert manager.allocate_slots(request, 54, 96, computed_blocks) is not None\n+\n+    mamba_blocks = manager.get_blocks(request.request_id).blocks[1]\n+    assert mamba_blocks[1].block_hash_num_tokens == 144\n+    hit = manager.block_pool.get_cached_block(request.block_hashes[144 // 16 - 1], [1])\n+    assert hit is not None and hit[0] is mamba_blocks[1]\n+    assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None\n+\n+\n+@pytest.mark.parametrize(\"retention_interval\", [None, 0])\n+def test_mid_block_resume_run_past_keeps_resumed_block_unkeyed(retention_interval):\n+    \"\"\"Resuming at 96 and ending two blocks later, the resumed block keeps\n+    state@96: it must not get the full-block hash of state@128.\"\"\"\n+    manager, request, computed_blocks = _resume_mid_block(retention_interval, 230)\n+    assert _mamba_split(request, 134, 96) == 134\n+    assert manager.allocate_slots(request, 134, 96, computed_blocks) is not None\n+\n+    mamba_blocks = manager.get_blocks(request.request_id).blocks[1]\n+    assert mamba_blocks[1].block_hash is None\n+    assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None\n+    assert mamba_blocks[2].block_hash_num_tokens == 224\n+    # The stale resumed block must not reach a connector either.\n+    offloads = drain_boundary_state_offloads(manager).get(request.request_id, [])\n+    assert offloads == [(1, mamba_blocks[2].block_id, 224)]\n+\n+\n+def test_running_request_resuming_mid_block_exports_into_resumed_block():\n+    \"\"\"A running request whose chunk stopped mid-block (96) exports its next\n+    chunk's checkpoint into that block, its own previous running block.\"\"\"\n+    manager = make_full_mamba_manager(\n+        dcp_world_size=1,\n+        hash_block_size=16,\n+        full_block_size=16,\n+        mamba_block_size=64,\n+        num_blocks=64,\n+        num_prefill_checkpoint_blocks=1,\n+    )\n+    request = make_request(\"running\", list(range(150)), 16, sha256)\n+    assert manager.allocate_slots(request, 96) is not None\n+    request.num_computed_tokens = 96\n+    manager.new_step_starts()\n+    assert manager.allocate_slots(request, 54) is not None\n+\n+    mamba_blocks = manager.get_blocks(request.request_id).blocks[1]\n+    assert mamba_blocks[1].block_hash_num_tokens == 144\n+    assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None\n+\n+\n+@pytest.mark.parametrize((\"num_new\", \"num_accepted\"), [(17, 15), (40, 40)])\n+def test_decode_step_resuming_mid_block_exports_no_checkpoint(num_new, num_accepted):\n+    \"\"\"A decode step with at least a hash block of drafts can pass the\n+    checkpoint rule, but decode rows export none: the block gets only the\n+    block-end state saved once 128 tokens are committed.\"\"\"\n+    manager = make_full_mamba_manager(\n+        dcp_world_size=1,\n+        hash_block_size=16,\n+        full_block_size=16,\n+        mamba_block_size=64,\n+        num_blocks=64,\n+        num_prefill_checkpoint_blocks=1,\n+    )\n+    request = make_request(\"decode\", list(range(112)), 16, sha256)\n+    assert manager.allocate_slots(request, 112) is not None\n+    request.num_computed_tokens = 112\n+    request.append_output_token_ids([1])\n+    manager.new_step_starts()\n+    assert manager.allocate_slots(request, num_new) is not None\n+    request.append_output_token_ids(list(range(num_accepted)))\n+    request.num_computed_tokens = 112 + num_accepted\n+    manager.cache_blocks(request, request.num_computed_tokens)\n+\n+    block = manager.get_blocks(request.request_id).blocks[1][1]\n+    expected = 128 if request.num_computed_tokens >= 128 else None\n+    assert block.block_hash_num_tokens == expected\n+\n+\n @pytest.mark.parametrize(\"retention_interval\", [None, 0, 32, 64, 256])\n @pytest.mark.parametrize(\"hash_block_size\", [16, 32])\n @pytest.mark.parametrize(\"use_eagle\", [False, True])"
+        },
+        {
+          "filename": "tests/v1/core/test_mamba_align_chunk_split.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 4,
+          "patch": "@@ -208,9 +208,8 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:\n         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE\n     )\n \n-    # A hash-aligned resume inside a physical Mamba block cannot use the fixed\n-    # internal-checkpoint column: it aliases the initial-state column. Enabling\n-    # checkpoints must therefore preserve the normal aligned split.\n+    # With checkpoint export, the checkpoint goes in the resumed column, whose\n+    # state is read before the forward, so the rest of the prompt runs at once.\n     assert (\n         _split(\n             request,\n@@ -219,7 +218,7 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:\n             partial_hit=True,\n             num_prefill_checkpoint_blocks=1,\n         )\n-        == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE\n+        == prompt_len - resume_at\n     )\n \n "
+        },
+        {
+          "filename": "tests/v1/e2e/general/test_mamba_prefix_cache.py",
+          "status": "modified",
+          "additions": 155,
+          "deletions": 0,
+          "patch": "@@ -890,3 +890,158 @@ def test_mamba_prefix_cache_mrv2_async_flashinfer(monkeypatch: pytest.MonkeyPatc\n         async_scheduling=True,\n         additional_config={\"gdn_prefill_backend\": \"flashinfer\"},\n     )\n+\n+\n+@pytest.mark.skipif(\n+    not current_platform.is_cuda()\n+    or not (\n+        current_platform.is_device_capability(90)\n+        or (\n+            (\n+                current_platform.is_device_capability_family(100)\n+                or current_platform.is_device_capability_family(120)\n+            )\n+            and current_platform.get_cuda_runtime_major() >= 13\n+        )\n+    ),\n+    reason=\"FlashInfer GDN prefill needs SM90, or SM100/SM120 with CUDA 13.\",\n+)\n+@create_new_process_for_each_test()\n+def test_mamba_mid_block_resume_exports_into_resumed_block(\n+    monkeypatch: pytest.MonkeyPatch,\n+):\n+    \"\"\"A partial hit resuming mid-block whose prompt ends in the next block\n+    prefills in one step, exporting the checkpoint into the resumed block.\n+\n+    With B = 576 and hits every 64 tokens: a 776-token prompt caches its state\n+    at 768 (block 1); a 1252-token prompt sharing it resumes at 768 and runs to\n+    1252 at once, exporting its checkpoint (1216) into block 1. Block 1 must\n+    then hold the state a fresh 1216-token prefill ends with, block 2 the one\n+    a fresh 1252-token prefill ends with, and the next turn must hit at 1216.\n+    \"\"\"\n+    monkeypatch.setenv(\"VLLM_ENABLE_V1_MULTIPROCESSING\", \"0\")\n+    envs.disable_envs_cache()\n+\n+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as MRV2GPUModelRunner\n+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import (\n+        MambaHybridModelState,\n+    )\n+\n+    B = BLOCK_SIZE\n+    produced, resumed_at, checkpoint, prompt = B + 200, B + 192, 2 * B + 64, 2 * B + 100\n+    # Distinct tokens make a shifted conv window visible.\n+    tokens = [(i * 7919) % 30000 + 1 for i in range(prompt + 64)]\n+    steps: list[tuple[int, int]] = []\n+    captured: dict[str, Any] = {}\n+    original_preprocess_state = MambaHybridModelState.preprocess_state\n+    original_execute_model = MRV2GPUModelRunner.execute_model\n+\n+    def wrapped_preprocess_state(self, input_batch, block_tables, *args, **kwargs):\n+        captured[\"block_tables\"] = block_tables\n+        captured[\"kv_cache_config\"] = args[0] if args else kwargs[\"kv_cache_config\"]\n+        return original_preprocess_state(\n+            self, input_batch, block_tables, *args, **kwargs\n+        )\n+\n+    def block_states(runner: MRV2GPUModelRunner, col: int) -> list[torch.Tensor]:\n+        # Every Mamba layer's (conv, temporal) states in block column col;\n+        # reading block ids back is a deliberate D2H.\n+        kv_cache_config = captured[\"kv_cache_config\"]\n+        forward_context = runner.vllm_config.compilation_config.static_forward_context\n+        states: list[torch.Tensor] = []\n+        with gpu_sync_allowed():\n+            for group_ids in get_mamba_groups(kv_cache_config).values():\n+                for group_id in group_ids:\n+                    block_id = int(captured[\"block_tables\"][group_id][0, col].item())\n+                    for name in kv_cache_config.kv_cache_groups[group_id].layer_names:\n+                        states.extend(\n+                            s[block_id].clone() for s in forward_context[name].kv_cache\n+                        )\n+        return states\n+\n+    def wrapped_execute_model(self, scheduler_output: SchedulerOutput, *args, **kw):\n+        # Skip profile/warmup runs and steps that schedule nothing.\n+        if not (captured.get(\"generating\") and scheduler_output.num_scheduled_tokens):\n+            return original_execute_model(self, scheduler_output, *args, **kw)\n+        new = scheduler_output.scheduled_new_reqs\n+        start = (\n+            new[0].num_computed_tokens\n+            if new\n+            else scheduler_output.scheduled_cached_reqs.num_computed_tokens[0]\n+        )\n+        num_scheduled = next(iter(scheduler_output.num_scheduled_tokens.values()))\n+        steps.append((start, num_scheduled))\n+        ret = original_execute_model(self, scheduler_output, *args, **kw)\n+        end = start + num_scheduled\n+        if end == captured.get(\"snapshot_end\"):\n+            captured[\"snapshot\"] = {\n+                col: block_states(self, col) for col in captured[\"snapshot_cols\"]\n+            }\n+        return ret\n+\n+    monkeypatch.setattr(\n+        MambaHybridModelState, \"preprocess_state\", wrapped_preprocess_state\n+    )\n+    monkeypatch.setattr(MRV2GPUModelRunner, \"execute_model\", wrapped_execute_model)\n+\n+    engine = LLM(\n+        model=MODEL,\n+        load_format=\"dummy\",\n+        enforce_eager=True,\n+        skip_tokenizer_init=True,\n+        enable_prefix_caching=True,\n+        block_size=B,\n+        prefix_match_unit=64,\n+        additional_config={\"gdn_prefill_backend\": \"flashinfer\"},\n+        max_num_batched_tokens=3072,\n+        max_model_len=B * 4,\n+        # Layer 3 is full attention: a single (GDN-only) KV cache group only\n+        # hits on whole blocks, so prefix_match_unit needs a second group.\n+        hf_overrides={\"num_hidden_layers\": 4},\n+        seed=42,\n+    )\n+    params = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)\n+    assert isinstance(engine.llm_engine.engine_core, InprocClient)\n+    scheduler = engine.llm_engine.engine_core.engine_core.scheduler\n+\n+    def prefill(num_tokens: int, snapshot_cols: tuple[int, ...] = (), llm=engine):\n+        steps.clear()\n+        captured[\"snapshot_end\"] = num_tokens if snapshot_cols else None\n+        captured[\"snapshot_cols\"] = snapshot_cols\n+        captured[\"generating\"] = True\n+        try:\n+            llm.generate([TokensPrompt(prompt_token_ids=tokens[:num_tokens])], params)\n+        finally:\n+            captured[\"generating\"] = False\n+        return [step for step in steps if step[0] < num_tokens]\n+\n+    try:\n+        prefill(produced)\n+        assert prefill(prompt, snapshot_cols=(1, 2)) == [\n+            (resumed_at, prompt - resumed_at)\n+        ]\n+        resumed = captured.pop(\"snapshot\")\n+        # The next turn resumes at the checkpoint in block 1.\n+        assert prefill(prompt + 64)[0][0] == checkpoint\n+\n+        references = {}\n+        for num_tokens in (checkpoint, prompt):\n+            assert scheduler.reset_prefix_cache()\n+            prefill(num_tokens, snapshot_cols=(2,))\n+            references[num_tokens] = captured.pop(\"snapshot\")[2]\n+\n+        state_len = (\n+            engine.llm_engine.model_config.hf_text_config.linear_conv_kernel_dim - 1\n+        )\n+        for col, num_tokens in ((1, checkpoint), (2, prompt)):\n+            for i, (new, ref) in enumerate(zip(resumed[col], references[num_tokens])):\n+                if i % 2 == 0:  # conv state: compare the window only\n+                    if not is_conv_state_dim_first():\n+                        new, ref = new.mT, ref.mT\n+                    new, ref = new[..., :state_len], ref[..., :state_len]\n+                rel_err = (new.float() - ref.float()).norm() / ref.float().norm()\n+                assert rel_err < 1e-2, (col, num_tokens, i, rel_err)\n+    finally:\n+        del engine\n+        torch.accelerator.empty_cache()\n+        cleanup_dist_env_and_memory()"
+        },
+        {
+          "filename": "vllm/v1/core/single_type_kv_cache_manager.py",
+          "status": "modified",
+          "additions": 8,
+          "deletions": 1,
+          "patch": "@@ -1987,6 +1987,12 @@ class MambaManager(SingleTypeKVCacheManager):\n         prefill_end: int,\n     ) -> bool:\n         checkpoint_idx = cdiv(query_end, self.block_size) - 2\n+        # Mid-block resume: the checkpoint goes in the resumed block, which is\n+        # private to the request and read before the forward overwrites it.\n+        reuses_resumed_block = (\n+            query_start % self.block_size != 0\n+            and checkpoint_idx == query_start // self.block_size\n+        )\n         blocks = self.req_to_blocks[request_id]\n         return (\n             self.has_prefill_checkpoint_blocks\n@@ -2001,7 +2007,8 @@ class MambaManager(SingleTypeKVCacheManager):\n             )\n             and checkpoint_idx >= 0\n             and (\n-                checkpoint_idx >= len(blocks)\n+                reuses_resumed_block\n+                or checkpoint_idx >= len(blocks)\n                 or blocks[checkpoint_idx].is_null\n                 or (\n                     request_id in self._allocated_block_reqs"
+        },
+        {
+          "filename": "vllm/v1/kv_cache_interface.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -619,11 +619,11 @@ def is_mamba_prefill_checkpoint_valid(\n         return False\n     assert checkpoint_alignment > 0\n \n-    initial_state_col = (query_start - 1) // mamba_block_size\n     checkpoint_col = cdiv(query_end, mamba_block_size) - 2\n     return (\n         query_start % hash_block_size == 0\n-        and checkpoint_col > initial_state_col\n+        # A mid-block query may export into its first column (private copy).\n+        and checkpoint_col >= query_start // mamba_block_size\n         and query_start + hash_block_size <= checkpoint_position\n         and query_start < checkpoint_position < query_end\n         and (checkpoint_position - query_start) % checkpoint_alignment == 0\n"
+        }
+      ]
+    },
+    {
+      "sha": "7a558a78654fe95efb59a98ad7bc89b77071a7a5",
+      "author": {
+        "name": "Thien Tran",
+        "email": "gau.nernst@yahoo.com.sg"
+      },
+      "date": "2026-11-16T11:41:17+08:00",
+      "message": "[Perf][Qwen4Exp] Drop the defensive zero fill from the QSA output path (#67728)\n\nSigned-off-by: Thien Tran <gau.nernst@yahoo.com.sg>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "parents": [
+        "bde6bff65560fafed4af81e2a599b3dac326a080"
+      ],
+      "stats": {
+        "total_additions": 8,
+        "total_deletions": 2,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/models/qwen4_exp/test_qsa_reference.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 1,
+          "patch": "@@ -1108,7 +1108,10 @@ def test_qsa_sparse_paged_attention_correctness(\n     else:\n         k_scale, v_scale = 1.0, 1.0\n \n-    actual = qsa_ops.qsa_sparse_paged_attention(\n+    actual = torch.full_like(q, torch.nan)\n+    # Poisoned out buffer: the assert below fails if any actual row is left\n+    # unwritten, which is what lets the caller skip zero-filling it.\n+    qsa_ops.qsa_sparse_paged_attention(\n         q,\n         k_cache,\n         v_cache,\n@@ -1116,6 +1119,7 @@ def test_qsa_sparse_paged_attention_correctness(\n         block_table,\n         token_to_req,\n         use_prefill_config=use_prefill_config,\n+        out=actual,\n         k_scale=k_scale,\n         v_scale=v_scale,\n         output_gate=output_gate,"
+        },
+        {
+          "filename": "vllm/models/qwen4_exp/nvidia/qsa.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 1,
+          "patch": "@@ -230,7 +230,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):\n     ) -> torch.Tensor:\n         \"\"\"Run sparse attention over the owner's indexer-selected K/V rows.\"\"\"\n         num_tokens = attn_metadata.num_actual_tokens\n-        output.zero_()\n+        # No zero fill: the kernel writes every actual row (empty selections\n+        # included), and padding rows only feed row-wise ops, never sampled\n+        # outputs — same contract as the other attention backends.\n         if num_tokens == 0:\n             return output\n \n"
+        }
+      ]
+    },
+    {
       "sha": "bde6bff65560fafed4af81e2a599b3dac326a080",
       "author": {
         "name": "Artur Fierka",

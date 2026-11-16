@@ -1,0 +1,387 @@
+{
+  "date": "2026-11-16",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-16T12:46:57+08:00",
+  "daily_summary": "## 今日概览\n26 条提交（11 月 16 日仍在进行，这是抓取时刻的量）。三条线：一是启动与捕获阶段按 max_num_seqs * max_model_len 收口，越界读块表的两处漏洞一起补上；二是混合模型（Mamba align）的前缀缓存，先修错误发布、再把中途恢复的分段前向从三步压成一步；三是 AMD MI355X 继续压每步耗时，并把 eager 的 prefill 上下文并行带给 DeepSeek-V4.1-Flash。CI 3 条都是分片红灯。\n\n## 今日重点\n\n### 跨平台 / 引擎通用\n- **捕获尺寸**：max_num_batched_tokens 大于 max_num_seqs * max_model_len 时，编译区间 warmup、FlashInfer autotune 与 CUDA graph 捕获都按 max_num_batched_tokens 定规模，dummy 请求被摊成超过 max_model_len 的序列，注意力读到块表之外并报非法内存访问。前一日的 #67545 已约束 _dummy_run，今天的 #67469 再让 CudaGraphManager 丢掉超大的 prefill/mixed 捕获尺寸并按既有风格告警，覆盖不走 _dummy_run 的捕获路径。\n- **混合模型前缀缓存**：#67717 修的是错误发布——一次 prefill 从块中间的命中恢复又跑过块末尾时，块里存的是恢复点状态、却按整块哈希发布，下一条共享前缀的请求拿到截断状态就出乱码；现在状态不在块末尾的块不以整块哈希发布。#66938 在此基础上把这种请求从最多三步压成一步，做法是让 checkpoint 状态写进恢复自的那个块。动因是 Kimi K3.1 在张量并行 8 加解码上下文并行 8、--prefix-match-unit 128 下，1280 token 的块与 128 的命中边界错开。\n- **输入边界与安全**：#67316 把 VLLM_MAX_EMBED_DECODE_BYTES 的校验提到 torch.load 之前——一个 4.2 MB 的 base64 prompt_embeds 曾在 main 上让加载分配 3072 MiB，取其一行 view 还能绕过 2 GiB 限额，现在两者都在加载前被拒、峰值 RSS 只涨 0-1 MiB。#67408 让不带 tokenizer 的 --tokens-only 与 --skip-tokenizer-init 服务对 sampling_params.bad_words 返回 400，此前返回 200 且完全不生效。\n- **连接器**：#64363 把 Mooncake 的传输引擎收到 register_regions / submit / poll 接口后面，连接器不再直接触碰 mooncake.engine.TransferEngine，行为与线上格式不变；#62056 让 routed experts 在 P/D 分离下按行拼接返回，不新增请求字段，并去掉对 NIXL、MoRIIO、Mooncake 的拒绝。\n\n### AMD / ROCm\n- **Muse Spark**：8 张 MI355X 的 TEP8 单内核路径下，DSpark 的 5 个草稿层加 final norm 原来是约 70 个小 kernel、11 次 all-reduce，现在 1 或 2 请求的草稿步合成一次常驻 FlyDSL 启动，1 请求时 684-732 微秒降到 337-338，并发 2 交互性 +6.3%（#65985）。\n- **DeepSeek-V4.1**：DP 共享的 Engram 表（94 GiB 放 /dev/shm）下每层查找要花 36-110 毫秒且主流水空转，原因是 ROCm 从来不走已有的按表偏移排序路径，无序大查找把地址转换打爆，4 行改动从 32768 行起打开排序（#67805）；eager 的 prefill 上下文并行（PCP=2）正式可用，GSM8K 落在不带 PCP 基线一个标准误内，PCP 之上再开专家并行也行（#66842）。\n- **recipe**：DeepSeek-V4.1-Flash 加 MI300X AgentX 预设，12 个并发点覆盖张量并行 8 与 4，Engram 表按拓扑分别常驻显存与卸载到宿主（#67586）；Kimi-K3.1-Pro 的 MI355X 预设换到 kimi-k31-5c14fe8 镜像并在每个点设 VLLM_K3_SP_PREFILL=1（序列并行 prefill 只在 DCP8 下真正生效）（#67817）。\n\n### NVIDIA\n- **Qwen3.5**：把动态按 token 的 FP8 输入量化并进融合 Gemma add-RMSNorm，此前每个 input_layernorm 与 post_attention_layernorm 后都要单独跑一次量化 kernel；SM120 上解码尺寸快 1.6-1.9 倍、prefill 快 1.27-1.56 倍，FP8 码与 token scale 同非融合链（#67393）。\n- **Qwen4Exp（Qwen3.8-Flash-Next）**：去掉 QSA 输出路径上防御性的整块零填充，kernel 不变、真实行逐位相同，测试改用 NaN 污染 buffer 强制检查写入覆盖（#67728）。\n- **Rubin（SM107）**：flashinfer_moe_ep_cutedsl 后端在计算能力 10.7 上支持 NVFP4 专家，需要 flashinfer 0.7.3 以上、nvshmem4py-cu13 与 CUTE_DSL_ARCH=sm_107a，且永不自动选中（#65974）；Fast Start 的 CUDA IPC 权重缓存重启支持 compressed-tensors 的 128×128 分块 FP8 linear（#63976）。\n\n### Intel XPU\n稀疏 MLA 的 Triton kernel 从来没施加按头的 attn_sink，softmax 因此是错的（1 个有效 key 的行误差达输出的 105-118%），补上可选 sink 参数并让不传 sink 的 V3.2、GLM-5 逐位不变（#64252）；未量化的 MoE LoRA 改走 XpuFusedMoe 的两个 hook 而不是 Triton experts，fused_moe_lora 新增 row_map 描述 (token, topk) 到输出行的映射（#62807）。\n\n### 多模态\nLlama 4 计算图像占位符时用 processor 默认的 max_patches，而产出 pixel_values 的 HF processor 用的是请求合并后的参数，两者不一致；改成都从合并 kwargs 读（#67813）。ERNIE-4.5-VL 的视频预算与 profile 假输入按图像设置算，允许的视频比 profile 过的大，首条视频就在视觉编码器 OOM；改按 video_min_pixels / video_max_pixels 定标后，启动 profile 的就是允许的最大视频（#66937）。PD 实例重置编码器缓存后，ECMooncakeConnector 仍以为 embedding 在本地、不从 Encoder 重载，导致 Encoder cache miss 打死引擎，现在重置同时清连接器本地缓存（#66846）。\n\n## 需要关注\n- #67316 之后，超限的嵌入归档在加载前就被拒绝；此前靠 torch.load 之后检查侥幸通过的客户端会开始报错。\n- #67717 与 #66938 成对改变 Mamba align 前缀缓存的发布与分步行为，#66938 依赖 #67717，两者一起看。\n- #67469 会丢弃大于 max_num_seqs * max_model_len 的捕获尺寸，这类配置的 CUDA graph 覆盖范围变窄（带告警）。\n",
+  "sig_summaries": {
+    "sig-core": "7 条，两条正确性主线加输入边界。\n- **捕获尺寸**：#67469 让 CudaGraphManager 丢掉大于 max_num_reqs * max_model_len 的 prefill/mixed 捕获候选并告警，补上前一日 #67545 约束 _dummy_run 之后仍未覆盖的捕获路径；两条合起来才把越界读块表的启动崩溃堵干净。\n- **混合模型前缀缓存**：状态不在块末尾的块不再以整块哈希发布（#67717）；在此基础上把中途恢复的请求从最多三步压成一步，checkpoint 写进恢复自的块（#66938）。\n- **输入校验**：嵌入归档的未压缩大小在 torch.load 之前检查，堵住 deflate 压缩全零 storage 的解压放大（#67316）；没有 tokenizer 时对 sampling_params.bad_words 返回 400 而不是无效的 200（#67408）。\n- **LoRA**：XPU 上未量化的 MoE LoRA 走 XpuFusedMoe 的 activation/output hook，fused_moe_lora 新增 row_map（#62807）。\n",
+    "sig-model-performance": "6 条，AMD 与 NVIDIA 各半。\n- **AMD**：DP 共享 Engram 表下从 32768 行起按表偏移排序宿主查找，避免无序查找把地址转换打爆（此前每层 36-110 毫秒且主流水空转，#67805）；Muse Spark 单内核路径把 5 个 DSpark 草稿层加 final norm 合成一次常驻 FlyDSL 启动，1 请求时 684-732 微秒降到 337-338，并发 2 交互性 +6.3%（#65985）。\n- **NVIDIA**：Qwen3.5 把动态按 token 的 FP8 量化并进融合 Gemma add-RMSNorm，SM120 解码尺寸快 1.6-1.9 倍（#67393）；Qwen4Exp 去掉 QSA 输出路径的整块零填充，并用 NaN 污染 buffer 约束写入覆盖（#67728）；flashinfer_moe_ep_cutedsl 在 SM107（Rubin）上支持 NVFP4 专家，需 FlashInfer 0.7.3 以上且永不自动选中（#65974）。\n- **Intel**：稀疏 MLA 的 Triton kernel 补上 attn_sink，此前 XPU 上 softmax 归一化是错的，1 个有效 key 的行误差达输出的 105-118%（#64252）。\n",
+    "sig-ci": "3 条，都是分片红灯。\n- **AMD**：语音转写正确性测试把 Canary 改到 fp32 跑并与确定性 fp32 基线比较——bf16 下某条语音是否落进贪心重复循环取决于批次组成，fp32 下全数据集字错率固定 12.4564（#67606）。\n- **NVIDIA**：Humming 量化测试改为 patch 平台类而不是实例，避免撤销实例级 monkeypatch 后在 current_platform.__dict__ 里留下绑定的 @classmethod @cache 方法、导致后续闭包无法被 cloudpickle 序列化（#67752）。\n- **Intel**：新增的 LoRA OLMoE 作业配置里 workspace 填错，改回正确值，一行（#67824）。\n",
+    "sig-omni": "3 条，处理器参数口径与缓存记账。\n- **Llama 4**：占位符数量按 processor 默认的 max_patches 算，而 pixel_values 由合并了请求参数的 HF processor 产出，按请求设 max_patches 时两者不一致；现在 max_patches 与 resize_to_max_canvas 都从合并后的 image kwargs 读，做法与 Mistral3 一致（#67813）。\n- **ERNIE-4.5-VL**：视频预算、帧数与 profile 假输入过去按图像设置定，而 processor 用 video_min_pixels / video_max_pixels 缩放视频帧，导致允许的视频比 profile 过的大、首条就在视觉编码器 OOM；改按视频像素上限定标后启动就为最大视频预留或启动即失败（#66937）。\n- **EC 连接器**：PD 实例重置编码器缓存时 Scheduler.reset_encoder_cache() 只清 EncoderCacheManager 的哈希、不填 freed，连接器的 _local_cache 要到 build_connector_meta 才被丢弃，于是下一次同图请求不再从 Encoder 重载、撞空缓存并打死 EngineCore；现在重置一并清连接器本地缓存（#66846）。\n",
+    "sig-large-scale-serving": "3 条。\n- **传输后端解耦**：Mooncake 的传输角色收到 register_regions / unregister_regions、submit(peer, op, ranges)、poll() 接口后面，TransferEngineBackend 用原来那次阻塞批量调用实现它；状态文本、失败传播、配置键与线上格式都不变（#64363）。\n- **辅助输出**：routed experts 在 P/D 分离下按行返回再拼接，prefill 给 [0, R)、decode 从 R 起，代理带 routed_experts_prompt_start，不新增字段；配置里对 NIXL、MoRIIO、Mooncake 的拒绝被移除（#62056）。\n- **上下文并行**：ROCm 上为纯文本 DeepSeek-V4.1-Flash 打开 eager 的 prefill 上下文并行（PCP=2），专家并行关闭时跨 PCP rank 收集 MoE 路由输入 id，注意力跳过 ROCm 的流重叠路径并把补齐尾部清零；不支持的组合仍拒绝（#66842）。\n",
+    "sig-spec-decode": "1 条。\n- **LFM3 作为目标模型**：Lfm3ForCausalLM 实现 SupportsEagle3，此前任何需要辅助隐状态的方法在加载时报 Model does not support EAGLE3 interface；辅助隐状态跨流水线并行 rank 中继，与 Qwen2Model 一致。LiquidAI/LFM3-1.7B 单卡用 Speculators 的 extract_hidden_states（层 3、11、19、23、24）跑在线 DSpark 训练，1000 步内 0 条非有限值记录（#66323）。\n",
+    "sig-quantization": "1 条。\n- **Fast Start 支持分块 FP8**：CUDA IPC 权重缓存重启此前不接受 serialized compressed-tensors 的 128×128 分块 FP8 linear 权重，本 PR 在校验通过的 CUTLASS 后端下复用处理后的权重与 scale，保持输出逐位相同与共享存储，不支持的配置仍拒绝。B300 上真实模型按普通加载、回退、IPC、第二次 IPC 走通（#63976）。\n",
+    "other": "2 条，都是 AMD recipe。\n- **DeepSeek-V4.1-Flash**：新增 InferenceX #5058 的 MI300X AgentX 预设，并发 1/2/4/8/16/32 各覆盖张量并行 8 与 4 共 12 个 opt-in 点，钉住实测镜像 nightly-rocm100-f5d93296，Engram 表张量并行 8 常驻显存、张量并行 4 卸载宿主（#67586）。\n- **Kimi-K3.1-Pro**：MI355X AgentX TP8 预设对齐 InferenceX #5089，镜像换成 kimi-k31-5c14fe8（含 recipe 层的 docker_image），每个并发点加 VLLM_K3_SP_PREFILL=1；runbook 注明序列并行 prefill 只在 DCP8 下生效，并发 1 时服务器会报不支持并退回默认 all-reduce（#67817）。\n"
+  },
+  "commits": [
+    {
+      "sha": "c02ebf136ed70dd6d9cc7b8858d27f8660f418de",
+      "comment": "新加的 LoRA 测试 LoRA OLMoE 在 Intel 作业配置里挂错了自己占用的 workspace 标识，一行改回正确的值。只动 .buildkite/intel_jobs/lora_intel.yaml，不涉及测试内容与运行时行为。",
+      "sig": "sig-ci",
+      "sig_reason": "只修正 Intel CI 里新增 LoRA 作业的 workspace 配置。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "intel",
+        "lora",
+        "workspace"
+      ],
+      "pr_number": 67824
+    },
+    {
+      "sha": "777288d2eb129baacda26d446d18b31d6e518ba1",
+      "comment": "Llama 4 计算 aspect_ratios 与 patches_per_image（并据此推出图像占位符数量）时用的是 image processor 的默认 max_patches，而产出 pixel_values 的 HF processor 用的是合并了请求参数的 kwargs。于是按请求传 mm_processor_kwargs={\"max_patches\": N}，或在初始化/请求级传 images_kwargs 里的 max_patches 时，pixel_values 实际切出的 tile 数比 vLLM 记的要少，占位符与像素不匹配。本 PR 从合并后的 image kwargs 里读 max_patches 与 resize_to_max_canvas，做法与 Mistral3 解析 size 的方式一致。带上按请求或作用域内的 max_patches 时 Llama 4 请求可以正常跑，提示 token id 与 HF processor 一致；默认参数与初始化时平铺的 max_patches（本来就能用）产出的占位符不变。验证在一台 RTX PRO 6000 Blackwell（Colab）上用 nightly wheel 0.34.0rc1.dev509+g0431c0f73 作基线对比。",
+      "sig": "sig-omni",
+      "sig_reason": "修多模态处理器参数在提示拼装与像素生成之间的口径不一致。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "llama4",
+        "max-patches",
+        "image-processor"
+      ],
+      "pr_number": 67813
+    },
+    {
+      "sha": "4d6df3fad69f7f80b78309855a6396881b23ad88",
+      "comment": "给 Lfm3ForCausalLM 加上 EAGLE-3 的辅助隐状态支持（实现 SupportsEagle3），这样 LFM3 可以作为 EAGLE-3、DFlash、DSpark 草稿模型以及 extract_hidden_states 的目标模型。此前任何需要辅助隐状态的方法在加载时就报 RuntimeError: Model does not support EAGLE3 interface（#66311）。辅助隐状态会跨流水线并行 rank 中继（supports_aux_hidden_states_over_pp = True），做法与 Qwen2Model 一致。单卡（流水线并行 1、张量并行 1）用 LiquidAI/LFM3-1.7B 加 Speculators 的 launch_vllm.py（extract_hidden_states，层号 3、11、19、23、24）跑在线 DSpark 训练：改前引擎启动失败，改后能启动、能抽取隐状态、训练能跑，带 --no-enable-prefix-caching --enforce-eager 时 1000 步里 0 条非有限值的隐状态记录。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "补齐目标模型对草稿训练所需辅助隐状态接口的实现。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "lfm3",
+        "eagle3",
+        "aux-hidden-states"
+      ],
+      "pr_number": 66323
+    },
+    {
+      "sha": "2f70c32d07af8063b632cb67fa160b3fd19ea90b",
+      "comment": "ERNIE-4.5-VL 允许的视频比它启动时 profile 过的更大，因此一条被允许的视频在请求阶段可能把视觉编码器跑到 OOM（main 上 16384 的预算下，一条 4,645 token 提示配一个 8 帧视频就崩）。原因是视频预算、帧数与 profile 用的假输入都按图像设置算，而 processor 实际是按 video_min_pixels / video_max_pixels 缩放视频帧。本 PR 改按视频像素上限来定这几项，让启动时 profile 的就是允许的最大视频：要么预留够显存，要么在启动阶段就失败。视频编码本身不变，沿用 #66608 的做法。1 张 A100 80GB 在 16384 与 24576 预算下：main 在第一条允许的视频上 OOM，本 PR 下所有测试视频都跑完，包括占满预算的 15,569 与 23,941 token 提示（输入为随机像素帧）。",
+      "sig": "sig-omni",
+      "sig_reason": "把视频显存 profile 的口径对齐到实际允许的视频像素上限，避免运行期 OOM。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "ernie-45-vl",
+        "video",
+        "memory-profiling"
+      ],
+      "pr_number": 66937
+    },
+    {
+      "sha": "d1911f711c07a9c4ceb05c993166b00ed4866497",
+      "comment": "VLLM_MAX_EMBED_DECODE_BYTES（#54632）限制客户端提交的 prompt_embeds、image_embeds、audio_embeds、video_embeds 张量的稠密大小，但这个检查在 torch.load 之后才做。torch.save 的产物是 zip，torch.load 会按归档里记录的未压缩大小读取每个 storage 条目，因此一个 deflate 压缩的全零 storage 会在检查之前就在 torch.load 内部膨胀到很多 GiB；取其中一行的 view 能通过检查，却把整个 storage 一直留在内存里。本 PR 在调用 torch.load 之前先检查归档的未压缩大小。4.2 MB 的 base64 prompt_embeds 载荷在 main 上让 safe_load_prompt_embeds 分配 3072 MiB，而同一 storage 的 (1, hidden) view 在 2 GiB 限额下仍被接受并带着那 3 GiB；本 PR 里两者都在加载前被拒绝，峰值 RSS 只涨 0-1 MiB。限额内的归档照常加载，压缩与否都一样。文档 docs/usage/security.md 与稀疏张量校验测试同步更新。",
+      "sig": "sig-core",
+      "sig_reason": "把客户端嵌入输入的体积校验提前到反序列化之前，堵住解压放大路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "security",
+        "embed-inputs",
+        "input-validation"
+      ],
+      "pr_number": 67316
+    },
+    {
+      "sha": "5b028fb8369dff6e5e8ba06d911d9ec98210fb51",
+      "comment": "混合模型（Mamba 的 align 模式）前缀缓存下，一次请求从某个 Mamba 块中间的命中恢复、而提示又结束在下一个块里时，main 要跑最多三步：先在块边界停、再在 checkpoint 处停、最后跑剩下的。本 PR 让它一步跑完——把 checkpoint 状态写进请求恢复自的那个块（在该请求的块表里）。这依赖 #67717：那处改动保证被中途恢复跑过的块不会以整块哈希发布，本 PR 正是据此才敢把 checkpoint 放进恢复块。动因示例是 Kimi K3.1 在单机张量并行 8 加解码上下文并行 8（2 × 4 GB300）、--prefix-match-unit 128、--max-num-batched-tokens 16384 下：块大小 1280 token，而前缀命中落在 128 的边界；第一条请求 1,984 token 的提示，其缓存状态停在 1,920，正好在块 1 中间。",
+      "sig": "sig-core",
+      "sig_reason": "减少混合模型前缀缓存命中后的分段前向次数，属缓存管理与调度步骤。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "mamba",
+        "prefix-cache",
+        "chunked-prefill"
+      ],
+      "pr_number": 66938
+    },
+    {
+      "sha": "7a558a78654fe95efb59a98ad7bc89b77071a7a5",
+      "comment": "去掉 Qwen3.8-Flash-Next（Qwen4Exp）真实 QSA 前向路径里那次防御性的 output.zero_()，每层每次推理因此少一次对整个补齐输出的零填充；注意力 kernel 本身不变，它会覆盖每一行真实数据，真实行的输出仍逐位相同。这是 #64419 里 GDN 那处改动在 QSA 上的对应做法。测试侧改用被 NaN 污染的输出 buffer 来强制检查写入覆盖：kernel 正确性测试里任何一行真实数据没被写就会在与参考比较时失败，并覆盖 Triton split-K 与 Blackwell fp8 decode kernel 两条分派；既有的 fp8 kernel 测试仍断言 request id 为 -1 的惰性行不产生输出。B300（sm_103）上 test_qsa_reference.py 与 test_qsa_prepare.py 共 98 passed。",
+      "sig": "sig-model-performance",
+      "sig_reason": "删除注意力输出路径上多余的整块清零，减少每层每次的填充开销。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "qwen4exp",
+        "qsa",
+        "zero-fill"
+      ],
+      "pr_number": 67728
+    },
+    {
+      "sha": "bde6bff65560fafed4af81e2a599b3dac326a080",
+      "comment": "XPU 上 DeepSeek-V4 的稀疏 MLA 通路从来没有施加按头的 attn_sink：prefill 调用点没传，xpu_sparse_decode_fp8() 接了参数却丢掉，而 NVIDIA、ROCm 与 CPU 后端都施加了。softmax 因此是错的——以 1 个有效 key 的行为例，误差达到输出的 105-118%，512-2048 个 key 时也有 0.2-0.8%（fp32 参考，sink 取已发布 V4-Flash 的 [-2.20, +2.49] 区间，Intel Arc Pro B70，bf16）。本 PR 给 _bf16_mla_sparse_kernel 与 triton_bf16_mla_sparse_interface 加可选的 attn_sink（用 HAS_ATTN_SINK 常量分支），sink 进入 softmax 分母、lse 仍只覆盖被选中的 key，并在 V4 的 prefill 与 decode 调用点传入；不传 sink 的调用方（V3.2、GLM-5）逐位不变。Arc Pro B60 上 tests/kernels/attention/test_xpu_mla_sparse.py 为 29 passed（其中 25 个是新增用例），未修的 kernel 在这 25 个上失败。",
+      "sig": "sig-model-performance",
+      "sig_reason": "补齐 Intel 稀疏 MLA kernel 缺失的 attn_sink，修正注意力归一化结果。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "xpu",
+        "sparse-mla",
+        "attn-sink"
+      ],
+      "pr_number": 64252
+    },
+    {
+      "sha": "b99384c624074d6d94d1407d46fda3ca001691d9",
+      "comment": "在 vllm serve --tokens-only 与 --enable-scale-out --skip-tokenizer-init 两种模式下，带 sampling_params.bad_words 的 /inference/v1/generate 请求返回 200，而且 token 与不带该参数时完全一样：bad_words 只有在服务器加载了 tokenizer 时才会被切成 token，而 ServingTokens.serve_tokens 从不读这个字段（#67407）。本 PR 让 serve_tokens 在没有 tokenizer 时对该请求返回 400，文案是 sampling_params.bad_words requires a tokenizer, but this server does not load one；直接发请求和把 /v1/completions/render 产出的 GenerateRequest 转过来都走同一条判定。文档 token_in_token_out.md 的 sampling_params 一行写明会 400。加载了 tokenizer 的服务器行为不变。",
+      "sig": "sig-core",
+      "sig_reason": "把无法生效的采样参数改成明确拒绝，属入口参数校验。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "sampling",
+        "tokenizer",
+        "http-status"
+      ],
+      "pr_number": 67408
+    },
+    {
+      "sha": "0067b98f7e62c774ea4acd300eea743aed832aaf",
+      "comment": "在 prefill/decode 的 PD 实例上重置编码器缓存会打断下一个使用同一张图的请求：A→A 正常，A→重置 PD→A 变成 Encoder cache miss、EngineDeadError、HTTP 500，PD 的 EngineCore 随之关闭。原因是记账缺口——PD 引擎已经丢掉 embedding，但 ECMooncakeConnector 仍认为它在本地，于是不会从 Encoder 重新加载，引擎撞到空缓存抛出未处理的 RuntimeError: Encoder cache miss。Scheduler.reset_encoder_cache() 只调了 encoder_cache_manager.reset()，它清掉 EncoderCacheManager 的哈希却不填 freed，而连接器的 _local_cache 要到 build_connector_meta 里经 free_encoder_mm_hashes 才被丢弃，重置后这条路径走不到。本 PR 让重置同时清掉连接器的本地缓存，并补上相应的释放与记账（memory、reservation、scheduler、state、worker 与 ec_connector/base.py），含新的单元测试。",
+      "sig": "sig-omni",
+      "sig_reason": "修分离式编码器缓存重置后的本地副本记账，避免多模态请求撞空缓存。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "ec-connector",
+        "encoder-cache",
+        "mooncake"
+      ],
+      "pr_number": 66846
+    },
+    {
+      "sha": "3494bb04178506d66d62c1e522dd97b73f7555f4",
+      "comment": "为 DeepSeek-V4.1-Flash 的 recipe 增加 InferenceX #5058 的 MI300X AgentX 预设：原 recipe 写了 MI300X 的 serving，但没把这条赛道的张量并行 8 与张量并行 4 工作点暴露给 builder。新增 12 个 opt-in 点（并发 1/2/4/8/16/32 各两种拓扑），限定在该赛道实测的 0909 checkpoint；钉住赛道用的 nightly-rocm100-f5d93296 镜像，Engram 表按拓扑放置（张量并行 8 常驻显存、张量并行 4 卸载到宿主）；保留 vLLM 默认的 SWA 有界重放，该镜像含 #65249 因此 CDNA3 上前缀缓存 SWA 重放也开着，runbook 注明更早的 v0.33.0 镜像不含 #65249、当时用 --no-swa-bounded-replay。serving 命令保留真实的推测验证，并单独说明 AgentX 的吞吐控制与评测范围。验证在 upstream/main 的 fee968681 配 recipes@55a0307 的渲染器上做。",
+      "sig": "other",
+      "sig_reason": "只新增面向用户的 recipe 预设与运行说明。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "deepseek-v41",
+        "mi300x",
+        "agentx"
+      ],
+      "pr_number": 67586
+    },
+    {
+      "sha": "193d81ab898f797586e318b0344afd9aa2cc2ea7",
+      "comment": "给 lm_head 加加载时的权重-only 在线 int4 量化：新权重格式 int4_per_group_32_asym（非对称 uint4，每 32 个输入通道一组 scale 与 zero point），把未量化的 fp16/bf16 ParallelLMHead 在加载时转成该格式，头跑在平台自己的混合精度 linear kernel 上（choose_mp_linear_kernel），gfx11/gfx12 上就是已有的 RDNAHybridW4A16LinearKernel，不改 C++。用法是把 targets 指到头：vllm serve amd/Qwen3.6-35B-A3B-Quark-UINT4-G128 --quantization-config 里用 re:.*lm_head$，因为该模型的头叫 language_model.lm_head，裸写 lm_head 只会选中顶层。动机是每个解码步都要读整个 lm_head，而很多 int4 checkpoint 把它留在 16 位：Qwen3.6-35B-A3B 上是 248320 × 2048、约每 token 970 MB，在 Strix Halo（gfx1151，211 GB/s）上要 4.5 毫秒，是解码里最大的一项。",
+      "sig": "sig-quantization",
+      "sig_reason": "新增一种输出层的在线 int4 权重格式，减少解码每步的权重读取。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "int4",
+        "lm-head",
+        "online-quantization",
+        "rdna"
+      ],
+      "pr_number": 62708
+    },
+    {
+      "sha": "12e8576f6f41012e2a56ddcc5a4516bf8b6edac9",
+      "comment": "把 Qwen3.5 NVIDIA 路径上已有的融合 Gemma add-RMSNorm 加输入量化（#64509）扩到动态按 token 的 FP8，也就是 llm-compressor 的 FP8_DYNAMIC checkpoint（如 RedHatAI/Qwen3.5-*-FP8-dynamic）与在线 PTPC FP8 使用的激活方案。此前这些模型在每个 input_layernorm 与 post_attention_layernorm 之后都要单独跑一次 dynamic_per_token_scaled_fp8_quant。融合 kernel 产出的 FP8 码与 (M, 1) 的 token scale 和非融合链一致：归一化后的 bf16 值相同的行逐位相同，只有 1-ulp 差异的少数行最多差一个码（与静态 FP8 路径同一约定）。SM120 上解码尺寸（M = 1-64）norm 加量化快 1.6-1.9 倍，prefill 尺寸快 1.27-1.56 倍；在张量并行 1 以及 FlashInfer AR+norm 不运行的场合（例如只有 PCIe 互联的 GPU）每层两个 norm 后的独立量化 kernel 全部消失。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把动态按 token 的 FP8 输入量化并进归一化 kernel，减少解码每层的小 kernel。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "qwen35",
+        "fp8",
+        "kernel-fusion"
+      ],
+      "pr_number": 67393
+    },
+    {
+      "sha": "88883873ed60cdef7f710bd56855c0bf9e86d08d",
+      "comment": ":amd: (MI355 DPX) Entrypoints Integration (Speech to Text) 里 test_wer_correctness 的 nvidia/canary-1b-v2 参数化偶发失败。本 PR 让该用例以 fp32 跑 Canary，并与确定性的 fp32 基线比较。抖动不是普遍的字错率漂移，而是某条语音落进贪心重复循环；在 bf16 下是否进入这个循环取决于批次组成。改成 --dtype=float32 后，不论批次怎么组输出都一致，全数据集字错率固定为 12.4564，与 #64215 报告的 Transformers fp32 参考值 12.46 相符。测试级改动：whisper 与 cohere 用例不变、请求仍并发发送、容差公式不变，出现循环的那次（字错率不小于 12.98）在新上限 12.68 下仍判失败。全部本地运行在 MI355X（gfx950）。",
+      "sig": "sig-ci",
+      "sig_reason": "只把语音转写正确性测试改为 fp32 基线，消除批次相关的贪心循环抖动。",
+      "tags": [
+        "test",
+        "low-risk",
+        "rocm",
+        "speech-to-text",
+        "dtype"
+      ],
+      "pr_number": 67606
+    },
+    {
+      "sha": "3b1f19c1e35f49ed147c38cc49604eef5092eb9b",
+      "comment": "Muse Spark Open 在 8 张 MI355X（TEP8、--monokernel）上，DSpark 的 5 个草稿层加最后的 norm 原来是约 70 个小 kernel、11 次 all-reduce。本 PR 对草稿步里 1 或 2 个请求的情况把它们合成一次常驻 FlyDSL 启动；其余情况仍跑 stock 草稿层。基于目标侧 monokernel #63440，依赖已合并的 #65125。草稿层加 final norm 的 CUDA graph 耗时：1 请求时 684-732 微秒降到 337-338，2 请求时 728-733 降到 380。完整 AgentX（同机同镜像）交互性并发 1 +4.1%、并发 2 +6.3%，每 GPU 吞吐 +2.8% / +1.5%。精度不变：GSM8K（并发 1-16）、多 key 大海捞针（32k-512k）、AIME25（32 seeds，−0.10 ± 0.41 个百分点）、RULER NIAH 都在 stock 的运行间波动内。没有新增开关，KV cache 池 −0.09%（加载期的 peer 与 scratch 缓冲，不复制权重）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "把 ROCm 单内核路径的草稿层合并为一次常驻启动，缩短每步草稿耗时。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "muse-spark",
+        "dspark",
+        "monokernel"
+      ],
+      "pr_number": 65985
+    },
+    {
+      "sha": "b6ed9b6b915099b9a57b99cb39c5793134ee2ac8",
+      "comment": "让 P/D 分离部署下也能返回 routed experts，只用现有请求字段：prefill 实例（max_tokens=1）返回第 [0, R) 行，R 是提示长度减去 KV 连接器的 prefill 回退量；代理带着 routed_experts_prompt_start = R（是 prefill 返回的行数，不是提示长度）发 decode 请求；decode 实例从 R 开始返回，代理把两段拼接起来。不新增请求或响应字段。改动包括：删掉配置里拒绝在 NIXL、MoRIIO、Mooncake 连接器下使用 routed experts 的检查；命中前缀缓存时只需要 emit 起点之后的行，max_cache_hit 取 min(max(行覆盖的 token 数, emit 起点), num_tokens - 1)，新请求的 emit 起点是 capped 后的 routed_experts_prompt_start。该 PR 在 main 上重写，保留代理拼接协议但引擎侧改动更小。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "让路由专家输出在分离式 P/D 之间按行拼接，属跨实例数据拼装。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "aux-output",
+        "routed-experts",
+        "disaggregated-prefill"
+      ],
+      "pr_number": 62056
+    },
+    {
+      "sha": "20b15bbf5bf550e390d322ce49b6a9d8b3ae3cbf",
+      "comment": "MooncakeConnectorWorker 过去直接创建 mooncake.engine.TransferEngine、向它要 RPC 端口、把 KV 内存注册进去、并在它上面跑两个方向的传输，等于把连接器绑死在一种引擎实现上。本 PR 把这个角色收到一个接口后面，并为 Transfer Engine 写一层适配器，连接器不再直接接触该类：接口覆盖 register_regions / unregister_regions（钉住与释放 KV 内存）、submit(peer, op, ranges)（发起一个请求，每个 range 带 id）、poll()（每个 range 的最终结果）。TransferEngineBackend 用连接器原本那次阻塞的批量调用实现它，并回报该请求每个 range 的批量状态；由于 Transfer Engine 在调用内部就把请求结清，一次提交的事件仍回到提交它的线程。行为不变：状态文本相同、按请求的失败传播相同、没有新增配置键、线上格式不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "把 KV 传输引擎从连接器里抽象成后端接口，便于替换传输实现。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "mooncake",
+        "kv-connector",
+        "backend-interface"
+      ],
+      "pr_number": 64363
+    },
+    {
+      "sha": "1bf414e97acf7563297726531f702cdbea6b2921",
+      "comment": "把 Kimi-K3.1-Pro 的 MI355X AgentX TP8 预设（#67600）对齐 InferenceX #5089。镜像：预设钉 kimi-k31-5c14fe8@sha256:a61996b4…（该赛道实测的 digest），recipe 层的 AMD docker_image 也从 kimi-k31-6d74a15 换成 kimi-k31-5c14fe8。环境：每个并发点都加 VLLM_K3_SP_PREFILL=1，其余参数与变量不变。source 指向该赛道在 75d74552 的配置。runbook 说明序列并行 prefill 只在 DCP8 下真正生效（并发 4-48），并发 1 不带 DCP 时服务器日志会报 sequence-parallel prefill unsupported by this configuration 并退回默认的 all-reduce 路径。",
+      "sig": "other",
+      "sig_reason": "只更新面向用户的 recipe 镜像与环境变量。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "kimi-k31",
+        "mi355x",
+        "sequence-parallel-prefill"
+      ],
+      "pr_number": 67817
+    },
+    {
+      "sha": "207d6e6f9a6650056df1bd00ef5b4b5d782045b1",
+      "comment": "MI355X 上用 DP 共享的 Engram 表（--engram-config 里 cpu_offload 与 embedding_across_dp 都为 true，94 GiB 放在 /dev/shm）时，一个 prefill 步每层 Engram 要在 _engram_lookup_kernel 上花 36-110 毫秒，期间主流水是空转的。原因是 _engram_lookup_thresholds 只为 SM100 写了实测分支，ROCm 落到 sort_min_rows is None，永远不走已有的按表偏移排序路径；这张表用小页映射，超过约 32K 行的无序查找会把 GPU 的地址转换（TLB）打爆。本 PR 用 4 行把 ROCm 的排序路径从 32768 行起打开，inline-lookup 阈值仍留 None。相关：#59327 加入排序路径，#67677 给同一函数加 SM120 阈值，两者不重叠，也没有别的开放 PR 覆盖 ROCm。测试用真实大小表的独立微基准（一个共享 /dev/shm 文件、cudaHostRegister、8 卡并发读、rows = tokens × 24、随机行 id、计时含排序开销），另加 DEP8 的 prefill profile。",
+      "sig": "sig-model-performance",
+      "sig_reason": "在 AMD 上启用按表偏移排序的宿主查找，缓解地址转换抖动。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "rocm",
+        "engram",
+        "tlb"
+      ],
+      "pr_number": 67805
+    },
+    {
+      "sha": "218459c6cdaf7c3441155af08aef5d12454fc417",
+      "comment": "XPU 上未量化（BF16）的 MoE LoRA 原来走 Triton experts，本 PR 改为走 XpuFusedMoe 的 activation_hook 与 output_hook：把 LoRAExpertsMixin 混进 XPUExperts 形成单一类，做法与 TritonExperts 一致；FP8、BlockFP8、WNA16、MXFP4 通过 supports_lora() 退出。两个 hook 直接在 XpuFusedMoe 按专家分组的 gemm1_output / gemm2_output 上加 LoRA 增量，因此不再需要 grouped 布局与 (token, topk) 布局之间的 gather/scatter。fused_moe_lora 算子新增可选的 row_map，把每个 (token, topk) 对映射到它的输出行（当 mul_routed_weight=True 时也用于输入行），值为 -1 表示跳过该对；该参数一路穿过 one-shot、小批量与 shrink/expand kernel、PunicaWrapperXPU 与 LoRAExpertsMixin。row_map 为 None 时（所有非 XPU 调用方）生成的代码不变。",
+      "sig": "sig-core",
+      "sig_reason": "让 LoRA 适配器在 Intel 的 MoE 专家实现上生效，属 LoRA 子系统能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "lora",
+        "moe",
+        "xpu"
+      ],
+      "pr_number": 62807
+    },
+    {
+      "sha": "75f3967ac127cb5cf36b2fee7b7377dca5725d51",
+      "comment": "Mamba 的 align 模式前缀缓存会供出错误的 SSM 状态。一次 prefill 从某个 Mamba 块内部的半截命中恢复、又跑过该块末尾时，块里存的是恢复点状态，但 cache_blocks() 仍按整块哈希把它发布出去；下一条共享该前缀的请求命中整块、载入这个被截断的状态，于是输出乱码。本 PR 让状态不在块末尾的块永远不以整块哈希发布。最小复现上，带缓存的输出现在与不带缓存一致（main 上会从一个过期的 832 token 命中给出错答）。状态正好在块末尾的块、提示扩展、以及 prompt checkpoint（仍按自己的位置缓存）都不受影响。相关：#53614 允许后端内部导出 prompt checkpoint 时越过块边界，#66938 在更大的改动里用了同样的遮蔽思路。",
+      "sig": "sig-core",
+      "sig_reason": "修线性注意力状态缓存的发布条件，避免错误前缀命中污染后续请求。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "mamba",
+        "prefix-cache",
+        "ssm-state"
+      ],
+      "pr_number": 67717
+    },
+    {
+      "sha": "109331007a330093fa726b1c179729fd8088703e",
+      "comment": "让已有的 flashinfer_moe_ep_cutedsl 后端在 SM107（计算能力 10.7，NVIDIA Rubin）上跑 NVFP4 专家，走 FlashInfer 的 Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig，要求 flashinfer-python 不低于 0.7.3 并在运行时探测。该后端不会被自动选中，FlashInfer 的 pin 与 SM100/SM103 路径不变。用法是 --moe-backend flashinfer_moe_ep_cutedsl --enable-expert-parallel，其余前置条件写进新文档小节 FlashInfer MegaMoE on SM107：vllm download-kernels、nvshmem4py-cu13、CUTE_DSL_ARCH=sm_107a，以及当后端需求超过 NVSHMEM 默认堆时才需要设 NVSHMEM_SYMMETRIC_SIZE。无跟踪 issue。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为新架构开放既有的 CuTe DSL MoE 后端路径，属 kernel 与硬件支持。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "moe",
+        "nvfp4",
+        "sm107",
+        "rubin"
+      ],
+      "pr_number": 65974
+    },
+    {
+      "sha": "e22287df5035af6919663c37171b57f827151b87",
+      "comment": "当 max_num_batched_tokens 大于 max_num_seqs * max_model_len 时，dummy 前向可能拿到真实批次装不下的 token 数：编译区间 warmup、FlashInfer autotune（_run_flashinfer_autotune_dummy_runs）以及 full/mixed CUDA graph 捕获都按 max_num_batched_tokens 定规模。InputBatch.make_dummy 把这些 token 摊到至多 max_num_reqs 条请求上，于是出现长度超过 max_model_len 的序列与越界的块表访问，FlashAttention 报 CUDA error: an illegal memory access（#66244）。#67545 已经约束了 _dummy_run，覆盖编译区间 warmup 与 autotune；CUDA graph 捕获不走 _dummy_run，本 PR 因此再限制捕获尺寸：CudaGraphManager._init_candidates 丢掉大于 max_num_reqs * max_model_len 的 prefill/mixed 捕获尺寸，并按既有「Dropping ... from ...」的风格告警。",
+      "sig": "sig-core",
+      "sig_reason": "把捕获尺寸约束在真实批次容量内，消除显存越界访问。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "cuda-graph",
+        "dummy-run",
+        "block-table"
+      ],
+      "pr_number": 67469
+    },
+    {
+      "sha": "71c3541492cfb12b79ff0c4a31047f4d4b7ffcb8",
+      "comment": "在 ROCm 的模型运行器 V2 上为纯文本 DeepSeek-V4.1-Flash 打开 eager 模式的 prefill 上下文并行（PCP）。本 PR 接过已停更的草稿 #62981（@haic0 保留共同作者）并移植到当前 main。main 上该配置启动即报 NotImplementedError: DeepSeek-V4.1 PCP currently supports NVIDIA CUDA only.，现在 --prefill-context-parallel-size 2 可以服务。张量并行 2 加 PCP 2 的 GSM8K 落在不带 PCP 基线约一个标准误以内，PCP 之上再开专家并行也可用；专家并行关闭时 MoE 路由的输入 id 会跨 PCP rank 收集，与 MoE runner 对 hidden states 的 PCP 收集一致。PCP 的注意力跳过 ROCm 的流重叠路径（那条路径缓存 compressor latent 时不做 PCP 收集），把 PCP 补齐的输出尾部清零，并在该 rank 没有 token 时提前返回，与 CUDA 的 FlashMLA 相同。不支持的组合（流水线并行、数据并行、DCP、微批、推测解码、KV 传输、前缀缓存等）仍被拒绝。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "让长上下文提示在 AMD 上按上下文并行切分到多个 rank，属并行部署能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rocm",
+        "prefill-context-parallel",
+        "deepseek-v41"
+      ],
+      "pr_number": 66842
+    },
+    {
+      "sha": "919d45fc3a54c07034bf637fe649dfa86eed48c2",
+      "comment": "Fast Start（CUDA IPC 权重缓存重启）此前不支持 serialized compressed-tensors 的 128×128 分块 FP8 linear 权重，本 PR 打开这条路：在通过校验的 CUTLASS 后端下跨引擎重启复用处理后的权重与 scale，保持输出逐位相同、共享存储以及必需的 Python 元数据，不支持的配置仍被拒绝。属于 #56049 的一部分，本次按评审要求从堆叠的 PR 里解耦，直接基于 main 的 34d5de18cd8b 单独提交，只带这一个特性与其必需的公共管线。B300 上验证：层与配置回归 16 passed、46 deselected；真实模型按 普通加载 → 回退 → IPC → 第二次 IPC 走通（1 passed）；改动文件的 pre-commit 全过（含 mypy、ruff 与测试 tethering 检查）。",
+      "sig": "sig-core",
+      "sig_reason": "扩展重启时权重缓存可复用的量化格式范围，属引擎启动加速。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "fast-start",
+        "weight-cache",
+        "block-fp8"
+      ],
+      "pr_number": 63976
+    },
+    {
+      "sha": "1da9b29c651174b5839de06979572c50a072b13d",
+      "comment": "(H200 MIG 35GB) Quantization 分片 4/4 从构建 102780 起每次 main 都失败：test_modelopt_nested_mixed_checkpoint 与 test_modelopt_mixed_dspark_checkpoint 报 _pickle.PicklingError，说 vllm.platforms.cuda.NvmlCudaPlatform.get_device_capability 不是同一个对象。根源在 test_humming_nvfp4_linear_declares_executed_activation（#59460 加入）：它把 get_device_capability monkeypatch 到 current_platform 实例上，而 pytest 9.2 之前撤销实例级补丁会把继承来的值写回实例 __dict__，留下一个绑定的 @classmethod @cache 方法；后一个测试把包住 current_platform 的闭包经 LLM.apply_model 送出时，cloudpickle 无法按引用序列化那个 lru_cache 包装器。本 PR 改为 patch 平台类而不是实例。",
+      "sig": "sig-ci",
+      "sig_reason": "只调整测试里 monkeypatch 的作用对象，消除序列化失败。",
+      "tags": [
+        "test",
+        "low-risk",
+        "monkeypatch",
+        "pickling",
+        "quantization"
+      ],
+      "pr_number": 67752
+    }
+  ]
+}
