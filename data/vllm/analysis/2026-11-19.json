@@ -1,20 +1,328 @@
 {
   "date": "2026-11-19",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-11-19T20:14:19+08:00",
-  "daily_summary": "## 今日概览\n105 条提交。三条主线：前端与流式输入的语义被成批收口，包括流式提示超出上下文长度时丢弃更新而不是让引擎卡死、beam search 与语音转写保住数据并行 rank、logprobs 改由引擎行渲染。DeepSeek-V4.1 在 ROCm 上一口气合并了多个每步 kernel。工程基线有两个变化：Python 3.14 成为所有镜像与 CI 的默认版本；一台服务器现在可以同时使用多个结构化输出的文法后端。CI 18 条，另有 Inkling 2 的 Hopper 支持与新模型 HY4 Flash。\n\n## 今日重点\n\n### 跨平台 / 引擎通用\n- **流式与输入边界**：流式输入会话以前直接把下一块并进提示，不看合并后是否超过 max_model_len，超出时引擎会卡死甚至崩溃；现在合并后在上下文内已放不下一个采样步就丢弃这次更新并打服务端警告，会话继续等待更短的更新（#63113）。beam search 与语音转写不再丢数据并行 rank（#67001）；generate 上显式传 null 的 max_tokens 也照样套用上限（#66233）；Responses 输出保留空的 reasoning 块（#67189）；样本 logprobs 保持引擎行再由前端渲染（#60542）；快速反分词器用提示尾部做种子而不是空串（#67153）；工具名在流式解析时改成增量扫描（#67156）；DSML 的非 JSON 参数不再每个 tick 都转一次（#68070）；Muse Spark 的解析器迁到流式解析引擎（#62728）。\n- **结构化输出**：服务器不再在第一个请求上锁死一个文法后端，现在按需惰性支持多个（例如 xgrammar 加 guidance），backend 取 auto 时把每个请求路由到支持它的后端（#67335）；分配 bitmask 的接口简化（#68484）。\n- **调度与内存**：模型运行器 V2 的异步调度深度可配（#64145）；CUDA graph 的尺寸策略移进 Platform（#68552）；只服务于草稿模型的滑窗桶不再决定 KV cache 分组的大小，避免目标全注意力层被迫补齐（#68533）；批分片采样与 LoRA 同时开启在启动时拒绝（#56074）。\n- **可观测**：迭代指标可选带 GPU 计时（#61690）；抢占改由调度器计数而不是恢复时（#65317）；空的日志区间不再让计时器漂移（#55474）；模型加载完成后打印每类层选中的后端（#67526）。\n- **Fast Start**：IPC 加载器去掉 copy 模式（#68388）；compressed-tensors 的 WNA16 预处理权重可以复用（#68328）。\n\n### AMD / ROCm\nDeepSeek-V4.1 的每步 kernel 又合并了几处：解码的稀疏 MLA 变长 top-k 一次启动打包完成（#67365）、MXFP4 indexer 的解码元数据一次启动构建（#67363）、压缩后的 KV cache 直接写进 compressor 内部而不是另走一遍（#67364）；GLM-5.3-Flash 的 kpool 稀疏路径去掉 int32/int64 拷贝（#63910），其 KDA 解码与预填充改走 FlashInfer（#63544）；Qwen4Exp 在 ROCm 上导出 PLE 短卷积的预填充检查点（#68574）；AITER 的 FlashAttention 为解码与预填充各配 split-KV 专用 kernel（#67133）。两处崩溃修复：MiniMax-M3.1 用预洗牌权重时的解码衔接崩溃（#68454）、无 gate 的 MoE 上 AITER 共享专家融合的路由（#64737）。wvSplitK 在 wave64 上把 bf16 N=5 保持在 YTILE 2 以避免寄存器溢出（#66444）；基座 RotaryEmbedding 迁到 vLLM IR 算子，CUDA 与 ROCm 共用（#58838）。Qwen3.8-Flash-Next 在 MI325X 上用 AITER 验证 BF16（#66911）。\n\n### NVIDIA 与新模型\nInkling 2 Small 首次进入 Blackwell（#67325），Inkling 2 补上 Hopper（SM90）支持（#67880）；腾讯 HY4 Flash 及其多模态支持落地（#68296）；GLM-5.3-Flash 加上 LoRA（#56327）、GTE 的 embedding 与 rerank 模型开启 LoRA（#68049）；HyperConnection 的 up 投影与 gate 混合在 SM90/SM100 上融合（#66791）。\n\n### Intel XPU 与 CPU\nXPU 上把 eager 的 Qwen3.5 模型移植过来并融合 MoE 解码（#64687）；SamplingMaskTensors 改跑 SYCL kernel（#64231）；AWQ 打包的 MoE 权重转成 GPTQ 等价布局（#48552）。CPU 侧补上 AArch64 的 top-k 与 top-p 采样 kernel（#62440），服务前把剩余采样 kernel 预热（#64522）。\n\n### 分离式与 KV 卸载\n编码器缓存新增文件系统层：EC 分层连接器把 CPU 内存作为主缓存、条目就绪后异步写穿到 .ec 文件，命中时晋升回 CPU，索引在启动时恢复，缓存可以跨服务重启复用（#63294）。NIXL 推送模式修掉 WRITE 提交停滞与块被过早释放（#66795），并在生产者已释放 KV 层之后拒绝远端预填充读（#66011）；Mooncake 校验返回结果并把失败的传输真正终结掉（#67939）；MultiConnector 的握手元数据路由修正（#67174）；连接器在引擎启动完成、KV cache 准备之后才收到通知（#66574）；块复用的 fence 限定在源池内（#68058）；SWA 尾部在 first_live_chunk_idx 里给出最终值（#68359）。\n\n### 量化与权重传输\n给所有量化线性 kernel 统一 LinearKernel 基类，七类 kernel 从同一个根派生，这是把线性侧也做成 oracle 的第一步（#68019）；ModelOpt 的 INT8_PB_WO 支持路由专家（#66717）；SM107 的 flashinfer_moe_ep_cutedsl 支持 MXFP4 专家（#66158）；ROCm 上 Muse Spark 对首尾层的 BF16 embedding 使用在线 MXFP4 目标（#67191）；GLM-5.3 的在线量化可以覆盖 BF16 注意力投影（#64373）；SM90 的 FlashInfer FP8 block-scale 传打包行（#64040）；批不变模式下把 Marlin 排除在 MXFP4 linear 选择之外（#68008）。权重传输侧：打包传输改成按缓冲大小切一块的布局（#68043）、load plan 把拷贝期的类型转换与 setitem 写入计划成独立操作（#67836）、CPU 卸载的 Engram 存储在加载期被保留（#68048）、torchao 的重载装饰器移除（#68329）。\n\n### 推测解码\nDeepSeek-V4 的 DSpark 草稿补上 packed_modules_mapping（#65647）；接受率统计里拒绝非有限的 Newton 步（#68164）；Gemma-4 的 MTP 在前缀缓存因 lookahead 块而命中丢失时修正（#65263）；Step5 的 PrimTS 在滑窗验证批次上保持解码计划（#68129）；多模块 MTP 的重新预填充限制在有效请求范围内（#66951）。\n\n### CI、构建与文档（23 条）\nPython 3.14 成为 CUDA、CPU、Zen、XPU、ROCm 与 gfx1250 基底、s390x 与 ppc64le 所有镜像以及 CI 的默认版本（#68457）；nvidia-cudnn-frontend 限制在 1.33 以下（#68566）；vllm-flash-attn 临时指向上游 222 号 PR 的头提交，_vllm_fa2_C 动态库从 70.69 MiB 缩到 39.96 MiB、单独编译墙钟从 407.5 秒降到 220.2 秒（#68348）；mi300_dpx 的作业临时迁回 mi300_1 队列（#68568）；8 个 CPU 步骤与 Entrypoints、Rust 前端服务步骤登记进自动分片（#67534、#64128）；H100 的故障容错端到端测试挪到 nightly（#68494）；Intel 打开采样器与 logits processor 用例、扩充注意力与 worker 测试、跑起基于 Ray 的 test_comm_ops（#68541、#67833、#66975）；流水线并行等价性测试在 Hopper 以下跳过 HYV4 与 Inkling（#68604）；解码跨越边界的 Mamba 命中写进 Qwen MTP 测试的预期（#68356）；水印密钥检查忽略密钥文件路径（#68592）；Nemotron 的 GSM8K 卸载条目改为真正走 CPU 重载（#67916）；/ci rocm cache 早于基础镜像推送时给出说明（#68480）。\n\n## 需要关注\n- #68457 把 Python 3.14 设为所有镜像与 CI 的默认版本，自装环境的用户会遇到新的最低版本要求。\n- #68348 的 PR 标题带着 Do Not Merge，却把 vllm-flash-attn 的拉取位置钉到上游某个 PR 的头提交，属于临时 pin，需要跟进它回滚。\n- #63113 改变流式输入的失败方式：超出上下文时丢弃更新并告警，以前能通过的超长流式会话现在会看到警告日志。\n- #67335 让一台服务器可同时使用多个文法后端，backend 取 auto 时路由结果不再是「第一个请求定终身」。\n- #63294 的编码器缓存文件系统层跨重启保留索引，重启后仍会尝试复用磁盘上的 .ec 条目。\n",
+  "generated_at": "2026-11-20T10:34:59+08:00",
+  "daily_summary": "## 今日概览\n126 条提交（含当天晚些时候合并的 21 条，126 条全部已分析）。三条主线：Rust 前端与入口继续对齐 Python（批量提示、生成式打分路由、服务器级多模态参数等）；DeepSeek-V4.1 与 GLM-5.3 在 ROCm 上又合并了几处每步 kernel；工程基线有两个变化——Python 3.14 成为所有镜像与 CI 的默认版本，一台服务器可以同时使用多个结构化输出的文法后端。CI 19 条，编码器缓存新增文件系统分层。\n\n## 今日重点\n\n### 跨平台 / 引擎通用\n- **前端与流式语义**：流式输入会话以前直接把下一块并进提示，不看合并后是否超过 max_model_len，超出时引擎卡死甚至崩溃；现在合并后放不下一个采样步就丢弃这次更新并打服务端警告（#63113）。Rust 侧新增 /v1/completions 的批量提示（#68390）、/generative_scoring 路由（#68612）、服务器级多模态 processor 参数（#68186）；HF 渲染器保住助手的 refusal 历史（#67954）；beam search 与语音转写不再丢数据并行 rank（#67001）；显式传 null 的 max_tokens 也套用上限（#66233）；样本 logprobs 保持引擎行再由前端渲染（#60542）；快速反分词器用提示尾部做种子（#67153）；工具名改增量扫描（#67156）；DSML 的非 JSON 参数不再每个 tick 转一次（#68070）。\n- **结构化输出**：服务器不再在第一个请求上锁死一个文法后端，按需惰性支持多个（例如 xgrammar 加 guidance），backend 取 auto 时按请求路由（#67335）；bitmask 分配简化（#68484）。\n- **调度与内存**：模型运行器 V2 的异步调度深度可配（#64145）；CUDA graph 的尺寸策略移进 Platform（#68552）；只服务草稿模型的滑窗桶不再决定 KV cache 分组大小（#68533）；批分片采样与 LoRA 同时开启在启动时拒绝（#56074）。\n- **可观测与加载**：迭代指标可选带 GPU 计时（#61690）；抢占改由调度器计数（#65317）；模型加载后打印每类层选中的后端（#67526）；监控线程加入之前先杀掉 RayExecutorV2 的 actor（#68526）；引擎退出状态改为窥探而不是回收子进程（#68288）；NemotronLabsDiffusion 的主机同步检查失败修掉（#68376）；Fast Start 的 IPC 加载器去掉 copy 模式（#68388）、支持 compressed-tensors 的 WNA16 预处理权重（#68328）。\n- **水印**：检测跨越提示边界的重复上下文（#67947）；密钥检查忽略文件路径差异（#68592）。\n\n### AMD / ROCm\nDeepSeek-V4.1 的每步 kernel 又合并几处：解码的稀疏 MLA 变长 top-k 一次启动打包（#67365）、MXFP4 indexer 的解码元数据一次启动构建（#67363）、压缩后的 KV cache 直接写进 compressor 内部（#67364）。GLM-5.3-Flash 的 kpool 稀疏路径去掉 int32/int64 拷贝（#63910）、KDA 解码与预填充改走 FlashInfer（#63544）；Qwen4Exp 在 ROCm 导出 PLE 短卷积的预填充检查点（#68574）；AITER FlashAttention 为解码与预填充各配 split-KV 专用 kernel（#67133）；W4A16 修掉 gfx1151 在解码尺寸上的 bf16 tile 断崖（#66133）；MoRIIO 修掉异构张量并行下写 NVFP4 KV 页（#68072）。崩溃与错误结果的修复：MiniMax-M3.1 预洗牌权重的解码衔接（#68454）、无 gate MoE 的 AITER 共享专家融合路由（#64737）、Nemotron 扩散绕开 torch 2.13 Inductor 的 gather 缺陷（#68694）、Kimi-K3 不把融合解码 MLA 烘进分段图（#66578）、fused_qk_norm_rope 的 int32 偏移溢出（#68386）。\n\n### NVIDIA 与新模型\nInkling 2 Small 进入 Blackwell（#67325），Inkling 2 补上 Hopper 支持（#67880）；HY4 Flash 及其多模态支持落地（#68296）；GLM-5.3-Flash 与 GTE 的 embedding/rerank 加上 LoRA（#56327、#68049）；HyperConnection 的 up 投影与 gate 混合在 SM90/SM100 融合（#66791）；基座 RotaryEmbedding 迁到 vLLM IR 算子，CUDA 与 ROCm 共用（#58838）；SM107 支持 MXFP4 专家的 CuTe DSL MoE（#66158）；在线量化的峰值显存降下来并支持分块处理（#68171）；Qwen3.5 的 MTP 草稿去掉量化兜底（#67414）；空的日志区间不再让计时器漂移（#55474）。\n\n### Intel XPU 与 CPU\nXPU 移植 eager 的 Qwen3.5 并融合 MoE 解码（#64687）；SamplingMaskTensors 改跑 SYCL kernel（#64231）；新增 VLLM_XPU_SUPPORT_FP8_QUERY 控制 flash attention 是否用 FP8 query（#67860）；AWQ 打包的 MoE 权重转成 GPTQ 等价布局（#48552）。CPU 侧补上 AArch64 的 top-k 与 top-p 采样 kernel（#62440），服务前把剩余采样 kernel 预热（#64522）。\n\n### 分离式、卸载与多模态\n编码器缓存新增文件系统分层：EC 分层连接器把 CPU 内存作为主缓存、条目就绪后异步写穿到 .ec 文件、命中时晋升回来、索引在启动时恢复，缓存可以跨服务重启复用（#63294）。HiSparse 支持 QSA 的稀疏注意力（#59209）；NIXL 推送模式修掉 WRITE 提交停滞与块被过早释放（#66795），并在生产者已释放 KV 层之后拒绝远端预填充读（#66011）；Mooncake 校验返回结果并终结失败的传输（#67939），同时按请求尊重离线写入上限（#68529）；MultiConnector 的握手元数据路由修正（#67174）；连接器在启动期 KV cache 准备完成后才收到通知（#66574）；EPD 在引擎信息里报告只含元数据的输入能力（#68565）；渲染响应带上 mm_payload 的元数据值（#65018）；generate 返回 mm_hashes（#68135）。多模态输入侧：接受 vLLM 自带 HF 处理器里的 NumPy 图像（#68655）；负跨距的图像输入先归一化（#68367）；图像占位符数量按请求级 processor 参数确定（#68127）。\n\n### CI、构建与文档（24 条）\nPython 3.14 成为 CUDA、CPU、Zen、XPU、ROCm 与 gfx1250 基底、s390x 与 ppc64le 所有镜像以及 CI 的默认版本（#68457）；nvidia-cudnn-frontend 限制在 1.33 以下（#68566）；vllm-flash-attn 临时指向上游 PR 的头提交，_vllm_fa2_C 动态库从 70.69 MiB 缩到 39.96 MiB、单独编译墙钟从 407.5 秒降到 220.2 秒（#68348）；mi300_dpx 的作业临时迁回 mi300_1（#68568）；8 个 CPU 步骤与 Entrypoints、Rust 前端服务步骤登记进自动分片（#67534、#64128）；H100 的故障容错端到端测试挪到 nightly（#68494）；Model Executor 测试超时前 dump 子进程栈（#68652）；Intel 打开采样器、logits processor、注意力与 worker 用例并跑起基于 Ray 的 test_comm_ops（#68541、#67833、#66975）。文档站与工具侧：/ci rocm cache 早于基础镜像推送时给出说明（#68480）；LayerName 注册改用 torch 2.14 的自定义类接口（#64314）。\n\n## 需要关注\n- #68457 把 Python 3.14 设为所有镜像与 CI 默认，自装环境会碰到新的最低版本要求。\n- #68348 的 PR 标题带着 Do Not Merge，却把 vllm-flash-attn 钉到上游某个 PR 的头提交，属临时 pin，需要跟进回滚。\n- #63113 改变流式输入的失败方式：超出上下文时丢弃更新并告警，以前能过的超长流式会话现在会看到警告日志。\n- #67335 之后，backend 取 auto 时每个请求按能力路由到不同文法后端，不再是「第一个请求定终身」。\n- #68386 与 #68694 都是会静默改变数值的问题：前者是 fused_qk_norm_rope 的 int32 偏移溢出，后者是 torch 2.13 Inductor 的 gather 缺陷。\n",
   "sig_summaries": {
-    "sig-core": "31 条，当天最大一块，前端语义与调度边界为主。\n- **流式与解析**：流式输入超出 max_model_len 时丢弃更新并告警（#63113）；beam search 与语音转写保住数据并行 rank（#67001）；显式 null 的 max_tokens 仍套上限（#66233）；保留空的 reasoning 块（#67189）；样本 logprobs 走引擎行（#60542）；反分词器用提示尾部做种子（#67153）；工具名增量扫描（#67156）；DSML 参数不再每 tick 转换（#68070）；Muse Spark 解析器迁到流式引擎（#62728）。\n- **配置**：一台服务器支持多个结构化输出文法后端并按请求路由（#67335）；bitmask 分配简化（#68484）；异步调度深度可配（#64145）；CUDA graph 尺寸策略移入 Platform（#68552）；草稿专用滑窗桶不再决定 KV 分组大小（#68533）；批分片采样加 LoRA 在启动时拒绝（#56074）。\n- **可观测**：迭代指标可选 GPU 计时（#61690）；抢占由调度器计数（#65317）；空日志区间不漂移（#55474）；加载后打印每类层的后端选择（#67526）。\n- **模型与加载**：HY4 Flash 及多模态（#68296）；Inkling 2 的 Hopper 支持（#67880）；GLM-5.3-Flash 与 GTE 的 LoRA（#56327、#68049）；Fast Start 去掉 copy 模式并支持 WNA16 预处理权重（#68388、#68328）；Unlimited-OCR-2 关闭可扩展 KV cache（#68254）；非整除的 BLIP-2 编码器预算允许（#67271）；NemotronLabsDiffusion 的主机同步检查失败修掉（#68376）；监控线程加入之前先杀掉 RayExecutorV2 的 actor（#68526）；引擎退出状态改为窥探而不是回收子进程（#68288）。\n",
-    "sig-model-performance": "16 条，ROCm 的每步 kernel 合并是主线。\n- **DeepSeek-V4.1 / ROCm**：解码稀疏 MLA 的变长 top-k 一次启动打包（#67365）；MXFP4 indexer 的解码元数据一次启动构建（#67363）；压缩后的 KV cache 直接写进 compressor 内部（#67364）。\n- **GLM-5.3 / Qwen4Exp / 其他 ROCm**：kpool 稀疏路径去掉 int32/int64 拷贝（#63910）；KDA 解码与预填充改走 FlashInfer（#63544）；Qwen4Exp 在 ROCm 导出 PLE 短卷积检查点（#68574）；AITER FlashAttention 分别配 split-KV 专用 kernel（#67133）；wvSplitK 在 wave64 保持 YTILE 2 避免寄存器溢出（#66444）；MiniMax-M3.1 预洗牌权重的解码衔接崩溃与无 gate MoE 的共享专家融合路由（#68454、#64737）。\n- **NVIDIA / XPU / CPU**：HyperConnection 的 up 投影与 gate 混合在 SM90/SM100 融合（#66791）；基座 RotaryEmbedding 迁到 vLLM IR 算子（#58838）；XPU 移植 eager Qwen3.5 并融合 MoE 解码（#64687）、SamplingMaskTensors 走 SYCL kernel（#64231）；AArch64 的 top-k 与 top-p 采样 kernel（#62440）；chunk_scaled_dot_kkt 的 beta 改到 K 循环之后乘，与上游 flash-linear-attention 一致，消掉 Hopper 上同一 kernel 多次运行结果不同（#67812）。\n",
-    "sig-ci": "18 条，构建基线与分片登记。\n- **基线**：Python 3.14 成为所有镜像与 CI 的默认（#68457）；nvidia-cudnn-frontend 限制在 1.33 以下（#68566）；vllm-flash-attn 临时指向上游 PR 头提交，_vllm_fa2_C 从 70.69 MiB 缩到 39.96 MiB、编译墙钟 407.5 秒降到 220.2 秒（#68348）；mi300_dpx 作业临时迁回 mi300_1（#68568）。\n- **分片与调度**：8 个 CPU 步骤登记自动分片（#67534）；Entrypoints 与 Rust 前端服务步骤登记（#64128）；命令 span 先上传、作业结束的大批量刷新给更多时间（#68208）；H100 故障容错端到端挪到 nightly（#68494）。\n- **平台用例**：Intel 打开采样器与 logits processor（#68541）、扩充注意力与 worker（#67833）、跑起基于 Ray 的 test_comm_ops（#66975）；Hopper 以下跳过 HYV4 与 Inkling 的流水线等价性（#68604）；AITER 不支持时跳过 MoE 对齐测试（#62527）；AITER ASM 路径在在线 MXFP4 Hadamard 用例里强制（#68188）。\n",
-    "sig-large-scale-serving": "10 条，编码器缓存分层与 NIXL 的失败模式。\n- **编码器缓存**：EC 分层连接器把文件系统作为第二级，CPU 内存为主缓存、异步写穿到 .ec 文件、命中晋升、启动时恢复索引，缓存可跨重启复用（#63294）。\n- **NIXL**：推送模式修掉 WRITE 提交停滞与块被过早释放（#66795）；生产者已释放 KV 层之后拒绝远端预填充读（#66011）。\n- **连接器**：Mooncake 校验返回结果并终结失败的传输（#67939）；MultiConnector 握手元数据路由修正（#67174）；连接器在启动期 KV cache 准备完成后才收到通知（#66574）。\n- **卸载细节**：块复用 fence 限定在源池内（#68058）；SWA 尾部在 first_live_chunk_idx 给出最终值（#68359）；generate 返回 mm_hashes（#68135）；DeepSeek-V4.1 的工具检索按 deepseek-recipe 渲染（#68211）。\n",
-    "sig-quantization": "9 条，接口统一与硬件覆盖。\n- **接口**：七类量化线性 kernel 统一到 LinearKernel 基类，构造与 is_supported、can_implement、executed_activation_key、input_quant_key 等约定收口，是线性侧做 oracle 的第一步（#68019）。\n- **覆盖**：ModelOpt 的 INT8_PB_WO 支持路由专家（#66717）；SM107 的 CuTe DSL MoE 支持 MXFP4 专家（#66158）；ROCm 上 Muse Spark 首尾层 BF16 embedding 使用在线 MXFP4 目标（#67191）；GLM-5.3 的在线量化覆盖 BF16 注意力投影（#64373）；XPU 把 AWQ 打包的 MoE 权重转成 GPTQ 等价布局（#48552）。\n- **修错**：SM90 的 FlashInfer FP8 block-scale 传打包行（#64040）；批不变模式下把 Marlin 排除在 MXFP4 linear 选择之外（#68008）；W4A16 稠密预填充缓存去掉加载期内存缓冲（#64744）。\n",
-    "sig-omni": "7 条，输入参数与占位符口径。\n- 负跨距的图像输入先归一化再送编码器（#68367）；LFM2-VL 尊重 do_image_splitting 与 use_thumbnail（#68055）；图像占位符数量按请求级 processor 参数确定（#68127）；--limit-mm-per-prompt 可以按模态关闭嵌入输入（#67995）；带音频嵌入的放置方式去掉音频套音频的宿主回读（#68200）；Unlimited-OCR-2 的 DASH 路由做到批不变（#68563）；Inkling 2 Small 进入 Blackwell（#67325）。\n",
-    "sig-spec-decode": "5 条。\n- DeepSeek-V4 的 DSpark 草稿补 packed_modules_mapping（#65647）；接受率统计拒绝非有限的 Newton 步（#68164）；Gemma-4 的 MTP 修掉 lookahead 块导致的前缀缓存命中丢失（#65263）；Step5 的 PrimTS 在滑窗验证批次上保持解码计划（#68129）；多模块 MTP 的重新预填充限制在有效请求范围内（#66951）。\n",
+    "sig-core": "36 条，当天最大一块，Rust 前端与入口语义是主线。\n- **Rust 前端与入口**：/v1/completions 支持批量提示（#68390）；新增 /generative_scoring 路由（#68612）；服务器级多模态 processor 参数（#68186）；HF 渲染器保住助手 refusal 历史（#67954）；Mooncake 的 lookup_lease 状态解码（#68584）。\n- **流式与解析**：超出 max_model_len 的流式更新被丢弃并告警（#63113）；beam search 与语音转写保住数据并行 rank（#67001）；显式 null 的 max_tokens 仍套上限（#66233）；样本 logprobs 走引擎行（#60542）；反分词器用提示尾部做种子（#67153）；工具名增量扫描（#67156）；DSML 参数不再每 tick 转换（#68070）；Muse Spark 解析器迁到流式引擎（#62728）；空的 reasoning 块保留（#67189）。\n- **配置与调度**：多个文法后端按需路由（#67335）；bitmask 分配简化（#68484）；异步调度深度可配（#64145）；CUDA graph 尺寸策略进 Platform（#68552）；草稿专用滑窗桶不再决定 KV 分组大小（#68533）；批分片采样加 LoRA 启动时拒绝（#56074）；非整除的 BLIP-2 编码器预算允许（#67271）；Unlimited-OCR-2 关闭可扩展 KV cache（#68254）。\n- **模型与加载**：HY4 Flash 及多模态（#68296）；Inkling 2 的 Hopper 支持（#67880）；GLM-5.3-Flash 与 GTE 的 LoRA（#56327、#68049）；Fast Start 去掉 copy 模式并支持 WNA16 预处理权重（#68388、#68328）；可观测三项（#61690、#65317、#67526）。\n",
+    "sig-model-performance": "20 条，ROCm 占多数。\n- **DeepSeek-V4.1 / ROCm**：解码稀疏 MLA 的变长 top-k 一次启动打包（#67365）；MXFP4 indexer 的解码元数据一次启动构建（#67363）；压缩后的 KV cache 写进 compressor 内部（#67364）。\n- **GLM-5.3 / Qwen4Exp / 其他 ROCm**：kpool 稀疏路径去掉整型拷贝（#63910）；KDA 解码与预填充改走 FlashInfer（#63544）；Qwen4Exp 导出 PLE 短卷积检查点（#68574）；AITER FlashAttention 配 split-KV 专用 kernel（#67133）；wvSplitK 在 wave64 保持 YTILE 2 避免寄存器溢出（#66444）；MiniMax-M3.1 预洗牌解码衔接与无 gate MoE 的共享专家融合路由（#68454、#64737）。\n- **NVIDIA**：融合 HC 上投影与 gate 混合（#66791）；SM107 支持 MXFP4 专家的 CuTe DSL MoE（#66158）。\n- **正确性与移植**：fused_qk_norm_rope 的 int32 偏移溢出（#68386）；Nemotron 扩散绕开 torch 2.13 Inductor 的 gather 缺陷（#68694）；Kimi-K3 不把融合解码 MLA 烘进分段图（#66578）；chunk_scaled_dot_kkt 的 beta 位置（#67812）；torch.compile 通过 *args 找到被编译模块（#68717）；XPU 移植 eager Qwen3.5（#64687）与 SYCL 的采样掩码（#64231）；AArch64 的 top-k 与 top-p kernel（#62440）。\n",
+    "sig-ci": "19 条，构建基线与分片登记。\n- **基线**：Python 3.14 成为所有镜像与 CI 的默认（#68457）；nvidia-cudnn-frontend 限制在 1.33 以下（#68566）；vllm-flash-attn 临时指向上游 PR 头提交，_vllm_fa2_C 从 70.69 MiB 缩到 39.96 MiB（#68348）；mi300_dpx 作业临时迁回 mi300_1（#68568）。\n- **分片与调度**：8 个 CPU 步骤登记自动分片（#67534）；Entrypoints 与 Rust 前端服务步骤登记（#64128）；命令 span 先上传并给结束刷新更多时间（#68208）；H100 故障容错端到端挪到 nightly（#68494）。\n- **平台用例**：Intel 打开采样器与 logits processor（#68541）、扩充注意力与 worker（#67833）、跑起基于 Ray 的 test_comm_ops（#66975）；Model Executor 超时前 dump 子进程栈（#68652）；Hopper 以下跳过 HYV4 与 Inkling 的流水线等价性（#68604）；AITER 不支持时跳过 MoE 对齐测试（#62527）、在线 MXFP4 Hadamard 强制 ASM 路径（#68188）；Nemotron 的 GSM8K 卸载条目真正走 CPU 重载（#67916）；Mamba 跨边界命中写进 Qwen MTP 测试预期（#68356）。\n",
+    "sig-large-scale-serving": "15 条，编码器缓存分层是新增能力。\n- **编码器缓存**：EC 分层连接器把文件系统当第二级，CPU 内存为主缓存、异步写穿到 .ec、命中晋升、启动恢复索引，可跨重启复用（#63294）；EPD 在引擎信息里报告只含元数据的输入能力（#68565）；渲染响应带 mm_payload 元数据（#65018）；generate 返回 mm_hashes（#68135）。\n- **卸载与连接器**：HiSparse 支持 QSA 稀疏注意力（#59209）；块复用 fence 限定在源池（#68058）；SWA 尾部给出最终值（#68359）；Mooncake 校验结果并终结失败传输（#67939）、按请求尊重离线写入上限（#68529）；MultiConnector 握手元数据路由（#67174）；启动期准备完成后才通知连接器（#66574）。\n- **NIXL 与 MoRIIO**：推送模式修掉 WRITE 停滞与块过早释放（#66795）；生产者已释放 KV 层之后拒绝远端读（#66011）；MoRIIO 修掉异构张量并行下写 NVFP4 KV 页（#68072）；DeepSeek-V4.1 的工具检索按 deepseek-recipe 渲染（#68211）。\n",
+    "sig-quantization": "13 条，接口统一、硬件覆盖与显存。\n- **接口**：七类量化线性 kernel 统一到 LinearKernel 基类（#68019），是线性侧做 oracle 的第一步。\n- **覆盖**：SM107 支持 MXFP4 专家（#66158）；ModelOpt INT8_PB_WO 支持路由专家（#66717）；Muse Spark 首尾层 BF16 embedding 用在线 MXFP4 目标（#67191）；GLM-5.3 的在线量化覆盖 BF16 注意力投影（#64373）；XPU 用开关控制 flash attention 是否接受 FP8 query（#67860）、AWQ 打包的 MoE 权重转 GPTQ 等价布局（#48552）。\n- **显存与修错**：在线重量化的峰值显存降低并支持分块处理（#68171）；W4A16 修掉 gfx1151 在解码尺寸上的 bf16 tile 断崖（#66133）；W4A16 稠密预填充缓存去掉加载期内存缓冲（#64744）；SM90 的 FlashInfer FP8 block-scale 传打包行（#64040）；批不变模式排除 Marlin（#68008）；Qwen3.5 的 MTP 草稿去掉量化兜底（#67414）。\n",
+    "sig-omni": "8 条。\n- **输入接受度**：vLLM 自带的 HF 处理器接受 NumPy 图像（#68655）；负跨距的图像输入先归一化（#68367）；LFM2-VL 尊重 do_image_splitting 与 use_thumbnail（#68055）；图像占位符数量按请求级 processor 参数确定（#68127）。\n- **配置与安全**：--limit-mm-per-prompt 可以按模态关闭嵌入输入（#67995）；带音频嵌入的放置方式去掉音频套音频的宿主回读（#68200）；Unlimited-OCR-2 的 DASH 路由做到批不变（#68563）。\n- **模型**：Inkling 2 Small 进入 Blackwell（#67325）。\n",
+    "sig-spec-decode": "6 条。\n- DeepSeek-V4 的 DSpark 草稿补 packed_modules_mapping（#65647）；接受率统计拒绝非有限的 Newton 步（#68164）；Gemma-4 的 MTP 修掉 lookahead 块造成的前缀缓存命中丢失（#65263）；Step5 的 PrimTS 在滑窗验证批次上保持解码计划（#68129）；多模块 MTP 的重新预填充限制在有效请求范围内（#66951）。\n- 水印在推测解码路径上检测跨提示边界的重复上下文（#67947）。\n",
     "sig-rl": "4 条。\n- 打包权重传输改成按缓冲大小切一块的布局（#68043）；load plan 把拷贝期的类型转换与 setitem 写入计划成独立操作（#67836）；CPU 卸载的 Engram 存储在加载期被保留（#68048）；torchao 的重载装饰器移除（#68329）。\n",
-    "other": "5 条。\n- **recipe**：DeepSeek-V4.1-Flash 补上 InferenceX 的 GB300 Dynamo AgentX 预设（#68556）；MiniMax-M3.1-Flash 分别加 H200 与 H100 的 AgentX 张量并行 8 DSpark 预设（#68486、#68487）；Qwen3.8-Flash-Next 在 MI325X 上用 AITER 验证 BF16（#66911）。\n- **杂项**：LayerName 注册改用 torch 2.14 的自定义类接口（#64314）。\n"
+    "other": "5 条。\n- **recipe**：DeepSeek-V4.1-Flash 补 InferenceX 的 GB300 Dynamo AgentX 预设（#68556）；MiniMax-M3.1-Flash 分别加 H200 与 H100 的 AgentX 张量并行 8 DSpark 预设（#68486、#68487）；Qwen3.8-Flash-Next 在 MI325X 上用 AITER 验证 BF16（#66911）。\n- **杂项**：LayerName 注册改用 torch 2.14 的自定义类接口（#64314）。\n"
   },
   "commits": [
+    {
+      "sha": "d2da27eb2defb88377636fba83d9a41ad35bf44d",
+      "comment": "vLLM 的编译包装器里有个 bytecode_hook,它要从被编译函数的参数中找出真正的模块对象。Transformers 主干分支给建模后端模型的 forward 套了一层 deprecate_kwarg 装饰器,签名变成 (*args, **kwargs),原来的取法就找不到 self。症状是 vllm serve 在引擎启动阶段直接抛 KeyError: self,包括 Llama 在内走 Transformers 建模后端的模型全都起不来。这次改成优先从位置参数 *args 里取编译目标;普通 forward(self, ...) 的第一个位置参数仍然是 self,行为不变。作者在 1 张 B200、Transformers 主干 166948d96c 上,用 VLLM_DISABLE_COMPILE_CACHE=1 强制走 torch.compile 前端 Dynamo 复现并验证。这个提交从 #59224 里拆出来,顺带为 Transformers 5.24 版本升级和 #66416 扫清障碍。",
+      "sig": "sig-model-performance",
+      "sig_reason": "改的是 vllm/compilation 的 torch.compile 包装器与编译钩子,属于编译路径修复。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "torch-compile",
+        "bytecode-hook",
+        "transformers-backend"
+      ],
+      "pr_number": 68717
+    },
+    {
+      "sha": "9f6c850b40d983a384671a20eea3ba16974c279a",
+      "comment": "多模态请求走分离式部署时,渲染接口原先只有两档:把处理好的张量一起序列化返回,或者什么都不返回。前一档在 prefill 实例自己会算嵌入的场景里等于白搬一遍数据。这次给渲染请求的 mm_payload 加了 metadata 这一档:返回里 kwargs_data 置空,mm_metadata 保留。prefill 端凭元数据就能通过负责搬运多模态嵌入的 EC 连接器去取嵌入,不必让渲染侧序列化张量。元数据档返回的 token 序号、哈希、占位符和 mm_metadata 与张量档完全一致,端到端输出也和单实例对齐。顺带修掉一个 400:LLaVA-OneVision 和 Gemma 4 上一个请求里某个模态没有元数据时,张量档会直接失败。不过元数据档遇到同样情况仍返回 400,免得两个字段全空被生成侧读成全部命中缓存。none 与默认的 tensors 档行为不变。该改动关掉 #64997,是 #46722 的一部分。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是让分离式 prefill 经 EC 连接器取多模态嵌入,属于规模化的编码器与 P/D 拆分链路。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "multimodal",
+        "kv-connector",
+        "render-api",
+        "prefill-decode"
+      ],
+      "pr_number": 65018
+    },
+    {
+      "sha": "9a2e60358dc851dacfaa2dbf82286cec1ed60096",
+      "comment": "Rust 前端以前对 /v1/completions 传一组 prompt 直接回 400,而 Python 前端和 OpenAI 规范都接受文本列表或 token ID 列表的列表(#62460)。这次 Rust 侧补上批量 prompt,做法是每个 prompt 复用已有的候选数大于 1 时的扇出(#65625),各自产出 n 个候选。候选序号按 prompt 优先排列,即 prompt 序号乘 n 再加 i。用量统计里每个 prompt 的 token 只算一次,补全 token 累加,流式响应最后只发一个用量块;单个 prompt 的行为跟以前一样。跟 Python 一致,批量里每个 prompt 是一条独立引擎请求,请求 ID 尾部加 -序号。/v1/completions/render 也按 prompt 返回多条生成请求,请求 ID 与 Python 对齐。文本与 token ID 混着的批量,或其中某个 prompt 降级、提交失败,会在任何候选开始流式之前返回 400,已提交的 prompt 被中止。cargo nextest 715 条通过,1 张 GB200 上把原先因不支持批量而跳过的 Python 用例补进了 CI。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 Rust API 前端的 OpenAI completions 路由与请求拆合逻辑,属于核心前端能力补齐。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "openai-completions",
+        "batched-prompts"
+      ],
+      "pr_number": 68390
+    },
+    {
+      "sha": "8cc54e23c9de35ea6a1671939733f0c5ae2560e7",
+      "comment": "Rust 前端以前对 POST /generative_scoring 一律回 501。这次按 Python 同名路由的语义把它实现出来:每个待打分条目拼成一条 max_tokens=1 的请求,读标签 token 的对数概率。接口接受文本或 token ID 的 query,加上 items、label_token_ids、apply_softmax、item_first、add_special_tokens、cache_salt、priority、request_id,返回结构与 Python 一致。prompt 构造也照 Python:query 按 add_special_tokens 分词,items 不分词,再按 token ID 拼接。用量对所有条目求 prompt 与补全 token 之和,不含 prompt token 明细。它取代了 #46427,重建在当前 vllm-text 的请求准备之上,但没有带上那个 PR 的投机解码保护和条目数上限,这两点后续还要补。这个路由属于 #44280 的一部分。",
+      "sig": "sig-core",
+      "sig_reason": "新增 Rust 前端的推理路由与响应协议,是 API 前端本身的功能。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "generative-scoring",
+        "logprobs"
+      ],
+      "pr_number": 68612
+    },
+    {
+      "sha": "8828834fb105e71cd2da399f5e05941fb35c923a",
+      "comment": "选择性租约(#63420)之后,MooncakeStoreConnector 会记录一个 lookup_lease 操作,而 Rust 前端的 MooncakeOperation 枚举里没有这一项。统计区间里一旦出现它,Rust 侧就不再按 Mooncake 存储的统计来解码;放在多连接器 MultiConnector 里时,整个数据退化成 KvConnectorStats::Other,结果这个区间的 Mooncake 指标连同兄弟连接器(比如 NIXL)的指标一起丢掉。这次把 Mooncake 存储的操作名和状态名改成和 Python 一样以字符串传递,UBMP 存储的操作名同样处理。以后新增操作不用再改 Rust 就能导出。验证结果:Rust 前端上 vllm:mooncake_store_operation_* 指标里能看到 operation=lookup_lease,与 Python 前端一致;Rust 代码不认识的操作或状态,不再丢掉整个区间的键值缓存统计。",
+      "sig": "sig-core",
+      "sig_reason": "缺陷在 Rust engine-core-client 对连接器统计的解码方式上,连接器本身逻辑未改。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "kv-connector",
+        "mooncake-store",
+        "metrics"
+      ],
+      "pr_number": 68584
+    },
+    {
+      "sha": "8283763f58569d9e90e998b005d02463de33449c",
+      "comment": "(MI300) Model Executor 这一步偶尔挂死,EngineCore 进程还活着,要等 pytest 的 --timeout=900 把测试杀掉,日志里看不到卡在哪。#67605 已经能在测试超过 faulthandler_timeout 时打印子进程堆栈,但 run-amd-test.sh 把它设成 1500 秒,这一步 900 秒就先被杀,堆栈永远打不出来。这次在该步骤的 pytest model_executor 命令上加 -o faulthandler_timeout=600,超过 600 秒的测试会先打印自身的 Python 堆栈,再打印每个子进程的原生与 Python 堆栈和内核等待通道,然后才被 900 秒的超时杀掉。600 秒留了 300 秒给打印。改动只有两个 Buildkite 配置文件共 2 行,测试结果不变,只多输出日志;作者本地按 CI 分片重放 240 次也没能复现挂死。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 .buildkite 里 AMD 测试步骤的超时参数,属于 CI 调试配置。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "rocm",
+        "buildkite",
+        "test-timeout"
+      ],
+      "pr_number": 68652
+    },
+    {
+      "sha": "6bc4849aa413c3952b198a7c1a94c4fa681f16fc",
+      "comment": "csrc/fused_qknorm_rope_kernel.cu 里 QKV 的偏移按 32 位整数计算,num_tokens(这一批要处理的 token 个数)一大就溢出。GLM-5.3-Flash 按数据并行 4 路加专家并行跑在 H200 上、开启视觉编码器启动时,编码器预热要处理 96 万个图像块,直接触发非法内存访问。第二个缺陷是每线程束处理多个头的路径会把部分旋转的 NeoX 结果写坏,主干分支在 33% 到 70% 的元素上与参考不一致,8 头时返回 NaN;修复后 2、4、8 头和自动选择都与单头内核逐位相同(修掉 #51049)。第三,rotary_dim 的一半不是 2 的幂个线程时,NeoX 取配对线程的下标是错的,现在 rotary_dim 48、head_dim 128 这种形状也对得上参考。另外补一条线程束同步,让 GPT-J 路径能看到别的线程拷来的正余弦值,这条此前没观察到失败。性能上,部分旋转、60 万 token 时主干 5372 微秒且结果错误,现在 2890 微秒;全旋转没变慢。修复后同一服务 126 秒起来,10 张合成图加 1 条文本问题共 11 个提示全答对。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修的是 CUDA 融合 QK 归一化加 RoPE 内核的寻址与线程协作错误。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "cuda-kernel",
+        "fused-qk-norm-rope",
+        "rotary-embedding",
+        "int32-overflow"
+      ],
+      "pr_number": 68386
+    },
+    {
+      "sha": "5e921de215cd9b4c1c129473198c94b8c4e4556c",
+      "comment": "HiSparse 原先只服务 DSA 这条稀疏注意力路径,QSA 用不上。这次把 QSA 接进同一套 HiSparse 规划器与索引组运行时:主 K/V(键值缓存)可以卸载到主机内存,indexer 的 key、原始 key 环形缓冲和 GDN 状态仍留在显存里。稀疏角色字段 cache_role、topk_buffer_width、is_index_group_leader 挪到 AttentionSpec 上,这套元数据因此不再绑死多头潜在注意力,普通全 K/V 注意力也能用;HiSparse 关掉时 QSA 退回自己的常规后端。设备端缓存采用 BLNHC 排布,让同一个 token 在本地各头上的 K/V 连成一整行搬运。张量并行每个 rank 管一份私有主机池,host_pool_gib 按去重后的 KV 头数给预算,padding 和被复制的头照样占物理显存。NIXL 的分离式 prefill 与 decode 支持拆到 #68281,QSA 目前还不支持 decode 上下文并行。GB300 上单引擎 256 客户端时,同时在跑的最大请求数从 64 提到 179,吞吐低 5.3%(3354 对 3542 tok/s);3 个 prefill 配 1 个 decode 的部署,吞吐提升 38.1% 到 42.8%,128 并发时从 899 涨到 1680 tok/s。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是把 HiSparse 的键值缓存主机卸载扩到 QSA,属于多层 KV 缓存卸载。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "hisparse",
+        "kv-offloading",
+        "sparse-attention",
+        "qsa"
+      ],
+      "pr_number": 59209
+    },
+    {
+      "sha": "79e937641247236e124b94860d71e42b3d6d768d",
+      "comment": "多模态分离式部署里,前端要先知道引擎能不能接受只有元数据、不带嵌入张量的输入。这次把引擎已有的 allow_missing_mm_embeddings 设置放进 EngineCore 的 READY 应答,并透出到 Rust 的 LlmInfo,这样 HTTP 前端(#68080)和 gRPC 前端(#66094)两条 EPD 分离式部署链路可以共用同一份能力判断,不用各写一套。老引擎的应答里没有这个字段,读不到时按 false 处理。这一步不放开任何新的前端请求,调度器、执行器和连接器的行为都没变。验证在 GCP 上用 Rust 1.95 跑 cargo test 与 cargo check 及格式检查;Python 侧用 MessagePack 固定报文同时覆盖带上新字段和老引擎省略字段两种情况。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "字段服务于 EPD 分离式多模态部署的能力协商,改动落在握手协议而非引擎行为。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust-frontend",
+        "engine-handshake",
+        "multimodal",
+        "epd"
+      ],
+      "pr_number": 68565
+    },
+    {
+      "sha": "2986b5cb092cb0f1a1fafcb1f031b2a59b1d7448",
+      "comment": "gfx1151 上 bf16 的 W4A16 Triton 层在 decode 尺寸的 M(M 是矩阵乘里的 token 数)上有一道 tile 断崖:原来按 prefill 调好的 tile,在宽 N 层的 M=33 到 64 和 g32 长 K 层的 M=65 到 128 上特别慢,正好卡在解码批次。这次给 gfx1151 的 bf16 路径加上 M=9 到 128 的 decode 尺寸 tile 选择,扫出来的 tile 不是稳定更快就沿用原有梯度,以免个别形状反而变慢;fp16 选择器和打包反量化路径都没动。Qwen3.8-27B 的输出吞吐,原始跑分在并发 64 时 +43.8%,带 MTP(多 token 预测投机解码)在并发 12 和 16 时分别 +41.9% 和 +33.6%。独立复跑是 +36.9%、+37.8%、+33.2%,三次跑分差不超过 1.3%。内核层面 35 个转置权重用例几何平均 1.38 倍,最差 0.90 倍;相对 fp32 参考的最大相对误差 0.0031。",
+      "sig": "sig-quantization",
+      "sig_reason": "调的是 W4A16 混合精度量化线性层的 Triton tile 选择,属量化内核提速。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "w4a16",
+        "triton",
+        "tile-selection"
+      ],
+      "pr_number": 66133
+    },
+    {
+      "sha": "fd774d6d89b7fcbef84c3f93e3cb13aec830cb57",
+      "comment": "在 XPU 上 flash_attn_supports_quant_query_input() 一直返回 False,所以就算 KV 缓存是 FP8,flash attention 后端也从没把 query 量化成 FP8。而 vllm-xpu-kernels 0.1.17 起的 Xe3p 内核已经能跑全 FP8 注意力,Q、K、V 都是 FP8,q_scale 直接融进内核,Xe2 还做不到。这次加环境变量 VLLM_XPU_SUPPORT_FP8_QUERY,类型是布尔或者不设:设 1 强制打开,设 0 强制关闭,不设时由 XPUPlatform.support_fp8_query() 去查 torch.ops._xpu_C.is_xe3p_arch(),是 Xe3p 就打开,其它 XPU(比如 BMG)或这个算子不存在就维持原来的关闭。其它平台的返回值仍是 True,没受影响。已知限制是 Xe3p 的全 FP8 内核目前只支持 head_size 128,而且 Q、K、V 得是同一种 FP8 类型。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是决定 XPU 上注意力是否把 query 量化到 FP8,属于 FP8 计算路径的开关。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "xpu",
+        "fp8",
+        "flash-attention",
+        "env-var"
+      ],
+      "pr_number": 67860
+    },
+    {
+      "sha": "e805e2546ee408fe4e4a61b7aae3364e2abde50d",
+      "comment": "prefill 与 decode 张量并行度不同的 MoRIIO WRITE 路径,今天服务不了 MiniMax-M3,有两个独立原因。一是 ROCm 上的 NVFP4 键值缓存:写入按「每个 KV 头的字节连续」切页,但 ROCm 的页在 K 和 V 两侧都是先把所有头的 FP4 数据排完、再排所有头的块级 scale,于是 TP4 到 TP1 的 decode 实例收到错位的 KV,生成的是乱码。这次按真实排布切页,切不了的其它打包页改为抛 ValueError,不再静默写错。二是复制型的 indexer key 缓存:MiniMax-M3 的 lightning-indexer key 每 token 一条向量、每个张量并行 rank 一份,存在多头潜在注意力型缓存里,而模型本身是分组查询注意力。原来的逐层映射按模型 KV 头数估算它的大小,prefill 并行度高于 decode(如 TP4 到 TP2)时会按头去切,每个请求都报 MoRIIOError。现在这类层改成整块复制。CPU 单测在多种并行度组合上逐字节比对 decode 侧的页。其它缓存、多头潜在注意力模型、两侧 KV 头相同的场景不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修的是 MoRIIO 键值连接器在异构张量并行分离式部署下的写入布局。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "moriio",
+        "heterogeneous-tp",
+        "nvfp4",
+        "rocm"
+      ],
+      "pr_number": 68072
+    },
+    {
+      "sha": "8ff4edd0b67d40bc70712c6dec351ed42476735a",
+      "comment": "Nemotron 扩散模型的采样步在 Inductor(torch 2.13 的编译后端)上会生成引用未定义变量的代码,报 NameError,提示 tmp27 is not defined,CI 里 MI355 的两个 Nemotron 扩散测试 test_greedy_generation 与 test_stochastic_rollouts 因此失败。根因是 PyTorch 的 bug #194490,torch 2.14 的 #194786 已经修掉,但 ROCm 镜像还停在 torch 2.13,CUDA 镜像已经是 2.14。这次在 torch 低于 2.14 时改用带掩码的 max 来取被选中 token 的 logit,替掉出问题的那次 gather,取到的数值相同;torch 2.14 及以上继续走原代码。作者在与 CI 同镜像的 MI355X 上关掉 Inductor 缓存复现验证,并指出这个 bug 只在 CI 那种 128 个计算单元的 DPX 分区上出现。CUDA 侧没有变化,改动只有 19 行加 4 行删除,落在单个模型文件里。",
+      "sig": "sig-model-performance",
+      "sig_reason": "为绕开 torch.compile 后端 Inductor 的 gather 代码生成 bug 而改写算子写法。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "torch-compile",
+        "inductor",
+        "nemotron"
+      ],
+      "pr_number": 68694
+    },
+    {
+      "sha": "fe537b1785f3a636365306d532e4fa0daf959698",
+      "comment": "水印功能在 deduplicate_contexts=all 且开投机解码时有个漏判:一个上下文如果第一次出现始于 prompt、结尾落到输出里,重复上下文掩码认不出它是重复的,于是投机路径给这个 token 打了水印,而非投机路径本应在这里跳过水印。掩码不一致会动摇 #65961 依赖的「投机与非投机逐 token 相同」这个前提,这个问题是审查那个 PR 时发现的。这次把投机解码的校验行和草稿步两处的重复上下文掩码都改对,让 none、single_turn、all 三种模式下投机掩码与非投机掩码完全相等。none 与 single_turn 的掩码和生成代码都没变。验证在 1 张 H200、主干 9986df412 加预编译 wheel 上做,配 #65961 的贪心草稿,all 模式下投机与非投机输出逐 token 相同,并新增了跨 prompt 边界比较上下文的测试。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "缺陷只在投机解码的校验行与草稿步上出现,修的是投机路径的水印掩码。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "watermarking",
+        "speculative-decoding",
+        "sampling"
+      ],
+      "pr_number": 67947
+    },
+    {
+      "sha": "a3b845e2265c495e20661e788003cddf2cb05953",
+      "comment": "MooncakeStoreConnector 以前不认请求级的 kv_transfer_params.max_offload_tokens,每个请求都把整段前缀写进 Mooncake 存储,调用方没法限制单个请求占用共享存储的量。这次让它生效:值为 0 就完全不写,正数则限制写入存储的前缀长度,而查找和加载照常进行,读取侧不受影响。常规保存会在上限内向下取到整块,例如块长 16 时,上限 100 实际写 96 个 token 的前缀。边界状态交接、请求结束时的检查点、部分尾部的注意力证明,这些特殊写入同样被压在上限之内。实现只复用已有的请求跟踪和存储元数据;参数解析与原生 OffloadingConnector 共用一份代码,整型 0 的语义和非法值「警告后忽略」的旧行为都保留。单测用真实请求、调度器配置、缓存组和块池,只把外部查找服务打桩,覆盖 0、正数上限、整块取整以及恰好卡边界的检查点与证明。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "改动在 Mooncake 存储连接器的卸载写入配额逻辑,属于多层 KV 缓存卸载。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-connector",
+        "mooncake-store",
+        "offloading",
+        "scheduler"
+      ],
+      "pr_number": 68529
+    },
+    {
+      "sha": "1ae1b64807ff6be2a0d3f942dbad0a59a663a02a",
+      "comment": "OpenAI 风格的助手消息有时把拒答文本放在顶层 refusal 字段里,而 content 是空的。共享的 Python 聊天归一化只看 content,这段历史在交给 HF 渲染器时就被丢掉,拼出来的 prompt 里没有拒答内容,多轮对话因此少了一截。这次让归一化在 content 缺失、为 null、为空字符串或空列表、同时 refusal 是非空字符串时,把它当成显式的 refusal 内容块处理,归一化后的会话与 HF /tokenize 产出的 token ID 都跟显式写法一致。content 非空时仍然以 content 优先,包括 content 是一次性迭代器的情况。作者在 macOS arm64 纯 CPU 上,用官方 HuggingFaceTB/SmolLM2-135M-Instruct 权重对比改动前后同一份测试文件的结果,并同步更新了 openai_compatible_server 文档。",
+      "sig": "sig-core",
+      "sig_reason": "改的是聊天消息归一化与渲染器这一前端公共路径,不涉及模型或内核。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "renderer",
+        "chat-normalization",
+        "openai-protocol"
+      ],
+      "pr_number": 67954
+    },
+    {
+      "sha": "fd2b7ac40fba94906ad44c84b6a51e77c9fae8a8",
+      "comment": "在线重量化指的是用 --quantization-config 在加载时把已经序列化的 checkpoint 转成另一种格式。以前它会把整个模型的源权重先在显存里实体化再逐层转换,加载峰值等于序列化模型加上量化后模型两份。Mistral-Large-4-1T-A52B 在张量并行 4 路下,只加 dequantize_weight、不加本次 meta 设备改动的对照组峰值到 287.9 GiB,把显存打满;改成重量化源先建在 meta 设备(只有形状没有数据)上、由逐层加载器读满一层就当场转换后,峰值降到 147.9 GiB,基线是 144.2 GiB,加载完的模型显存与基线基本相同。同时给 FP8 MoE 的三种方法(块、逐张量、逐通道 scale)补上 dequantize_weight,共用一个 helper,按权重的 QuantKey 驱动并分块以压住 fp32 中间缓冲。块 FP8 专家重量化成 MXFP4 与直接在线量化反量化后的 bf16 专家逐字节相同。行为变化:源层缺 checkpoint 张量现在在加载结束时抛 ValueError,而不再从全零转换;带静态激活 scale 的 FP8 checkpoint 抛 NotImplementedError。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是降低在线重量化的加载峰值并打通块 FP8 到 MXFP4,属量化加载路径。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "online-quantization",
+        "mxfp4",
+        "fp8-moe",
+        "model-loading"
+      ],
+      "pr_number": 68171
+    },
+    {
+      "sha": "283bf21b69686a9091fc59fa74b6c46303d365cc",
+      "comment": "vLLM 本身是接受 NumPy 数组当图片输入的,多模态输入类型 HfImageItem 就包含 np.ndarray。用 HuggingFace 上托管处理器的模型(比如 Qwen2-VL)传数组也没问题。出问题的是 vLLM 自己放在 transformers_utils/processors 下的那批处理器,它们默认拿到的是 PIL 图片,直接调 image.size、image.mode、image.width,同一张图换成数组就整条请求失败:比如 InternVL3-1B 传 np.asarray(pil_image) 会先抛 TypeError 说没法解开一个 int,再被包成处理器失败的 ValueError。这次在这 7 个处理器第一次使用图片的位置统一过一遍 transformers 的 to_pil_image,本来就是 PIL 图片的原样通过。改动只有 +14/-3,涉及 deepseek_ocr、deepseek_vl2、internvl、isaac、nano_nemotron_vl、ovis、ovis2_5 七个处理器文件,风险面小。",
+      "sig": "sig-omni",
+      "sig_reason": "修的是多模态图片输入在这些模型自带处理器上的类型兼容。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "image-input",
+        "hf-processor"
+      ],
+      "pr_number": 68655
+    },
+    {
+      "sha": "e2c96445a5814fa44f1ba79cb299b3656c634481",
+      "comment": "ROCm 上 Kimi-K3 的融合 decode 多头潜在注意力路径,原先在捕获阶段被写进了 PIECEWISE 计算图,也就是按段捕获、prefill 与混合批次也会 replay 的那批图。结果之后每次 replay 都拿只适用于解码的内核去处理 prefill 或混合 token。配 max_cudagraph_capture_size=1024 时,第一个请求就崩溃或挂死。这次让这条融合路径在 PIECEWISE 图里跳过,改走未融合实现;未融合路径在捕获前需要先备好窄 GEMM 的工作区,所以把预热挪进 allocate_kv_cache,覆盖所有键值缓存分配路径。验证是 Kimi-K3 用 AITER 注意力后端、张量并行 8 路跑在 8 张 MI350X(gfx950)上,主干在捕获上限 1024 时首个请求就崩或挂,加上本次改动能正常服务,MI355X 同样验证。作者检索过主干上相关关键词,没有其它 PR 覆盖这个问题。",
+      "sig": "sig-model-performance",
+      "sig_reason": "根因与修复都在 CUDA graph 捕获策略上,决定融合解码注意力是否进图。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "cuda-graph",
+        "rocm",
+        "mla",
+        "kimi-k3"
+      ],
+      "pr_number": 66578
+    },
+    {
+      "sha": "bd95fa0e689f81246b46f91a4b9710e439d882c4",
+      "comment": "Qwen3.5 的 MTP(多 token 预测)草稿模型在建解码层时,只要 checkpoint 的 dynamic 规则里出现提到 mtp 的 - 开头条目,就把共享的 vllm_config.quant_config 置空(#48816 时期的绕法),让草稿层按未量化的方式建。这个职责后来由 #49539 统一接管:AutoGPTQ 在给某一层挑方法时自己读这些规则,#67413 之后 moe_wna16 也一样。于是那份代码成了死代码,而且它只在成功路径上把 quant_config 恢复回去,中途出异常就会把共享配置留在被清空的状态。这次从两份草稿实现里都删掉它,改为直接用 checkpoint 自己的量化规则建草稿模型。验证用 Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 加 num_speculative_tokens=2 起服务,目标模型与草稿模型的加载时间从 7.33 秒和 0.52 秒变成 7.24 秒和 0.39 秒,并跑 16 条贪心补全对比输出。",
+      "sig": "sig-quantization",
+      "sig_reason": "删的是 AutoGPTQ 量化规则在投机草稿上的历史绕法,让量化分派回到统一入口。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "autogptq",
+        "quantization-config",
+        "mtp",
+        "speculative-decoding"
+      ],
+      "pr_number": 67414
+    },
+    {
+      "sha": "3487a1c10c3718f0fe427148dd184ed16ca15d24",
+      "comment": "这条 PR 正文是空模板,Overview、Claims、Validation 三段都没填,下面的判断只来自标题和改动文件,具体参数名与默认值需看补丁确认。从标题看,这次给 Rust 前端加的是服务级的多模态处理器参数:原来要给图片、视频处理器传额外 kwargs 只能在别处指定,现在可以在启动服务时统一配置一次。改动落点与这个说法吻合:命令行入口在 rust/src/cmd/src/cli.rs 及其测试里新增选项,不支持该选项的组合在 cli/unsupported.rs 上报错;配置往下传到聊天模块的 HF 后端构造处(rust/src/chat/src/backend/hf.rs 与 mod.rs)和多模态处理路径(multimodal.rs、multimodal/video.rs),另附一个外部引擎示例。共 13 个文件、+290/-21,Python 引擎侧没动。由于缺少作者的说明与验证记录,影响面与兼容性证据不足。",
+      "sig": "sig-core",
+      "sig_reason": "改动全在 Rust 前端的命令行与聊天多模态处理路径,属于 API 前端配置能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "multimodal",
+        "cli-args"
+      ],
+      "pr_number": 68186
+    },
     {
       "sha": "f0c592bfddc1394b5e74abc0a9d340e947aba41f",
       "comment": "KV 卸载调度器在复用块之前，要检查这个块上是否还挂着没写完的卸载任务，有就得先把任务刷完。此前这个判断只看块的数字编号，而 DeepSeek 稀疏注意力的 HiSparse 主机池和显存池各自独立编号。主机池新分配块的编号撞上显存池里待写入块的编号时，调度器会把一个毫不相干的卸载写入加进待刷列表。这次把判断范围限定到块所属的池：只有和被卸载源池同一个组内的复用才触发刷新。新增的回归测试走真实的 core 调度器和 CPU 卸载管理器，同步与异步调度两种模式都覆盖。PR 给了反向验证：在改动前的 main 上这条测试会因为待刷列表多出一个元素而失败。",
