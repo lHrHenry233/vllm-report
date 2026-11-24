@@ -1,0 +1,515 @@
+{
+  "date": "2026-11-24",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-24T11:05:46+08:00",
+  "daily_summary": "## 今日概览\n34 条（抓取于当日上午，还在增长）。三条线。一是内核实测收益集中兑现：HY4 Flash 在 SM100 上整轮优化，单并发时每输出 token 时延从 22.09 ms 降到 6.37 ms、吞吐涨 3.36 倍（#68770）；AWQ 反量化改成一次 16 字节的向量化 store，kernel 快 2.44 到 3.66 倍（#63590）；Qwen4Exp 的稀疏注意力与索引器在 AMD 两个架构上拿到 1.24 到 6.5 倍（#65474）。二是量化格式边界：MXFP8 的 MoE 接上 DeepEP 低延迟路径（#66456），TorchAO 后端进入废弃（#69066），一批无人调用的量化实现被删（#69483）。三是 CI 底盘：自动分片默认开启（#64796），vllm-runners 锁定为只能由 main 分支上的复用 workflow 调用（#69510、#69513）。\n\n## 今日重点\n\n### AMD / ROCm\n- **稀疏注意力**：Qwen4Exp 的 QSA 还剩两个 Triton kernel 没按架构调优。这次把 head group 补到 16 行、gfx942 与 gfx950 共用一套 BF16 启动配置，索引器只算到本 batch 最长序列。MI325X 上 prefill 快 1.57 倍、decode 快 1.65 倍，MI355X 是 1.24 与 1.45 倍；索引器在 8K 到 60K 上下文快 1.3 到 6.5 倍（#65474）。\n- **量化精度**：ROCm 的非对称 int8 走 TritonInt8ScaledMMLinearKernel，先把矩阵乘结果舍入到 bf16 再减激活的 zero-point，精度被这一步抹掉，Llama-3-8B-INT8-asym 在 MI300 的 LM Eval 只多过一题。现在减法挪进 kernel、直接在 int32 累加器上做（#69085）。\n- **注意力竞态**：MLA 分块续接上下文时用原生 merge_attn_states 就地合并前缀的 LSE，某个 head 的 LSE 可能在该 head 其它线程读完之前就被覆盖，跨 chunk 边界的 token 拿到错误输出，问题由 AMD nightly 暴露（#69433）。\n- **CI**：ROCm 基础镜像在合并前自动缓存，不再压在 pre-commit 门禁后面等维护者手工触发（#69056）。\n\n### NVIDIA\n- **HY4 Flash**：新增自定义 CUDA kernel 与稀疏 decode，25 个文件近 5000 行。张量并行 4 单并发时首 token 时延从 378 ms 降到 226 ms、吞吐从 43.9 升到 147.5 tok/s，并发 32 时从 645 到 1588 tok/s，两种并行布局拿到 2.17 到 3.26 倍；gsm8k 0.9704 到 0.9659，AIME25 精确匹配 1.0 到 0.9778（#68770）。\n- **MLA decode**：TRITON_MLA 的 stage1 原先先遍历 batch 维，同属一次的 head 块被拉开排布、L2 里的 KV cache 复用不起来。现在把 head 块挪到 grid 第一维协同调度、K_Buffer 换成行主序，改 27 行拿到 kernel 级最高 1.7 倍（#69029）。\n- **GLM-5.3-Flash**：融合的 all-reduce + mHC（流形超连接）+ RMSNorm decode kernel 扩到 Hopper，在张量并行 4 卡 decode 配置下默认启用，端到端吞吐提升 8.7%。作者明确其它并行度与完整迁移还没做（#69001）。\n- **AWQ**：反量化时每个线程的 8 个半精度值原来写 8 次 2 字节标量 store，改成一次 16 字节的 uint4 store，数学不动、输出逐位相同。H100 上 kernel 快 2.44 到 3.66 倍、带宽提到约 2 TB/s，并发 1 时单 token 时延从 34.9 ms 降到 16.0 ms，精度不变（#63590）。\n- **MXFP8**：DeepEP 低延迟的 dispatch 路径此前没有任何 MXFP8 experts kernel，现在接上 FlashInfer 0.7.3 的 masked grouped GEMM，SM100/SM103 上选 deepep_low_latency 或 nixl_ep 时自动命中，内核跑不了的配置在启动阶段就拒绝（#66456）。DeepSeek-V4.1 的 MXFP8 线性层在 H100 上被切到 BF16 权重加 FP8-GEMV 路径，张量并行等于 1 时每卡从 47.67 GiB 涨到 60.21 GiB，现在 SM90 在张量并行 1 时改回平台自带的 MXFP8 内核（#69446）。\n- **其它**：Mamba2 的 SSD 预热从单 chunk 扩到最多 32 个 chunk，避免自动调参锁死一个慢 tile（#60800）；decode 的 top-k 宽度加上 1 到 8192 的原生校验，越界变成明确报错而不是崩溃（#60961）；HY4 的 DFly 放开 compressed-tensors 目标方案白名单，NVFP4 检查点也能用推测解码（#69274）。\n\n### Intel XPU\n- TRITON_ATTN 的张量描述符路径限制回 XPU：这条路在 CUDA 上本身有 bug、测试里抛 PassManager 运行失败，而且比 CUDA 默认路径还慢。改动 10 行，代价是 CUDA 侧少了一条可选路径（#68521）。\n\n### 跨平台 / 引擎通用\n- **流水线并行**：HF3FS 连接器直接把张量并行秩当作存储 rank，不同 stage 的同号 worker 因此写进同一个数据文件、并在元数据服务里注册成同一个 rank，可它们持有的是不同的层，回读出来的 KV 混着别的 stage、输出直接乱码；存储 rank 改为由流水线秩派生（#67301）。DeepSeek V4 的 MegaMoE 路由每层都要原始 token ID，而 Model Runner V2 默认只在第一个 stage 保留 input_ids，纯文本版在后续 stage 抛 AttributeError（#55520）。\n- **KV 缓存与存储**：MooncakeStore 读远端失败后，只要元数据还在报命中而实际 GET 一直失败，请求就在等待准入与等待远端 KV 之间来回弹，永远回不到本地计算，现在补上每请求的失败标记（#67957）。HiSparse 把热点 KV 页常驻显存，分块 prefill 时下一步分配发现页不够就把请求卡住，现在分配之前先回收能释放的常驻页（#67185）。\n- **引擎与前端**：Gemma3n 开 --kv-sharing-fast-prefill 后跨解码器只跑裁剪后的 token，而重放的分段 CUDA graph 按完整批次捕获，两者对不上，现在调用前后改写批次描述符（#68944）。OLMo Hybrid 删掉自己那份门控 delta net（线性注意力）实现，只留 96 行适配器接进 Qwen 已有的路径，生产代码净减 493 行（#68368）。只配了 OTLP trace 端点但关掉请求统计时，第一个请求结束就断言失败，因为统计原先只在打印时收集（#68674）。--cohere-format 的默认值此前会注入每个服务端的 chat template 参数，走 Mistral tokenizer 时报未知参数，现在只在 cohere 模式下注入（#69468）。/v1/decisions 原先把所有问题一律截到 26 个候选，现在尊重策略报告的 labeled 上限（#68037）。\n- **工具与 CI**：vllm bench startup 新增 --serve-cmd，此前它在单进程里直接构造 LLM，少算了 API server、engine core、worker 进程和第一个请求（#69076）。Buildkite 的自动分片改为对纯 pytest 步骤默认开启，脚本、cargo 与手工拆分步骤不受影响（#64796）。vllm-runners 的锁定分两步上线：先新增 6 个复用 workflow，再把 6 个调用方改成引用 main 上的它们（#69510、#69513）。被测试选择器留在 blocked 的已完成构建不再算作还在跑，/ci retry 才说得通（#69497）。CPU 镜像装 gcc-15 时 Launchpad 的 PPA 只给到约 100 kB/s 且频繁 503，27 次构建挂 12 次，现在加重试（#69416）。HY4 Flash 的 IndexPool 辅助函数补类型标注，解掉严格文档构建的 19 条告警（#69472）。\n- **量化治理与其它**：TorchAO 后端打 deprecation warning、点名 v0.37 移除（#69066）；一批无人调用的量化实现一次删掉 215 行（#69483）。ERNIE-5.5-Flash 放出 Preview 版权重，recipe 整份重写并给出 FP4、FP8、BF16 三种格式的部署配置（#69425）；pooling 子系统新增 committer（#69437）。\n\n## 需要关注\n- TorchAO 量化后端将在 v0.37 移除，还在用的要提前迁到 compressed-tensors 或在线量化。\n- 自动分片默认开启改变了 CI 步骤形态，自定义步骤要确认测试命令确实是纯 pytest，否则显式标 automatic_shard: false。\n- vllm-runners 两步上线完成后，依赖这组 runner 的自建 workflow 必须改成走 main 上的复用 workflow，否则会直接失败。\n- #68521 让 CUDA 侧少了一条可选的 TRITON_ATTN 路径；#69001 只覆盖张量并行 4 的一种 decode 配置，其它并行度仍是缺口。\n- 当日仍在进行，晚间合并的部分留到下一轮补。\n",
+  "sig_summaries": {
+    "sig-model-performance": "9 条，几乎每条都带实测数字，AMD 与 NVIDIA 各占一半。\n- **AMD**：Qwen4Exp 的 QSA 稀疏分组查询注意力与索引器按 gfx942/gfx950 分别调 tile，MI325X 上 prefill 1.57 倍、decode 1.65 倍，索引器在 8K 到 60K 上下文 1.3 到 6.5 倍、1K 短 prompt 8 到 11 倍，张量并行 1 到 8 的范围内没有超过 1% 的回退（#65474）。MLA 分块续接上下文时就地合并前缀 LSE 存在读写竞态，跨 chunk 边界的 token 会拿到错误输出，由 AMD nightly 暴露（#69433）。\n- **NVIDIA**：HY4 Flash 在 SM100 上整轮优化，单并发每输出 token 时延 22.09 ms 降到 6.37 ms、吞吐 3.36 倍，并发 32 时 645 到 1588 tok/s，精度基本持平（#68770）。TRITON_MLA stage1 把 head 块挪到 grid 第一维并改用行主序 K_Buffer，kernel 最高 1.7 倍（#69029）。GLM-5.3-Flash 的融合 all-reduce + mHC + RMSNorm decode kernel 扩到 Hopper，张量并行 4 下端到端吞吐 8.7%（#69001）。AWQ 反量化写出改成 uint4，kernel 2.44 到 3.66 倍、带宽约 2 TB/s（#63590）。Mamba2 的 SSD 预热从单 chunk 扩到 32 个 chunk，避免自动调参锁死慢 tile（#60800）。decode top-k 宽度加 1 到 8192 的原生校验并补 5 个回归用例（#60961）。TRITON_ATTN 的张量描述符路径限制回 XPU，CUDA 侧不再走这条有 bug 且更慢的路（#68521）。\n- **测量工具**：vllm bench startup 新增 --serve-cmd，拉起真实服务命令分别计时段，此前少算了 API server、engine core、worker 进程与第一个请求（#69076）。\n",
+    "sig-core": "7 条，接口正确性与实现去重。\n- **流水线并行**：DeepSeek V4 的 MegaMoE 路由每层都要原始 token ID，而 Model Runner V2 默认只在第一个 stage 保留 input_ids，纯文本版在后续 stage 抛 AttributeError，现在在需要的 stage 保留（#55520）。\n- **CUDA graph**：Gemma3n 开 --kv-sharing-fast-prefill 后跨解码器只跑被裁剪的 token，重放的分段 CUDA graph 却按完整批次捕获，调用前后需要改写批次描述符（#68944）。\n- **KV 分配**：HiSparse 的热点页常驻显存，导致下一个 prefill 分块分配不到页、请求卡住，现在分配前先回收可释放的常驻页，四组相关测试 650 通过（#67185）。\n- **线性注意力去重**：OLMo Hybrid 删掉自己复制的门控 delta net 实现，用 96 行适配器接进 Qwen 已有的路径，保留独立的 B/A 投影、output norm 的 epsilon 与 2 乘 sigmoid(b) 的门控形式，生产代码净减 493 行（#68368）。\n- **前端**：只配 OTLP trace 端点而关闭请求统计时，第一个请求结束就断言失败，收集与打印解耦（#68674）；--cohere-format 的默认 kwarg 只在 cohere tokenizer 模式下注入，否则 Mistral 链路会把未知参数转给 mistral-common（#69468）；/v1/decisions 开始尊重 DecisionLimits.labeled，读取类策略不再被硬截到 26 个候选（#68037）。\n",
+    "sig-ci": "7 条，主题是 CI 底盘与供应链。\n- 自动分片改为默认开启：原先只给显式标记的步骤分片，main 上堆了 497 个标记而新步骤常漏标；现在纯 pytest 步骤默认分片，脚本、cargo 与手工拆分步骤保持原样，个别步骤可用 automatic_shard: false 退出（#64796）。\n- vllm-runners 的访问锁定分两步：先新增 6 个 workflow_call 形式的复用 workflow（#69510），再把 6 个调用方改成引用 main 上的它们，同时放宽仓库内 @main 引用的钉版本检查、外部 action 仍必须钉 40 位 SHA（#69513）。任何人都能在 PR 里加 workflow 调度到这组 runner，这是真实的供应链风险。\n- 被测试选择器留在 blocked 的已完成构建不再算作还在跑，此前 /ci retry 总回答上一个构建还在跑、/ci run 说该 commit 已经跑过（#69497）。\n- ROCm 基础镜像在合并前自动触发缓存构建，不再压在 pre-commit 门禁后面等人工点击（#69056）。\n- CPU 镜像从 Launchpad PPA 装 gcc-15/g++-15 时源站只给到约 100 kB/s 且频繁 503，27 次构建挂 12 次，现在加下载重试（#69416）。\n- HY4 Flash 的 IndexPool 辅助函数补类型标注，消掉 19 条 Griffe 告警，让严格模式的文档构建重新通过（#69472）。\n",
+    "sig-quantization": "6 条，格式覆盖、显存回退与后端治理。\n- MXFP8 的 MoE 检查点此前走不了 DeepEP 低延迟专家并行，因为那条 dispatch 路径上没有 MXFP8 experts kernel；现在接上 FlashInfer 0.7.3 的 masked grouped GEMM 与 masked MXFP8 量化内核，compressed-tensors、INC、ModelOpt 与在线 MXFP8 都能用，SM100/SM103 上自动命中，不支持的配置在启动阶段就拒绝（#66456）。\n- DeepSeek-V4.1 的 MXFP8 线性层在 H100 上被切到 BF16 权重加 FP8-GEMV 路径，张量并行等于 1 时每卡显存从 47.67 GiB 涨到 60.21 GiB，现在 SM90 在张量并行 1 时改回平台自带内核（#69446）。\n- ROCm 上非对称 int8 走 TritonInt8ScaledMMLinearKernel 时先把结果舍入到 bf16 再减激活的 zero-point，精度被抹掉，Llama-3-8B-INT8-asym 在 MI300 的 LM Eval 只多过一题；减法挪进 kernel 在 int32 累加器上做，只在 ROCm 生效（#69085）。\n- AWQ 的 dequantize_weights 写出改成一次 16 字节的 uint4 store，逐位相同、kernel 2.44 到 3.66 倍（#63590）。\n- 后端治理：TorchAO 进入废弃流程，传 quantization 等于 torchao 会打一次 deprecation warning 并点名 v0.37 移除（#69066）；同时删掉一批无人调用的量化实现，215 行，覆盖 CPU 侧 FP8 头文件、sgl-kernels 的 FP8 W8A8 GEMM、w4a8 grouped_mm 入口、Machete 的 prepacked layout 等（#69483）。\n",
+    "sig-large-scale-serving": "2 条，都是分离式 KV 存储的正确性。\n- HF3FS 的 KV 连接器直接用张量并行秩当存储 rank。开流水线并行后，不同 stage 的同号 worker 写进同一个数据文件并在元数据服务里注册成同一个 rank，而它们持有的是不同的层，回读的 KV 混着别的 stage 的层、输出直接变乱码。本 PR 把存储 rank 改为由流水线秩派生（#67301）。\n- MooncakeStore 读远端 KV 失败后，调度器按 recompute 策略重置已算 token 数并重排请求，但失败标记在完成信号到达时就被清掉；只要元数据仍报命中（例如已下线 segment 的残留信息）而实际 GET 一直失败，请求就在等待准入与等待远端 KV 之间来回弹，回不到本地计算。现在补上每请求的失败标记，失败后不再重复向存储发起加载（#67957）。\n",
+    "sig-spec-decode": "1 条。HY4 的 DFly 推测解码原先对目标模型的量化方案有白名单，NVFP4 这类 compressed-tensors checkpoint 被挡在外面，RedHatAI/Hy4-NVFP4 因此用不上。本 PR 放宽校验：compressed-tensors 目标不再看具体的分层方案，只有出现 kv_cache_scheme 或 transform_config 非空时才拒绝（#69274）。\n",
+    "other": "2 条。\n- 百度 ERNIE-5.5-Flash 放出 Preview 版 chat 权重，仓库里的 recipe 还是旧内容；本次按 vLLM-ERNIE 的 README 整份重写，给出 FP4、FP8、BF16 三种权重格式的部署配置与启动参数（#69425）。\n- 治理：Taneem Ibrahim 加进 pooling 子系统的 committer 名单，CODEOWNERS 同步更新，提名来自 njhill（#69437）。\n"
+  },
+  "commits": [
+    {
+      "sha": "9cd5cde84bc372462a9034e49462634a168304fb",
+      "comment": "之前 Buildkite 的流水线生成器只给显式标了 automatic_shard: true 的步骤做自动分片，main 上已经堆了 497 个这样的标记，新增步骤常常漏标。现在 .buildkite/ci_config.yaml 把 automatic_shard_default 设为 true，凡是测试命令为纯 pytest 的步骤默认就分片，生成器侧的支持在 ci-infra#885。脚本、cargo 或者手工固定拆分的步骤不受影响，保持原样运行，个别步骤可以用 automatic_shard: false 主动退出。作者说明这次取代了该 PR 早期的内容，当时逐个标豁免的做法在生成器重写后已经不需要。改动只有 3 行，但它决定所有步骤怎么分片，属于要逐行审的底盘配置。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 Buildkite 的 CI 配置开关，影响测试分片策略。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "buildkite",
+        "test-sharding",
+        "pytest"
+      ],
+      "pr_number": 64796
+    },
+    {
+      "sha": "28fb1365a90e9929e4596a72906e309dd7ac701f",
+      "comment": "百度 ERNIE-5.5-Flash 放出了 Preview 版 chat 权重，仓库里那份 recipe 还是旧内容。这次把 recipes/models/baidu/ERNIE-5.5-Flash.yaml 整份重写（+301/-289），按 vLLM-ERNIE 的 README 对齐，给出 FP4、FP8、BF16 三种权重格式的部署配置和对应的启动参数。验证方式是跑 node scripts/validate-source.mjs --source vllm --dir recipes 做来源一致性检查。PR 描述里还带着未填完的检查清单，并注明用了 AI 辅助。影响面只在用户侧的部署示例，不动引擎代码，风险低。",
+      "sig": "other",
+      "sig_reason": "只更新模型 recipe 的 YAML 部署示例，不涉及引擎实现。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "recipe",
+        "ernie",
+        "fp8"
+      ],
+      "pr_number": 69425
+    },
+    {
+      "sha": "ce2668a3df8ba6746d5470075d46eb770c1b11ac",
+      "comment": "Qwen4Exp 的 QSA 稀疏注意力在 AMD 上还有两个 Triton kernel 没按架构调优：稀疏分组查询注意力用统一 tile，索引器要扫整张补齐后的页表。这次在 #62590、#62589 之上继续调，把 head group 补到 16 行并让 gfx942 与 gfx950 共用一套 BF16 启动配置；索引器只算到本 batch 最长序列，并把 #62589 的单行 decode kernel 带到 gfx950、配独立 tile。作者用 MI325X（gfx942）和 MI355X（gfx950）测过：稀疏分组查询注意力几何平均在 gfx942 上 prefill 快 1.57 倍、decode 快 1.65 倍，gfx950 是 1.24 倍和 1.45 倍，张量并行 1 到 8、1 到 16384 行范围内没有超过 1% 的回退。索引器 prefill 在 8K 到 60K 上下文快 1.3 到 6.5 倍，1K 短 prompt 快 8 到 11 倍。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 AMD 上两个注意力 Triton kernel 的性能调优。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "triton",
+        "sparse-attention",
+        "qsa"
+      ],
+      "pr_number": 65474
+    },
+    {
+      "sha": "f08216eb63e48973aba6cb4d67f1cf8d45c2491a",
+      "comment": "任何人都能在 PR 里加一个 workflow，把任务调度到 vllm-runners 这组 runner 上，这是真实的供应链风险。这次是把该 runner 组设为 restricted_to_workflows 的第二步：6 个调用方 workflow 改成 uses 同仓库 main 分支上的 _reusable-*.yml，其中 pre-commit 用轻量的 ubuntu-latest 结果转发 job 保住了 pre-run-check 和 pre-commit 两个必需检查名。tools/pre_commit/check_github_actions_pins.py 同步放宽，允许同仓库的 @main 引用，外部 action 仍然必须钉 40 位 commit SHA。净减 93 行，重复逻辑集中到复用 workflow 里。合并后 PR 自带的或改过的 workflow 就没法再用这组 runner，需要和 #69510 一起看上线顺序。",
+      "sig": "sig-ci",
+      "sig_reason": "GitHub Actions 工作流与 runner 权限收敛，纯 CI 基础设施。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "github-actions",
+        "runner-group",
+        "security"
+      ],
+      "pr_number": 69513
+    },
+    {
+      "sha": "7200a4e0f5ce3457af19166d8a2de2f8a44fa9cc",
+      "comment": "GitHub 要求被调用的 @main 复用 workflow 必须先存在于 main 分支，所以锁定 vllm-runners 只能分两步上线。这一半只新增 6 个 on: workflow_call 的 _reusable-*.yml，覆盖 pre-commit、add_label_automerge、notify-ci-authorized、record-ci-approval、rocm-image-cache、run-ci-command，现有调用方一行不动。+261 行但当天没有任何行为变化，属于零停机方案的第一步，真正的切换在后续的 #69513。风险低，主要注意点是这 6 个文件在合并窗口内是死代码。",
+      "sig": "sig-ci",
+      "sig_reason": "新增供 CI 复用的 GitHub Actions workflow，不改运行行为。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "github-actions",
+        "reusable-workflow",
+        "runner-group"
+      ],
+      "pr_number": 69510
+    },
+    {
+      "sha": "66e8914fc93c1b49f27fda3da33b6f1126d37a37",
+      "comment": "HiSparse 会把热点 KV 页常驻显存，分块 prefill 时下一步分配页却发现常驻页不够，请求就卡在 prefill 或者流式续跑上。这次改的是分配顺序：在给下一个 prefill 分块分配之前，先回收能够释放的常驻页腾出空间。预分配只在容量不足时触发，哪些页有资格被回收由 HiSparse 判断，Hot 管理器拿到块后一直保留到通用分配循环消费掉，通用 coordinator 沿用原有接口。整序列拒绝、其它请求的预留和水位线仍然受保护。改动落在 kv_cache_manager、single_type_kv_cache_manager 和 hisparse/coordinator。验证跑的是 prefix_caching、single_type_kv_cache_manager、scheduler、hisparse_connector 四组测试，650 通过、2 个预期失败。",
+      "sig": "sig-core",
+      "sig_reason": "问题出在 KV cache manager 与调度器的分配卡死，属引擎核心路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-cache",
+        "hisparse",
+        "prefill",
+        "scheduler"
+      ],
+      "pr_number": 67185
+    },
+    {
+      "sha": "e04f069197ee4b3b5a6c67932735edb10d4e4ba2",
+      "comment": "代码里留着一批已经没人调用的量化实现。这次一次删掉 215 行，只补 2 行，范围按改动文件看包括 CPU 侧的 FP8 注意力头文件与 x86 类型定义、sgl-kernels 的 FP8 W8A8 GEMM、w4a8 grouped_mm 入口、Machete 的 prepacked layout、AITER 与 DeepGEMM 工具里的分支，以及 compressed-tensors 的 W8A8 FP8 方案。PR 描述只有一句标题，没有额外的动机说明和验证记录。功能上应当没有变化，风险主要在还有没有间接引用，需要靠 CI 的编译和量化测试兜住。",
+      "sig": "sig-quantization",
+      "sig_reason": "删除的是量化 kernel 与量化方案的死代码，归属量化线。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "dead-code",
+        "quantization",
+        "fp8"
+      ],
+      "pr_number": 69483
+    },
+    {
+      "sha": "1fd30e4f6e8fd621ac68cf44fb36bfe710646a69",
+      "comment": "Buildkite 的 Run more tests 选择器会让每个 PR 构建停在 blocked 状态，此时所有作业其实已经跑完，只是没人点那个选择器。is_active_build() 之前只看 blocked 就算构建还活着，于是 /ci retry 在新 push 之后总是回答上一个构建还在跑，/ci run 也说这个 commit 已经跑过。#66456 上那次就是 354 个 script 作业最晚 23:04 结束，只剩上传选中作业的 blocked 作业挂着。现在改成只有确实还有未完成工作才算活跃，也就是没有 finished_at 或者状态本身仍是运行类。改动集中在 run_ci_command.py，并配了同名测试文件。影响面是机器人命令的判断准确性，不动真实调度。",
+      "sig": "sig-ci",
+      "sig_reason": "修的是 /ci 命令脚本对构建状态的判断，纯 CI 基础设施。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "buildkite",
+        "test-picker",
+        "ci-command"
+      ],
+      "pr_number": 69497
+    },
+    {
+      "sha": "6e628b66ab60519d0ced0dd58c2c50d573e41758",
+      "comment": "decode 阶段传进来的 topK 宽度之前没有校验，超出整数收窄范围或者过大的值会直接下发到 GPU，结果是崩溃而不是一条清楚的报错（#60829）。这次在 top_k_per_row.cu 和 vllm/_custom_ops.py 里加了一道原生检查：宽度落在 1 到 8192 之外就在 kernel 启动和整数收窄之前拒绝，实际接受宽度的计算逻辑没有改动，同时补了 5 个回归用例并把限制写进文档。作者在 RTX 2000 Ada 上重编后跑 tests/kernels 相关用例，55 个通过，修复前 8193 这个值不会抛错。作者没有跑 MI50/ROCm、完整服务和模型评测，不过这次没有改任何模型计算。上限取的是保守值，设备共享内存限制可能让某些宽度提前失败。",
+      "sig": "sig-model-performance",
+      "sig_reason": "给注意力 top-k kernel 的入参加校验，属 kernel 层修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "cuda-kernel",
+        "top-k",
+        "dsa"
+      ],
+      "pr_number": 60961
+    },
+    {
+      "sha": "ab6ce7d23086042756e5434dbf861b7a2d3ce2b9",
+      "comment": "MXFP8（块级 FP8）量化的 MoE checkpoint 之前走不了 DeepEP 低延迟专家并行，因为那条 dispatch 路径上没有任何 MXFP8 experts kernel；而 NVFP4 已经在用 FlashInferCuteDSLBatchedExperts。这次给同一批 experts 接上 FlashInfer 0.7.3 引入的 masked grouped GEMM 和 masked MXFP8 量化 kernel，compressed-tensors、INC、ModelOpt 以及在线 MXFP8 都能用。在 SM100/SM103 上配 --all2all-backend deepep_low_latency 或 nixl_ep 时后端会自动选中，也可以用 --moe-backend flashinfer_cutedsl 显式指定；kernel 跑不了的配置在启动阶段就拒绝，不留到运行时。作者声明 NVFP4 行为和所有默认值不变，并加了 kernel 测试与 GSM8K 的评测配置。相关上游是 flashinfer-ai/flashinfer#3362。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是让 MXFP8 量化格式在 MoE experts kernel 上可用。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "mxfp8",
+        "moe",
+        "flashinfer",
+        "deepep"
+      ],
+      "pr_number": 66456
+    },
+    {
+      "sha": "4e630bfc663ccaa63b94a9a54ff69eb015435d3a",
+      "comment": "ROCm 基础镜像之前靠人推：#65276 把改 base image 的 PR 的每个测试都压在 pre-commit 门禁后面，等维护者手工点 /ci rocm cache 或 nocache。这次改成自动。新增一个 ROCm image cache 步骤，也就是 build.sh rocm check，只要这个 PR 的镜像栈还没进 main 的缓存、或者它合并了来自 main 的栈变更，这一步就保持红。维护者 /ci run、或可信 reviewer 批准后再 /ci run，机器人自己通过 reconcile_rocm_cache 把栈缓存好。main 上改动镜像栈或它的 key 时，recheck_rocm_stack_prs 会重跑那些已通过检查的开放 PR。改 build.sh 或 docker-bake-rocm.hcl 的 PR 也纳入缓存（并入 #69003），但参与生成 key 的那几行由 main 在合并后重建。promote 只在机器人创建的 API 构建里跑，manifest 原样拷贝。同时删掉 pre-commit 门禁和 /ci rocm cache|nocache 命令，更新文档与 CODEOWNERS。改动 +1638/-357，跨 GitHub Actions 和 Buildkite，是当天体量最大的 CI 项。",
+      "sig": "sig-ci",
+      "sig_reason": "改的是 ROCm 镜像缓存流水线与机器人命令，属 CI 与构建。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "rocm",
+        "docker-image-cache",
+        "buildkite",
+        "github-actions"
+      ],
+      "pr_number": 69056
+    },
+    {
+      "sha": "5a215c27fd761158ba3120415eafe04a2ee5841a",
+      "comment": "awq_dequantize 里的 dequantize_weights 之前把每个线程反量化出的 8 个半精度值写成 8 次 2 字节的标量 store，带宽用不满。这次改成一次 16 字节的 uint4 store，数学完全不动，输出逐位相同。H100 上在 Llama-3-8B 的各层形状下 kernel 快 2.44 到 3.66 倍，带宽从 0.6 到 0.85 TB/s 提升到约 2 TB/s。开 VLLM_BATCH_INVARIANT=1 服务 Llama-3.1-8B-Instruct-AWQ-INT4，并发 1 时单 token 输出时延从 34.9 ms 降到 16.0 ms，并发 32 时输出吞吐涨 1.85 倍，GSM8K 精度、贪心输出和 logprobs 都没变。另一个独立提交修了 benchmark_machete.py 的两个 bug：Marlin 的 zero point 之前按 K 而不是按分组数打包，导致 zero-point 的结果是错的，另外某个命令行参数的取值被全部拒绝。",
+      "sig": "sig-quantization",
+      "sig_reason": "AWQ 反量化 kernel 的写回优化，直接服务量化推理。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "awq",
+        "cuda-kernel",
+        "vectorized-store",
+        "benchmark"
+      ],
+      "pr_number": 63590
+    },
+    {
+      "sha": "6cbea92cb2f17d49e0a35e52313413a0f45dbd46",
+      "comment": "开了 --kv-sharing-fast-prefill 之后，Gemma3n 的跨解码器只跑被裁剪后的那部分 token，但重放的分段 CUDA graph 是按完整批次捕获的，两者对不上。这次在跨解码器调用前后把 forward_context.batch_descriptor 改成裁剪后的批次大小，做法和 #38879 给 Gemma 4 打的那次修补一样。改动只有 14 行，全在 gemma3n.py。这算是复活 Lucas Wilkinson 之前被批准但因过期关闭的 #38834，作者确认过没有其它开放 PR 碰这块。作者提到分段 prefill graph 上限到 8192 token 的场景，不过 PR 描述在这段被截断，具体收益数字没有给出。",
+      "sig": "sig-core",
+      "sig_reason": "修的是 fast-prefill 特性下批次描述符与图重放不一致的正确性问题。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "cuda-graph",
+        "gemma3n",
+        "prefill",
+        "kv-sharing"
+      ],
+      "pr_number": 68944
+    },
+    {
+      "sha": "4172f6178d47b6753b52ec4d7f47b144cdd1bf82",
+      "comment": "当天约 08:10 UTC 起，Launchpad 的 toolchain PPA 只给到约 100 kB/s 并且频繁返回 503，docker/Dockerfile.cpu 装 gcc-15 和 g++-15 时经常失败。作者统计 27 次 cpu-arm64-image-build 里挂了 12 次，main 和 PR 都中招，报错都停在 ppa.launchpadcontent.net 的 503。现在把取 PPA 索引和下载这两个包放进重试循环，最多 6 次、间隔 30 s，已经下完的文件保留，每次只补下还缺的。PPA 健康时行为和以前一样，一次下载然后安装。影响面只是 CPU 镜像构建的稳定性，不涉及运行时代码。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 CPU Dockerfile 的下载重试，解决镜像构建抖动。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "docker",
+        "cpu-image",
+        "retry",
+        "arm64"
+      ],
+      "pr_number": 69416
+    },
+    {
+      "sha": "6905d656c5df78effe0a3d5432cb3bb0f811f444",
+      "comment": "OLMo Hybrid 之前自己复制了一套门控 delta net（GDN，线性注意力）的执行代码，和 Qwen 那份并存，而 #65186 加的内部 prefill 中间态导出只落在 Qwen 一侧。这次删掉 OLMo 的重复实现，只留 96 行适配器接进 Qwen 已有的路径：投影、gated norm、输出投影走 Qwen forward，卷积、prefill 与 decode、checkpoint 导出发复用现成的 GDN 核心，不新增执行基类也不覆盖 metadata。OLMo 独立的 B/A 投影、output norm 的 epsilon、参数 dtype 和 2 乘 sigmoid(b) 的门控形式都保留，分离的卷积权重改用标准合并投影 loader 加载，未融合的旧数学路径删除。生产代码净减 493 行，两个模型共用融合实现。测试覆盖 fla、mamba 与 mamba prefix cache，并同步调整了 engine 测试分区。这个 PR 取代 #68297。",
+      "sig": "sig-core",
+      "sig_reason": "主体是模型线性注意力层的实现去重与权重适配，不是单点 kernel 提速。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "gdn",
+        "linear-attention",
+        "olmo",
+        "qwen"
+      ],
+      "pr_number": 68368
+    },
+    {
+      "sha": "a289c722dd59a0e74bf77e005a7077676c320f5c",
+      "comment": "GLM-5.3-Flash 的融合 all-reduce + mHC（流形超连接）+ RMSNorm decode kernel 在 #67099 里只覆盖了部分架构。这次按标题所说扩展到 Hopper，在支持的张量并行 4 卡 decode 配置下默认启用，改动集中在 glm5next 的 specialized_decode/all_reduce_mhc.py、runtime 入口和 common/mtp.py。作者给的验证方式是固定服务参数（tp 4、max-num-seqs 48、开启 MTP 投机解码、5 个候选 token）跑 vllm bench serve 和 lm_eval 的 aime25。收益是端到端吞吐提升 8.7%。作者明确列了两个未完成项：其它张量并行度数的支持，以及完整迁移，所以这次只是把默认开关推到 Hopper 的一种配置上。",
+      "sig": "sig-model-performance",
+      "sig_reason": "单模型 decode 阶段的通信与归一化融合 kernel 提速。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "fused-kernel",
+        "all-reduce",
+        "mhc",
+        "hopper"
+      ],
+      "pr_number": 69001
+    },
+    {
+      "sha": "74808b14bcc3f28a6202517490d86c7acf666c54",
+      "comment": "TRITON_ATTN 后端的张量描述符路径原本在 CUDA 上也会走，但那条路在 CUDA 上本身有 bug，测试里直接抛 PassManager 运行失败，而且比 CUDA 默认路径还慢。这次把它限制回 XPU，CUDA 上不再使用，对应的一组 use_td 测试用例改成跳过。改动只有 10 行、2 个文件，风险很低，代价是 CUDA 侧少了一条可选路径。这类问题之前给 CUDA 用户带来过不少麻烦，作者把前一位作者的贡献一并列为共同作者。",
+      "sig": "sig-model-performance",
+      "sig_reason": "调整注意力后端的 kernel 路径选择，属注意力性能与稳定性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "triton",
+        "attention-backend",
+        "xpu",
+        "cuda"
+      ],
+      "pr_number": 68521
+    },
+    {
+      "sha": "8d5e012ab97fb267da35b23941538f8a523b7fc2",
+      "comment": "Mamba2 的 SSD（状态空间对偶算法）路径靠 Triton 自动调参挑 tile。之前只在 profile run 里跑一个 chunk 做预热，而调参用的 key 里根本没有序列长度这一项，于是这一个 chunk 选出的 tile 会被后续所有 prefill 复用，开了 TRITON_CACHE_AUTOTUNING=1 还会写进磁盘缓存。单 chunk 时很多 tile 的耗时差异落在噪声里，谁赢完全随机，一次启动就可能锁死一个慢 tile。本 PR 把预热的序列放大到最多 32 个 chunk，让调参结果贴近真实 prefill 的 grid 规模。改动只有 8 行，是对 #39822 引入的预热逻辑的扩展，同时也是同批 kernel 张量描述符改造 #60801 拿到可复现结果的前提。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是修正 Triton kernel 自动调参选错 tile 带来的 decode/prefill 性能问题。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "triton",
+        "autotune",
+        "mamba2",
+        "ssd-kernel"
+      ],
+      "pr_number": 60800
+    },
+    {
+      "sha": "4043b93faf62485f5f77ec8f81ce99ab9d995061",
+      "comment": "治理类改动：把 Taneem Ibrahim 加进 pooling 子系统的 committer 名单，并同步更新 .github/CODEOWNERS 里对应路径的负责人。提名来自 njhill，两个文件都是名单和文档，不碰任何运行代码，影响面只是谁有权限评审 pooling 相关 PR。",
+      "sig": "other",
+      "sig_reason": "只改 CODEOWNERS 和治理文档的 committer 名单，无代码影响。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "governance",
+        "codeowners",
+        "pooling"
+      ],
+      "pr_number": 69437
+    },
+    {
+      "sha": "a998a20ef98e1f788954470ffd0c635207e7157a",
+      "comment": "HF3FS KV connector 之前直接用张量并行秩当作存储 rank。开流水线并行之后，不同 stage 的 worker 只要张量并行号相同，就会写进同一个数据文件（文件名只按 rank 编号），并在元数据服务里注册成同一个 rank，可它们持有的是不同的层。于是从 HF3FS 回读的 KV 里混着别的 stage 的层，输出直接变成乱码。本 PR 把存储 rank 改为 pp_rank * tp_size + tp_rank，让每个流水线并行与张量并行的组合都有自己的文件和元数据条目。流水线并行等于 1 时算出的 rank 与原来一致，行为不变。回归测试用 Qwen3-0.6B 跑两层流水线并行，配文件后端的 mock HF3FS 客户端和测试自起的元数据服务，验证回读结果能复现不走 HF3FS 时的输出。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修的是 HF3FS KV connector 在多并行维度下的存储 rank 冲突。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "hf3fs",
+        "pipeline-parallel"
+      ],
+      "pr_number": 67301
+    },
+    {
+      "sha": "a688ceac3979f7a9097e6d949db9bf91a5a42fde",
+      "comment": "只配了 OTLP trace 端点、但把请求统计关掉时，第一个请求结束就会崩在 OutputProcessor.do_tracing 里的 assert req_state.stats is not None。根因是请求统计只在打印统计时才收集，而离线 LLM 默认就带 disable_log_stats=True。本 PR 把「是否收集请求统计」和「是否打印统计」拆开：只要开了 tracing 就收集 stats，默认的 stat logger 仍然听 disable_log_stats，不会多打一行日志。改完之后 LLM 加 otlp_traces_endpoint 首次 generate 不再崩，导出的 llm_request span 属性与开统计时一致；vllm serve 配上 --disable-log-stats 也能持续服务，包括 engine core 与前端分进程的 --api-server-count 大于 1 模式。改动分散在 36 个文件，其中不少是跟着语义调整的测试用例。修复 #68433，也覆盖了更早的 #25352。",
+      "sig": "sig-core",
+      "sig_reason": "改的是引擎输出处理与请求统计收集时机，属于核心引擎可观测性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "tracing",
+        "otlp",
+        "request-stats",
+        "output-processor"
+      ],
+      "pr_number": 68674
+    },
+    {
+      "sha": "bfe3d7e879344289915ad4c0b5d01c219fbefbae",
+      "comment": "前端会把 --cohere-format 的默认值 cohere_format=cmd4 注入每个服务端的 default chat_template_kwargs，但这个参数只在 --tokenizer-mode cohere 下才有意义。走 Mistral tokenizer 时这些 kwargs 会转发给 mistral-common 的 ChatCompletionRequest.from_openai：公开版本忽略未知字段，更严格的实现却直接以 Non valid parameters 拒掉整个请求。本 PR 让 resolve_default_chat_template_kwargs 只在解析后的 tokenizer mode 确实是 cohere 时才注入默认值，API server 和 render server 两处调用都显式传入 model_config.tokenizer_mode。用户手写的 --default-chat-template-kwargs 原样透传，请求级 chat_template_kwargs.cohere_format 在 Cohere renderer 里优先级仍然更高。改动 67 行、6 个文件，含 CLI 参数和 Mistral tokenizer 的测试。",
+      "sig": "sig-core",
+      "sig_reason": "问题出在 OpenAI 兼容前端的默认 chat 模板参数注入逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "frontend",
+        "chat-template",
+        "mistral",
+        "cohere"
+      ],
+      "pr_number": 69468
+    },
+    {
+      "sha": "71985a9633253fb77385fe4104ab194c18dc1e0d",
+      "comment": "HY4 Flash 的 IndexPool 辅助函数是 #68770 带进来的，签名缺类型标注。Griffe 在生成 API reference 时对它们报了 19 条 warning，严格模式的 MkDocs 构建因此非零退出，把 main 和一批无关 PR 的文档流水线一起拖挂。本 PR 只给这些函数补类型标注，让严格构建重新通过。作者用 uv 单独建了文档环境，在 main 和本分支各跑一次 mkdocs build --strict 做前后对比。",
+      "sig": "sig-ci",
+      "sig_reason": "改动动机是让 main 上失败的严格文档构建流水线重新通过。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "docs-ci",
+        "type-annotations",
+        "hy4-flash"
+      ],
+      "pr_number": 69472
+    },
+    {
+      "sha": "822bbd577ba38dd90c00c7f7449c8d10cc754ff9",
+      "comment": "DeepSeek-V4.1 的 MXFP8 线性层在 H100 上会被切到 #66497 引入的 BF16 权重加 FP8-GEMV 路径，这条路径在张量并行等于 1 时显存代价很大。报告者在 8 卡 H100、数据并行 8 加专家并行 8、张量并行 1 的配置上看到每卡从 47.67 GiB 涨到 60.21 GiB。本 PR 让 SM90 在张量并行 1 时改回平台自带的 MXFP8 kernel，张量并行 2 及以上不变。缩减版复现里每卡加载显存从 28.37 GiB 降到 17.52 GiB，把 MTP（多 token 预测模块）和 Engram 一起算进去，预计能省约 12.4 GiB。代价是 decode 每步慢约 1.0%（单请求）和 0.6%（8 请求）。SM80、SM100 及以上、张量并行 2 以上，以及显式指定 MXFP8 后端的场景都没有变化。验证在 2 卡 H100 的 nightly 镜像上完成。",
+      "sig": "sig-quantization",
+      "sig_reason": "核心是 MXFP8 线性层在特定并行配置下选哪条量化 kernel 路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "mxfp8",
+        "deepseek-v4",
+        "weight-memory",
+        "sm90"
+      ],
+      "pr_number": 69446
+    },
+    {
+      "sha": "0f06eb7e4eee59fa43824b64f900c5c16306bb4d",
+      "comment": "ROCm 上非对称 int8（W8A8）模型走 TritonInt8ScaledMMLinearKernel。这个 kernel 先把矩阵乘结果舍入到 bf16，再去减激活的 zero-point 修正项，这一步把大部分输出精度抹掉了。结果是 Meta-Llama-3-8B-Instruct-INT8-compressed-tensors-asym 在 MI300 的 LM Eval 小模型评测里只多过一题，而 ROCm 10.1 的更新（#62536）把它压到了门槛以下。本 PR 把 zero-point 的减法挪进 Triton kernel 内部，直接在精确的 int32 累加器上做，并且只在 ROCm 生效。修完之后非对称 int8 线性层与精确解的差距在一个 bf16 舍入步以内，评测在 ROCm 10.0 和 10.1 上都能过线，其它平台行为不变。验证环境是 MI300X（gfx942）。",
+      "sig": "sig-quantization",
+      "sig_reason": "修的是 int8 W8A8 量化 linear kernel 的数值精度损失。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rocm",
+        "int8",
+        "w8a8",
+        "precision"
+      ],
+      "pr_number": 69085
+    },
+    {
+      "sha": "0fcd102378d9a501ab7abac7625deebe8200b43a",
+      "comment": "MooncakeStore 读远端 KV 失败后，调度器在 kv_load_failure_policy 设为 recompute 时会重置 num_computed_tokens 并重新排请求，而它在收到完成信号时就把失败标记清掉了。下一次准入时 get_num_new_matched_tokens 又去查存储，只要元数据还在报命中（例如某个已下线 segment 的残留信息）而实际 GET 一直失败，这个请求就在 WAITING 和 WAITING_FOR_REMOTE_KVS 之间来回弹，永远回不到本地计算。分离式 prefill/decode 连接器（Nixl、Mooncake P/D）不受影响，因为它们第一次拉取后就清掉 do_remote_prefill；OffloadingConnector 也早就有每请求的 load_failed 标记。本 PR 给 MooncakeStore 补上等价机制：update_connector_output 从 failed_recving 和 invalid_block_ids 两条路径记下失败请求，之后不再重复向存储发起加载。附调度器单元测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "处理 MooncakeStore KV 外存连接器的加载失败重试死循环。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "mooncake",
+        "scheduler",
+        "load-failure"
+      ],
+      "pr_number": 67957
+    },
+    {
+      "sha": "4623da99ff85b0f52d9493cfafe2d1f58ede67e4",
+      "comment": "DeepSeek V4 的 MegaMoE 路由在每一层 decoder 都要用原始 token ID。开流水线并行时，Model Runner V2 默认只在第一个 stage 保留 input_ids，后面的 stage 拿到的是 None，于是纯文本版 DeepseekV4ForCausalLM 在第二个 stage 抛 AttributeError。#61016 已经给 runner 加了开关：模型声明 requires_raw_input_tokens 时就在后续 stage 保留 input_ids，视觉变体当时已经打开。本 PR 只给 NVIDIA 后端的纯文本变体补上这一行声明。早期版本是在 IntermediateTensors 里自己带 input_ids，评审后改成复用 runner 现成的机制。测试用 DeepSeek-V4-Flash，张量并行 2 加专家并行，moe 后端为 deep_gemm_mega_moe。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 model runner 在流水线并行下保留输入 token 的通用机制与模型侧声明。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "pipeline-parallel",
+        "model-runner",
+        "deepseek-v4",
+        "moe"
+      ],
+      "pr_number": 55520
+    },
+    {
+      "sha": "5cfdcabb24c6196f0c75ef6bd8a5f787e38a3216",
+      "comment": "vllm bench startup 以前在单个进程里直接构造 LLM，并设 VLLM_ENABLE_V1_MULTIPROCESSING=0，对象一建好就停表。这样少算了 API server、engine core 和 worker 进程，也少算第一个请求，而这几块正是真正跑 vllm serve 时等待的大头。本 PR 新增 --serve-cmd：把给定的服务命令交给基准自己拉起进程，分别计时到 /health 就绪和到流式输出第一个文本，冷启动与热启动的迭代次数沿用原有设计。进程生命周期复用 vllm bench sweep serve 里的 ServerProcess。这是 #56049 计划里的 Startup benchmark 一格，也回应了 #48193 想要的测量方式；分阶段耗时报告留给 #49037，本 PR 不重叠。新增 355 行，含命令行文档和两组测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "改的是启动耗时基准工具的测量方式，属于性能测量线而非引擎逻辑。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "benchmark",
+        "startup",
+        "cold-start",
+        "cli"
+      ],
+      "pr_number": 69076
+    },
+    {
+      "sha": "51bb4b5844395a39bfd2051a6a149cf69d7aa88b",
+      "comment": "/v1/decisions 之前无视 DecisionLimits.labeled，所有问题一律把候选截到 26 个。但读取类策略并不按 label token 打分，这个上限对它们纯属多余，而同样的字段在 /v1/systemone 上是生效的。本 PR 让 /v1/decisions 对齐：策略报告 labeled 为 False 时改用请求里的 max_options，只受 schema 本身 255 个选项的硬上限约束；确实按 label 打分的策略仍然保留 26 的上限和原来的报错文案。D3 的 HTTP 支持没有变化，task 为 classify 的策略在 Decisions API 初始化阶段依旧返回 501，新增用例直接调 serving 层来覆盖。验证在单台 GB300 节点上跑 entrypoints 下的 structured_decisions 与 decisions 用例。",
+      "sig": "sig-core",
+      "sig_reason": "修的是 OpenAI 兼容前端 decisions 端点的参数处理逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "api-frontend",
+        "structured-decisions",
+        "option-limit"
+      ],
+      "pr_number": 68037
+    },
+    {
+      "sha": "4f0ecfff6be6f4d28ba91ad4d44b43b4100d4f2d",
+      "comment": "MLA（多头潜在注意力）把 prefill 上下文分块处理时，续接的 chunk 会用原生 merge_attn_states kernel 就地合并前缀的 LSE（log-sum-exp，即 softmax 分母的对数项）。这个就地写存在竞态：某个 head 的 LSE 可能在该 head 其它线程读完之前就被覆盖，跨 chunk 边界的 token 因此拿到错误的注意力输出，AMD nightly 第 15868 期里 test_fused_prefill_context_matches_unfused 的 flaky 也是它。本 PR 在合并前先把前缀 LSE clone 一份。就地合并是 #50613 引入的。新增的测试在 main 上每次都失败，加上修复就通过。代价只落在续接 chunk 上：CI 用例里 _compute_prefill_context 从 282.0 us 涨到 288.8 us。验证环境是单张 MI355X（gfx950）。",
+      "sig": "sig-model-performance",
+      "sig_reason": "问题出在 MLA 注意力融合 kernel 的线程竞态，改的是 attention ops 路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "mla",
+        "attention-kernel",
+        "race-condition",
+        "merge-attn-states"
+      ],
+      "pr_number": 69433
+    },
+    {
+      "sha": "5eca5e982bff3f04d446dcb83ec5277f93577f4c",
+      "comment": "TRITON_MLA decode 的 stage1 kernel 原来按 batch、head_groups、NUM_KV_SPLITS 排 grid。MLA 里所有 query head 共享同一个潜在 KV head，但 grid 先遍历 batch 维，同属一次的 head 块被拉开排布，L2 上的 KV cache 复用不起来。K_Buffer 也按 [BLOCK_DMODEL, BLOCK_N] 取，连续维是 BLOCK_DMODEL，读全局内存变成跨步访问。本 PR 把 head 块挪到 grid 第一维协同调度，并把 K_Buffer 换成行主序的 [BLOCK_N, BLOCK_DMODEL] 布局，一次读满 128 位、共享内存写入也没有 bank conflict。改动很小，只增 12 行删 15 行，但 kernel 级最高 1.7 倍收益，在多种 GPU 架构上都能复现。",
+      "sig": "sig-model-performance",
+      "sig_reason": "纯 Triton decode 注意力 kernel 访存与调度优化。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "triton",
+        "mla",
+        "decode-kernel",
+        "l2-cache"
+      ],
+      "pr_number": 69029
+    },
+    {
+      "sha": "e4ac61ae44d140df4daa4cb975a198aff002581e",
+      "comment": "HY4 Flash（Hy4-flash-FP8）在 SM100 上做了一轮整体优化：新增 hy_v4_ihc_kernels.cu 自定义 CUDA kernel 和 torch 绑定，配套稀疏 decode、IHC 边界的测试，共 25 个文件近 5000 行。性能用 vllm bench serve 测 random 8192 进 512 出：张量并行 4 单并发时首 token 时间从 378 ms 降到 226 ms，每输出 token 时延从 22.09 ms 降到 6.37 ms，吞吐从 43.9 升到 147.5 tok/s，即 3.36 倍；并发 32 时吞吐从 645 到 1588 tok/s。张量并行加专家并行、数据并行加专家并行两种布局也拿到 2.17 到 3.26 倍。精度基本持平：gsm8k 宽松判分从 0.9704 到 0.9659，AIME25 精确匹配从 1.0 到 0.9778（pass@3 仍为 1.0），OCRBench 从 835 到 830。",
+      "sig": "sig-model-performance",
+      "sig_reason": "单模型性能冲刺，主体是新增自定义 kernel 与端到端吞吐提升。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "hy4-flash",
+        "cuda-kernel",
+        "sm100",
+        "fp8"
+      ],
+      "pr_number": 68770
+    },
+    {
+      "sha": "4a107a282047eef22b1aac8b72e5969f5c40f0cc",
+      "comment": "TorchAO 量化后端进入废弃流程，这是 #69030 的第一步。现在传 quantization 等于 torchao 会打一条 deprecation warning，每个进程只报一次，文案点名 v0.37 移除并链到 #69030。量化总览页和 torchao 单独文档同步标注废弃，推荐改走在线量化，或者用 compressed-tensors、gptq、awq、fp8 这类离线量化 checkpoint。除日志和文档外没有别的行为变化。作者在 A100 上用 opt-125m 配 Int4WeightOnlyConfig 确认告警在 MainProcess 和 EngineCore 两侧都如期出现。",
+      "sig": "sig-quantization",
+      "sig_reason": "废弃的是 TorchAO 这个量化后端本身。",
+      "tags": [
+        "deprecation",
+        "low-risk",
+        "torchao",
+        "quantization",
+        "docs"
+      ],
+      "pr_number": 69066
+    },
+    {
+      "sha": "1d9f8058bf8b3354214b0f4a4dafdac25bfb4be1",
+      "comment": "HY4 的 DFly 推测解码原先对目标模型的量化方案有白名单，NVFP4 这类 compressed-tensors checkpoint 被挡在外面，RedHatAI/Hy4-NVFP4 因此用不上。本 PR 放宽校验：compressed-tensors 目标不再看具体的 layer scheme，只有出现 kv_cache_scheme 或者 transform_config 非空时才拒绝，compressed-tensors 序列化出来的空 transform_config 视作没有变换。草稿模型一侧仍然精确检查，只接受 BF16 或 blockwise W8A8 FP8。HY4 Flash 自己 checkpoint 的校验逻辑没有改动。新增 tests/v1/spec_decode/test_dfly_quantization.py，并把它挂进 .buildkite 的 spec_decode 测试区；这些用例在 main 上会失败。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "主旨是让 DFly 推测解码能跑在量化目标模型上。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "spec-decode",
+        "dfly",
+        "nvfp4",
+        "compressed-tensors"
+      ],
+      "pr_number": 69274
+    }
+  ]
+}
