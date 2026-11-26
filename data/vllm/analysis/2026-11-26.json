@@ -1,0 +1,384 @@
+{
+  "date": "2026-11-26",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-26T11:54:17+08:00",
+  "daily_summary": "## 今日概览\n26 条（抓于当日上午，全天仍在进行）。三条线。一是 Kimi K3 与 GLM-5.3-Flash 的启动与 prefill 开销：8 张 B300 上跑 Kimi-K3.1-Pro 时，低时延专用 decode 路径每卡的内核编译次数从 1435 降到 479，加载权重之后的拉起时间从 583 秒缩到 260 秒（#69669）；GLM-5.3-Flash 的 KDA 短卷积在 SM10x 上换成平面实现并默认启用（#66884）；Hopper 上 NoPE 稀疏 MLA 接上按 token 分片，八张卡不再重复给同一批 prefill 行打分（#69086）。二是 Transformers 建模后端收尾：A.X-K1 迁入并净减一千二百多行（#67277），显式指定 model_impl=transformers 时报 Cannot find model module 的缺陷修掉（#69955），MoE 融合器改成只替换 block 内的 MoE 调用（#69868），TeleFLM 彻底移除（#69929）。三是分层卸载在多节点上的缺口继续补：HiSparse 的主机池改为每节点一份之后，NIXL 仍只在全局 rank 0 注册，导致第二个节点之后的解码 rank 永远收不到主 KV（#69901）。\n\n## 今日重点\n\n### AMD / ROCm\n- **新架构与并行支持**：gfx1170 与 gfx1171 两款 RDNA4 显卡此前卡在构建阶段的 HIP_SUPPORTED_ARCHS 白名单，编译不出可用的包，现在加入支持并接上三条内核路径（#65202）。AITER Triton W4A16 的 MoE 后端一直不支持数据并行，它的限制是从 TRT-LLM 的 MXFP4 后端复制来的，那边当年的内核问题在 AITER 上并不存在，这次解除并补上专家并行（#66159）。\n- **分离式与卸载**：混合精度键值缓存做分离式 prefill/decode 时会丢数据——MoRIIO 的 READ 模式可能把自己已经收到的 prompt KV 又清掉，因为模型执行器在计算流上置零新块，没有任何机制保证 MoRI 的写入先完成（#67074）。Muse Spark 要求用 FP32 的 RoPE（旋转位置编码）表，但 forward_cuda 里的按 query 类型改写会把它降级成 BF16 或每步整表转换，现在保持 FP32（#63078）。\n\n### NVIDIA\n- **Kimi K3 / GLM-5.3-Flash**：低时延专用 decode 路径只编译真正会用到的内核，并只对捕获到的批次形状建图，8 卡 B300 上每卡编译次数 1435 降到 479、拉起时间 583 秒缩到 260 秒（#69669）。GLM-5.3-Flash 的 KDA 分块 prefill 此前用 causal_conv1d_fn 逐 token 循环做 q、k、v 的短卷积，现在换成与序列无关的平面 Triton 内核，SM90 以上走 TMA，分块太短或解码行太多时仍回退原内核（#66884）；同一条 NoPE 稀疏 MLA 路径接上按 token 分片，每卡只给自己那部分 prefill 行打分，decode 仍按头切分（#69086）。\n- **LoRA 与 HiSparse**：LoRA shrink 内核按 split-K 切分时，K=4096 的默认小批量配置切成 64 份而实际只有 16 个 K 块，48 个空程序白占调度，现在把上限压到 K 块数量（#61087）。HiSparse 此前不支持 Hopper 上首选的 FLASHINFER_MLA_SPARSE_SM90 后端，因为该后端把逻辑 top-k 转成物理位置读分页 KV，而卸载出去的页面留着过期行，现在补上这条路径（#61277）。\n\n### 跨平台 / 引擎通用\n- **多模态**：视觉编码器用的 FlashAttention 3 让内核自己决定 KV 的 split 数量，同一条 1024 token 的序列单独跑与打包跑选到的 split 可能不同，归约顺序一变结果就不一致，现在固定下来保证批次不变性（#69774）。Nemotron Shortcut 两处对不上：分桶权重加载时后含注意力或 MLP 权重的桶被误判为缺 indexer 权重而拒绝，视频前处理与训练侧不一致（#69642）。Qwen3 音频编码器在 CUDA graph 捕获范围外的批次反而变慢，改为绕掉不必要的中转、只压缩确实带多余底层显存的输出并把必需分配合批（#69116）。\n- **前端与接口**：流式接口的每请求指标新增可选的 time_to_first_content_token_ms，覆盖 Chat Completions、Completions 与 Responses，此前只有 TTFT，而模型先输出推理内容或工具调用、客户端看到第一个文字更晚（#56914）。Inkling 的工具参数解析器每来一个流式增量就重解析整段参数，一次长工具调用能把 API 服务器的 CPU 拖成平方级、连带 /health 一起卡住，现在接上 arg_value_extender 扩展点（#69297）。Muse 的工具解析器此前只折叠 NAME.NAME 这种重复写法，模型输出 Bash.command、Read.read 时被当成未知工具，现在做通用映射（#67972）。用 --reasoning-parser hunyuan_a13b 时结构化输出从来没生效过，因为管理器询问推理是否结束时永远读到未结束，现在改从 token id 判定（#63632）。Rust 前端的 OpenAI 兼容服务层不再绑死自带引擎，可以套在任意实现 Llm 接口的对象前面（#64729）。\n- **建模后端**：A.X-K1 迁入 Transformers 后端、删掉原生实现（#67277）；MoEBlockFuser 从整块替换改成只把融合 MoE 调用插进 trace 出来的 forward，于是专家前后还挂着别的模块的 block 也能融合（#69868）；显式指定 model_impl=transformers 时按 architectures 找不到模型类的问题修掉（#69955）；TeleFLM 因上游不存在该类且远程代码与 Transformers 5.x 不兼容而彻底移除（#69929）；nemotron_nas 把 DeciLMMLP 与 DeciLMAttention 内联回自己文件，不再依赖 llama.py（#69726）。\n- **其它**：weight_transfer 的两个工厂抽出共享的懒加载注册表基类，改一处不必再记得改两处（#69926）。Kimi-K3.1-Pro 与 Kimi-K3/K3.1 的 recipe 改为下发模型卡里的采样默认值（#69624）。\n\n## 需要关注\n- TeleFLM 支持已彻底移除，v0.34.0 是最后一个还能跑它的版本（#69929）。\n- 显式指定 model_impl=transformers 的部署此前会直接报 Cannot find model module，升级到本日之后才可用（#69955）。\n- --reasoning-parser hunyuan_a13b 与结构化输出的组合此前静默不受语法约束，可能已经产出过非法 JSON，需要复核历史数据（#63632）。\n- #69901 修的是多节点张量并行下第二个节点之后收不到主 KV，属静默错误，跨机部署应优先升级。\n- 当日仍在进行，晚间合并的部分留到下一轮补。\n",
+  "sig_summaries": {
+    "sig-core": "10 条，前端接口与建模后端收尾。\n- **前端**：每请求指标加上可选的 time_to_first_content_token_ms，覆盖三个流式接口，计时从请求被调度到第一个产出非空文本的批次（#56914）；Inkling 工具参数改增量扩展、不再每个流式增量重解析整段（#69297）；Muse 的工具解析器把 <tool>.<suffix> 映射回已注册工具名（#67972）；hunyuan_a13b 改从 token id 判定推理结束，此前结构化输出从未生效、整段回复不受语法约束（#63632）；Rust 前端的服务层改为对任意实现 Llm 接口的对象工作（#64729）。\n- **建模后端**：A.X-K1 迁入 Transformers 后端、删掉 AXK1.py，净减一千二百多行（#67277）；MoEBlockFuser 改为只把融合 MoE 调用插进 trace 出的 forward，带 post_mlp_layernorm 的 block 也能融合（#69868）；显式 model_impl=transformers 时按 architectures 解析模型类，修掉 Cannot find model module（#69955）；TeleFLM 彻底移除（#69929）；nemotron_nas 与 llama.py 解耦（#69726）。\n",
+    "sig-model-performance": "6 条，Kimi K3 与 GLM-5.3-Flash 的收益最实在。\n- Kimi-K3 的低时延专用 decode 路径原先启动时编译大量根本用不上的 CuTe DSL 内核，现在只编译真正会走的内核、只给捕获到的批次形状建图：8 张 B300 上跑 Kimi-K3.1-Pro、张量并行 8 路时，每卡编译次数从 1435 降到 479，加载权重后的拉起时间从 583 秒缩到 260 秒（#69669）。\n- GLM-5.3-Flash 的 KDA 短卷积换成与序列无关的平面 Triton 内核，SM90 以上用 TMA、否则走寄存器，SM10x 默认启用并带逐步回退判断（#66884）；同模型的 FlashInfer FA3 稀疏 MLA prefill 接上按 token 分片，张量并行 8 路下每卡只给自己那部分 prefill 行打分，decode 仍按头切分（#69086）。\n- LoRA shrink 的 split-K 上限压到实际 K 块数，K=4096 时不再启动 48 个空程序（#61087）。\n- Muse Spark 的 FP32 RoPE 表不再被按 query 类型降级为 BF16（#63078）。\n- gfx1170/gfx1171 两款 RDNA4 加入 HIP_SUPPORTED_ARCHS 并接上 paged attention 等三条内核路径（#65202）。\n",
+    "sig-large-scale-serving": "5 条，多节点卸载与分离式传输的正确性。\n- HiSparse 的共享主机池自上一个 PR 起改成每节点一份，但 NIXL 连接器仍只在全局 rank 0 注册并 READ 这块池子的主 KV，第二个节点之后的解码 rank 永远收不到 prefill 写好的数据；现在两边共用同一个主机 leader 判定（#69901）。\n- MoRIIO 的 READ 模式在异步调度下可能把自己已经收到的 prompt KV 清零：模型执行器在计算流上置零新块，没有任何机制保证 MoRI 的写入先完成；现在跳过这类置零并等待未完成的写入（#67074）。\n- ECCPU 连接器在重复请求命中 runner cache 时跳过编码与保存，导致新起的消费端拿不到传输地址；现在为这些请求保留一次 CPU 保存，复用正常的完成与就绪流程（#65123）。\n- FLASHINFER_MLA_SPARSE_SM90 此前 supports_hisparse() 返回 False、开了 HiSparse 就选不到它，现在补上这条卸载路径（#61277）。\n- AITER Triton W4A16 的 MoE 后端解除数据并行限制并补上专家并行支持（#66159）。\n",
+    "sig-omni": "3 条。\n- 视觉编码器的 FlashAttention 3 默认让内核自己决定 KV 的 split 数量，同一条序列单独跑与打包跑可能选到不同 split，归约顺序一变结果就不一致，破坏批次不变性；现在固定 split 选择（#69774）。\n- Nemotron Shortcut 两处对不上：稀疏模型分桶加载时，只含注意力或 MLP 权重的桶被误判为缺少 indexer 权重而拒绝加载；视频前处理与训练侧的缩放方式不一致（#69642）。\n- 多模态编码器加上 CUDA graph 后，落在捕获范围外的批次反而变慢；直接返回批次显存视图又会让一个缓存条目拖住整个批次，短音频远不到 5K token 就撞上限。现在绕掉不必要的中转、只压缩确实带多余底层显存的输出、把必需的分配与拷贝合批（#69116）。\n",
+    "sig-rl": "1 条。weight_transfer/factory.py 里 WeightTransferEngineFactory 与 WeightTransferTrainerFactory 各写了一份相同的懒加载注册表逻辑，改一处要记得改两处。本次抽出私有基类 _LazyEngineFactory 承载注册表与懒导入，两个工厂各自只保留自己的差异（#69926）。\n",
+    "other": "1 条。Kimi-K3.1-Pro 与 Kimi-K3/K3.1 的 recipe 改动：base_args 加上 --override-generation-config，把模型卡里的 temperature 1.0、top_p 0.95 变成服务端默认，避免客户端漏传时与官方推荐不一致；只改 recipes 下两个 yaml，不涉及 Python 或 Rust 代码（#69624）。\n"
+  },
+  "commits": [
+    {
+      "sha": "a53e0a05167117aaf671e7c10d2b91a9fa0c88a3",
+      "comment": "LoRA shrink 内核按 split-K 把 K 方向切成多份并行归约。默认的小批量配置在 K=4096 时切成 64 份，可实际只有 16 个 K 块，多出的 48 个程序是空的，白占调度开销。这次把配置的 split-K 上限压到 K 块数量，本来就低于上限的配置保持原切分，有效的 K 块分配和与批量无关的固定划分不受影响。生产代码只改一行，评审后删掉了补的边界测试。本地内核实测截断后 shrink 时延更低，但小模型的端到端数据不足以证明整体加速。验证在 RTX 3050 笔记本显卡（4GB）加 WSL2 上完成，截断方案和 H100 上的证据来自贡献者。修复 #61030。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是收紧 LoRA shrink Triton 内核的 split-K 配置以减少空程序，属于 GEMM 类内核的性能改动。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "lora",
+        "triton-kernel",
+        "split-k"
+      ],
+      "pr_number": 61087
+    },
+    {
+      "sha": "89c908a1b81c0b1826260818e60668c99a577642",
+      "comment": "Inkling 的工具参数解析器每来一个流式增量就重解析整段参数。一次很长的工具调用会把 API 服务器的 CPU 拖成平方级，连带 /health 和其它所有请求一起卡住。这次给它加上 arg_value_extender 扩展点，也就是 #61253（GLM）和 #62027（Qwen3）修同类问题时用的那个钩子，参数只在闭合时解析一次。相比只处理未闭合字符串的 #69293，本 PR 还覆盖未闭合的嵌套对象、数组和数字。实测每次增量 16 token 的单次流式 write_note 调用，8KB 参数的解析从主干的 17.23 秒降到 0.11 秒，16KB 在主干上要 72.23 秒；20 行和 200 行参数触发的转换器调用次数相同，主干上分别是 1501 次和 14461 次。修复 #69267。",
+      "sig": "sig-core",
+      "sig_reason": "改的是服务前端流式工具调用的参数解析路径，影响 API 服务器整体响应，不在内核侧。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "parser",
+        "tool-call",
+        "streaming"
+      ],
+      "pr_number": 69297
+    },
+    {
+      "sha": "15c90d1a8dc0cc2cd2e045a13f9c521e92690ab5",
+      "comment": "gfx1170 和 gfx1171 两款 RDNA4 显卡此前卡在构建阶段的 HIP_SUPPORTED_ARCHS 白名单，编译不出可用的包。这次把两个架构加进支持列表，并接上三条内核路径：ROCm 自定义的 paged attention 走 RDNA4 分支编译和运行；解码尺寸的 GEMM 用 FP8 的 skinny GEMM（wvSplitKQ）；逐张量 FP8 层选 ROCmFP8ScaledMMLinearKernel，逐通道 FP8 层走 torch 的 scaled_mm 内核。效果是 FP8 检查点和在线 FP8 量化都能在这两款卡上加载运行，此前内核选择会直接失败。改动共 7 个文件，涉及 CMake、两个 HIP 内核文件、scaled_mm 内核选择和 ROCm 平台逻辑。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是为新 ROCm 架构打通注意力与 GEMM 的内核选择路径，属于平台内核支持而非量化格式改动。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rocm",
+        "rdna",
+        "kernel-dispatch",
+        "fp8"
+      ],
+      "pr_number": 65202
+    },
+    {
+      "sha": "c99bc0ae570369e497a834b58219e7f8b2407a81",
+      "comment": "用 --reasoning-parser hunyuan_a13b 时，结构化输出（response_format 的 json_schema、json、regex）从来没生效过。结构化输出管理器询问推理是否结束时永远读到未结束，于是整段回复不受语法约束，可以输出非法 JSON 且不报错。这次修的是 HunyuanA13BReasoningParser 的 is_reasoning_end 和 is_reasoning_end_streaming，改成从 token id 判断结束，正常形式和「快速思考」形式都能在 think 结束、answer 标签出现后开始施加约束。多轮 prompt 里历史轮次残留的标签不会让语法提前启动。前端流式抽取没变，新判定和解析器状态机切到答案的是同一个 token，这一点有测试断言，测试用真实的 Hunyuan 权重跑。",
+      "sig": "sig-core",
+      "sig_reason": "问题在 OpenAI 兼容接口的推理结束判定与结构化输出联动，属于服务前端逻辑。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "reasoning-parser",
+        "structured-output",
+        "hunyuan"
+      ],
+      "pr_number": 63632
+    },
+    {
+      "sha": "13c850cb622ffb97a067863f470486de8fdfa5a7",
+      "comment": "weight_transfer/factory.py 里 WeightTransferEngineFactory 和 WeightTransferTrainerFactory 各写了一份相同的懒加载注册表逻辑，改一处要记得改两处。这次抽出私有基类 _LazyEngineFactory，用泛型承载引擎类型，把 register_engine 的重复名检查、惰性 importlib 导入闭包与直接注册两种分支，以及 _resolve_engine 的后端查找、报错格式和创建日志统一实现。两个子类各带 engine 和 trainer engine 标识继承基类，_registry 字典仍然独立，公开签名和报错、日志文本一字未改，净减少 25 行。权重传输是强化学习训练侧给推理引擎换权重的接口，这次只是内部去重，外部行为不变。",
+      "sig": "sig-rl",
+      "sig_reason": "改动位于权重传输引擎与训练器工厂，即强化学习权重更新接口，行为不变的重构。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "weight-transfer",
+        "rl",
+        "factory"
+      ],
+      "pr_number": 69926
+    },
+    {
+      "sha": "014649a2c8c5aa176f144b6520a4d15b568d5c21",
+      "comment": "Muse 的工具解析器此前只把 NAME.NAME 这种重复写法折叠回裸工具名，模型输出 Bash.command、Read.read、Bash.execute 甚至 Glob. 时原样发给客户端，被当成未知工具。这次改成通用映射：输出名没注册、点号前第一段是已注册工具、且没有别的注册名挂在 NAME. 之下时，就折叠到第一段。折叠后的调用沿用裸工具的参数类型，字符串 007 不会被解码成数字 7。覆盖 Python 侧的 muse 和 muse_glimmer 以及 Rust 前端解析器，流式与非流式、Chat Completions 与 Responses 行为一致。精确匹配、NAME.NAME、首段未注册这些原有情况不变。修复 #67962。",
+      "sig": "sig-core",
+      "sig_reason": "修的是 Rust 前端与 Python 侧的工具名解析映射，属于 OpenAI 兼容接口行为。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "tool-parser",
+        "muse"
+      ],
+      "pr_number": 67972
+    },
+    {
+      "sha": "04ffa45884dc7c956904ce8723b86e0b48acbd3d",
+      "comment": "Muse Spark 要用 FP32 的 RoPE（旋转位置编码）表，但 forward_cuda 里的 _match_cos_sin_cache_dtype 会按 query 类型改写这张表：eager 下换成 query 类型的副本，编译下每次调用整表转换或直接用 BF16 副本，第一次调用之后 FP32 表就没了。于是 DSpark 的 context key 预计算，以及 AMD 和 NVIDIA 上未融合注意力的分支，都拿 BF16 表去旋转本该是 FP32 的 Q 和 K。自 #58838 起旋转统一走 vLLM IR 算子，这次让 base.py 在表已经在 query 设备上时原样传给算子，只在设备确实不匹配时才转换，内核与 IR 签名相应调整。新增编译路径、位置编码内核和 Muse Spark 的回归测试，并挂进 AMD 与基础模型的 CI 列表。",
+      "sig": "sig-model-performance",
+      "sig_reason": "正确性问题出在 RoPE 旋转内核的 dtype 处理，修的是 kernel 侧行为而不是模型接口。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rope",
+        "dtype",
+        "kernel",
+        "muse-spark"
+      ],
+      "pr_number": 63078
+    },
+    {
+      "sha": "5ddf53fb5287fe15b5d7e70732dfd92f81636e97",
+      "comment": "ECCPU 连接器把多模态编码器的输出卸载到 CPU 层。重复请求同一份输入时会命中 runner cache，于是跳过编码和保存这两步：生产端手里还留着那个张量，却不给新起的消费端返回传输地址，对方拿不到数据。这次用已有的 EC 准入和元数据钩子，为被调度块里命中 runner cache 的请求保留一次 CPU 保存，通过 start_save_caches() 存下现成张量，复用正常的完成与就绪流程，不重跑编码器。消费端行为不变，ec_both 模式下命中缓存也不会多出无用的加载。改动同时更新了 ec_cpu_connector 文档，验证跑 scheduler 和 ec_connector 的相关单测。相关的 #65079 处理消费端准入，本 PR 只管生产端发布。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "问题是编码器缓存连接器的 CPU 卸载层与跨进程地址发布，属于大规模服务数据面。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "ec-connector",
+        "cpu-offload",
+        "scheduler"
+      ],
+      "pr_number": 65123
+    },
+    {
+      "sha": "ed686ccec527b48de4c8a67927184933886f062a",
+      "comment": "自 #68747 起，跨节点张量并行给每个节点一份自己的 HiSparse 共享主机内存池，由该节点最低的张量并行 rank 写入。但 NIXL 连接器仍只在全局 rank 0 上注册并 READ 这块池子的 DRAM（主 KV）部分，第一个节点之后的解码 rank 永远收不到 prefill 写好的主 KV。这次让 NIXL 改用和 HiSparse 相同的主机 leader，两边共用 get_hisparse_host_leader_rank 一个函数选 rank，每个节点的 leader 都注册并导入自己的共享池。单节点张量并行下 leader 本来就是 rank 0，每 rank 私有池的早退分支不动，这两种情况无影响。修复 #69900。作者只在 macOS 的 CPU 环境验证，没有多机 Hopper 或 Blackwell 可用。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修的是 NIXL KV 连接器在多节点张量并行下的主机池注册与导入，属于分离式服务数据面。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "nixl",
+        "hisparse",
+        "multi-node"
+      ],
+      "pr_number": 69901
+    },
+    {
+      "sha": "76433bbb307e4e27f0e40bd7979bb8750588840d",
+      "comment": "FLASHINFER_MLA_SPARSE_SM90 是 Hopper 上 NoPE 类模型（比如 GLM-5.3-Flash）首选的稀疏 MLA（多维潜在注意力）后端，但它没有 HiSparse 路径：逻辑 top-k 经 block_table 转成物理位置后读分页 KV，而 HiSparse 卸载出去的页面里留着过期行。主干上它的 supports_hisparse() 返回 False，开了 HiSparse 的服务器选不到它；绕过这道闸门则同一台服务器反复跑 GSM8K 越来越差，GLM-5.3-Flash 在 4 张 H200 张量并行加前缀缓存下从 0.901 掉到 0.834 再到 0.745。这次照其它稀疏后端接入 HiSparse：纯解码批次、或上下文全在热缓存里的批次，整批只做一次物理 top-k 转换并读热缓存；其余情况解码行走热缓存，prefill 行先 stage_prefill_rows 再在暂存工作区上转换，并补了 SM90 专属处理与测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "目的是让稀疏 MLA 后端走通 HiSparse 的 KV 卸载路径，属于 KV 卸载与注意力后端协同。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "hisparse",
+        "sparse-mla",
+        "flashinfer",
+        "sm90"
+      ],
+      "pr_number": 61277
+    },
+    {
+      "sha": "49ab32c35c6a33feb37a8a91195c41179f0dbd1b",
+      "comment": "AITER Triton W4A16 的 MoE 后端一直不支持数据并行。它的 supports_parallel_config 是从 TRT-LLM 的 MXFP4 后端复制过来的，那边当年的内核问题在 AITER 上并不存在。这次解除限制并补上专家并行支持。之所以可以直接打开：朴素数据并行在 dispatch 阶段就把整批 all-gather 进来，对 MoE 内核来说和 TP 加 EP 的输入形态一样；数据并行注意力搭配张量并行专家也用同样的 AG/RS 收发，不需要别的改动。效果是 AiterW4A16ExpertsMonolithic 能在数据并行注意力下搭配 TP 或 EP 切分的专家，DeepSeek-V4.1 在 gfx942 上以数据并行度 2、4、8 跑通，主干上数据并行度 2 起不来。顺带更新了 lm_eval 的 CI 列表、GSM8K 配置和两个 MoE 内核测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是让该 MoE 后端接受数据并行注意力与专家并行的并行配置，没有改动量化格式本身。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rocm",
+        "moe",
+        "dp-attention",
+        "w4a16"
+      ],
+      "pr_number": 66159
+    },
+    {
+      "sha": "0fbba2aa715eecf5d39b2a8c0b002553441321c1",
+      "comment": "视觉编码器用的 FlashAttention 3 默认让内核自己决定 KV 的 split 数量。同一条 1024 token 的序列，单独跑和与一条 256 token 的序列打包在一起跑时选到的 split 可能不同，归约顺序一变结果就不一致，批量不变性被破坏。这次在 VLLM_BATCH_INVARIANT=1 时把 CUDA 侧的视觉 FA3 固定为 num_splits=1，没开这个开关时仍由内核自动选择。新增两个回归：BF16 内核层面比对单独跑和打包跑是否逐位相同，Qwen3-VL-2B-Instruct 层面比对 512×512 与 256×256 图片下的 token id 和被选中 token 的 logprob。两个用例都加进 H100 的批量不变性 nightly，文档补了 Hopper 和 B200 的路径。验证环境是 H100 80GB、PyTorch 2.14.0+cu130，关联 #69763。",
+      "sig": "sig-omni",
+      "sig_reason": "问题出在多模态视觉编码器内部的注意力调用，修的是视觉路径的确定性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "vision-attention",
+        "batch-invariance",
+        "fa3"
+      ],
+      "pr_number": 69774
+    },
+    {
+      "sha": "a588d3974e08fa0a614152ee6b62762f62777ed4",
+      "comment": "GLM-5.3-Flash 的 KDA 在分块 prefill 里用的是现成的 causal_conv1d_fn，逐 token 循环做 q、k、v 的短卷积。这次写了一个 Triton 内核换成平面实现：与序列无关的 tile 模板，SM90 以上用 TMA、否则走寄存器，把 q、k、v 写成密集平面，同时保持 conv state 的接口约定。SM10x 上默认启用，并带逐步判断，分块太短或解码行太多时平面版会更慢，这些步仍走原内核；其它显卡保持原内核，也可以用 additional_config 里的 kda_prefill_conv 强制选 planar 或 causal_conv1d。解码和投机解码步骤不动。数值上 conv state 逐位相同，输出在一个 bf16 ulp 以内，实测的显卡上逐位一致；测试要求 state 精确、输出允许一个 ulp。长 prefill 分块下更快，另附基准脚本、recipe 更新和两类模型测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "新增 prefill 短卷积 Triton 内核换取吞吐，属于内核性能改动，recipe 只是顺带更新。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "triton-kernel",
+        "chunked-prefill",
+        "glm",
+        "sm100"
+      ],
+      "pr_number": 66884
+    },
+    {
+      "sha": "72b87c8867a0a0a73b1b7acb3b3fe3f317f517dd",
+      "comment": "显式指定 model_impl 为 transformers 时，InternLM3、EXAONE 3/3.5、IQuest-Coder、Sarvam 这类模型会报 Cannot find model module，而默认的 model_impl=auto 却能正常服务。原因是这些模型的 architectures 字段不是 Transformers 里的类名，而后端建模型用的是 AutoModel.from_config，只需要配置类。之前解析只试 getattr(transformers, 架构名) 和 auto_map 两条路，两条都走不通。PR#69955 加了一层回退：直接取 AutoModel 会选中的那个类，也就是按配置类型查 transformers.MODEL_MAPPING 得到的结果，除非原来的 auto_map 循环本来就会加载受信任的自定义代码。改动集中在模型注册表里约十行，并补了一条离线插件注册测试。Phi-3-vision 是同类问题，Hub 上的 architectures 仍是 Phi3VForCausalLM，Transformers 侧类名却是 Phi3VForConditionalGeneration，上游 huggingface/transformers#51214 还没合并，这次覆盖不到。",
+      "sig": "sig-core",
+      "sig_reason": "改的是引擎侧模型实现解析逻辑与注册表，属于模型加载主链路。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "transformers-backend",
+        "model-registry"
+      ],
+      "pr_number": 69955
+    },
+    {
+      "sha": "b40b2a99c09e780d6c3c22ef496e3b3ee002fa0c",
+      "comment": "只改 recipes 下两个 Kimi yaml，没有 Python 或 Rust 代码变化。Kimi-K3.1-Pro 的 base_args 加上 --override-generation-config，把 temperature 1.0、top_p 0.95 变成服务端默认值。之前 checkpoint 的 generation_config.json 里只有 max_length 和 eos_token_id，请求不传 top_p 时就用 vLLM 自己的默认值 1.0，而模型卡报结果用的是 top_p 0.95，两边对不上。客户端显式传的值仍然优先，指南里的 curl 示例不再写 temperature 0.7。Kimi-K3 和 K3.1-Pro 还各加了一个可选的严格工具调用开关 --tool-strict-level parameter。改动依据是在 8 张 MI355X 上跑 Kimi Vendor Verifier 套件的实测结果。",
+      "sig": "other",
+      "sig_reason": "仅调整 recipes/models 下两个模型 recipe 的启动参数。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "recipe",
+        "tool-calling"
+      ],
+      "pr_number": 69624
+    },
+    {
+      "sha": "ebe4901d02ea90b336ced8e2168820fb8a5c9da9",
+      "comment": "A.X-K1（AXK1ForCausalLM）原本有一份原生实现，这个 PR 把它迁到 Transformers 建模后端，删掉 vllm/model_executor/models/AXK1.py，整个提交净减一千二百多行。加载 skt/A.X-K1 需要上游 huggingface/transformers#50644，因此要求 Transformers 5.23。迁移依赖三件事先落地：MoE 融合器能把融合后的 MoE 插进被 trace 的 forward（#69868）、ROCm AITER 的融合共享专家替掉原生实现里的那份、以及重命名之后仍能匹配上被忽略的多余权重键。给出的结论是后端版在 LoRA（低秩适配）和 PP（流水线并行）下都能跑，效果与原生实现差距在噪声内，速度至少持平。原生实现本来也加载不了当前 checkpoint，那份权重在 2026-07-24 转成了融合专家格式，所以删掉不会丢现在能用的功能。验证是在 B200 上取前 4 层做贪心解码对比。",
+      "sig": "sig-core",
+      "sig_reason": "主旨是把一个模型实现迁入 Transformers 建模后端并删除原生代码，属模型层结构变更。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "transformers-backend",
+        "moe",
+        "model-registry"
+      ],
+      "pr_number": 67277
+    },
+    {
+      "sha": "85a084c38c2c714c6fbdf0bdcd195b7f0301dece",
+      "comment": "Hopper（SM90）上 GLM-5.3-Flash 走 FlashInfer 的 FA3 稀疏 MLA 后端，MLA 指多层注意力压缩。之前 TP8 时这条路径按注意力头切分，八张卡会把同一批长 prefill 的 query 行重复打分一遍。这个 PR 把后端接到 #63956 已合并的按 token 切分和集合通信上：每张卡只给自己那部分 prefill 行打分，再用全部注意力头做计算；decode 路径仍按头切分，没有动。后端只对符合条件的 NoPE prefill 主动开启，键值缓存支持 BF16 和 E4M3（fp8、fp8_e4m3），query 用 BF16，两条路径共用选定的缓存类型和 scale。每张卡本地的 FA3 plan 复用已有的浮点 workspace，读 decode 前缀之后的紧凑 Top-K 行，并用原始 query 行号在 GPU 上裁剪每个 work 的键值长度；异步 planner 复用 CPU 侧的行切分和序列长度上界。digest 里没给吞吐或时延数字，新增了 SM90 稀疏 MLA 的测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "改的是注意力稀疏 MLA prefill 内核的切分方式，属注意力内核性能优化。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "sparse-mla",
+        "flashinfer"
+      ],
+      "pr_number": 69086
+    },
+    {
+      "sha": "8136afc2f82187cc60172e4c31315d4167497d79",
+      "comment": "彻底移除 TeleFLM 支持。TeleFLMForCausalLM 在上游 Transformers 里并不存在，它的远程代码和 Transformers 5.x 也不兼容，v0.34.0 是最后一个还支持它的版本。这次删掉 vllm/model_executor/models/teleflm.py（45 行），把 TeleFLMForCausalLM 从注册表的文本生成模型列表里去掉，同时加进 _PREVIOUSLY_SUPPORTED_MODELS 并标上 0.34.0，这样加载它会抛出带版本号的提示，而不是含糊的报错。相关的示例模板、文档里的支持模型条目和渲染器测试也一并清理。对还在跑 TeleFLM 的部署来说这是破坏性变更，升级之后只能停在旧版本或者换模型。",
+      "sig": "sig-core",
+      "sig_reason": "主旨是从引擎里下线一个模型实现，落在模型注册表与模型代码。",
+      "tags": [
+        "deprecation",
+        "medium-risk",
+        "model-registry",
+        "teleflm"
+      ],
+      "pr_number": 69929
+    },
+    {
+      "sha": "7b7af30196ad3f12eadaa008fb3bf589ba02d520",
+      "comment": "之前 MoEBlockFuser 是把整个 MoE block 的 forward 换成融合实现，所以专家前后还挂了别的模块的 block 就没法融合，A.X-K1 的 MoE block 末尾带一个 post_mlp_layernorm，正好卡在这里。改成只把调用融合 MoE 的那一段替换掉，也就是专家计算本身、加上融合 MoE 顺带做的缩放和共享专家，block 里其余部分照 trace 出来的图执行，比如专家之后的 norm 层、之前的投影。融合器是 fail closed 的：trace 出来的图只要不能等价代表 forward，就拒绝融合，具体包括可选输入、叶子调用、张量常量、专家输出被挪作他用、或者 trace 被序列长度特化。融合器在 eval 模式下 trace，所以 Mixtral 的路由抖动这种只训练时才走的分支不会被烘进去。专家的缩放系数现在要求等于 routed_scaling_factor，替掉了原来的 divides_shared_output 标记。这是 #67277 拆分出来的前置改动。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 Transformers 建模后端的融合器与 fx trace 机制，不是内核本身。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "transformers-backend",
+        "moe",
+        "fx-trace"
+      ],
+      "pr_number": 69868
+    },
+    {
+      "sha": "1542adb40fe442128ff7d8cf479550c8057e9d2b",
+      "comment": "nemotron_nas 过去直接 import llama.py 里的 MLP 和注意力实现，llama 那边一改就会牵连到它，也是模型层清理（#67937）的一部分。这次把 DeciLMMLP 和 DeciLMAttention 内联进 nemotron_nas.py，文件里不再有任何 llama 模块的 import。参数名和权重加载逻辑不变，已有 checkpoint 照常加载。内联时顺手删掉了 DeciLM 用不到的分支：MLP 去掉从没传过的 reduce_results 和 disable_tp，保留 bias 和 maybe_fused_act_quant；注意力去掉 Eagle3 草稿模型用的 target_layer_count 偏移、EncoderOnlyAttention 分支和 attn_type 参数，同时保留原来 _init_rotary_emb 的重写（mistral_yarn 和 rope_llama4 走 is_neox_style=False）以及 layer_types 的滑窗支持。单文件改动，风险集中在后续与 llama 的行为漂移需要人工同步。",
+      "sig": "sig-core",
+      "sig_reason": "模型实现解耦，只动一个模型文件，属引擎模型层重构。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "nemotron",
+        "model-registry",
+        "decilm"
+      ],
+      "pr_number": 69726
+    },
+    {
+      "sha": "b7186d137addf271d4dd24c8d73c9985437baddc",
+      "comment": "流式接口原来的每请求指标只有 TTFT（首 token 时间），而模型会先输出推理内容或工具调用，客户端真正看到第一个文字要更晚。PR#56914 在 Python 和 Rust 两套前端的每请求指标里加上可选的 time_to_first_content_token_ms，覆盖 Chat Completions、Completions 和 Responses 三个流式接口。计时从请求被调度开始，到第一个产出非空文本内容的引擎输出批次为止，推理内容和工具调用不算。两个前端都直接观察内容本身，不再需要按解析器配置加计时开关，也没有拿 TTFT 当退路：没有文本就没有这个指标，如果第一个输出批次就是文本，它等于 TTFT。开关沿用已有的 --enable-per-request-metrics，聚合指标、投机解码指标和归因抑制规则都没改。流式场景下这个值出现在最后一个 usage chunk 或 Responses 的终止事件上。改动铺到 34 个文件，同时更新了特性文档。",
+      "sig": "sig-core",
+      "sig_reason": "落在 Rust 前端与 OpenAI 兼容接口的每请求指标上。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust-frontend",
+        "metrics",
+        "streaming"
+      ],
+      "pr_number": 56914
+    },
+    {
+      "sha": "83f120dcfcc101360c717bdfd8e40717ae8e7b1f",
+      "comment": "混合精度键值缓存放到分离式 prefill/decode 上会丢数据。用 DeepSeek-V4 这类缓存格式、再开异步调度时，MoRIIO 的 READ 模式可能把自己已经收到的 prompt 键值缓存又清掉：模型执行器在计算流上把新块置零，而没有任何机制保证 MoRI 的写入排在这次置零之后。修复分两步：被 READ 覆盖的那些满块不再参与置零；decode 侧 worker 只在当前计算流确实还排着这一步 READ 目标块的拷贝时，才在首次读之前等计算流。效果体现在精度上，MI355X 上走 xGMI 的 MoRIIO READ 加异步调度，DeepSeek-V4-Flash 做 prefill TP4 到 decode TP4，GSM8K 的严格匹配和宽松匹配从 0.600 / 0.644 回到 0.954 / 0.954，不分离的基线是 0.955 / 0.955。TP 即张量并行。补了 HMA 调度、READ 与 TP 应答三组单测。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "改的是 KV 连接器 MoRIIO 与分离式 prefill/decode 的读写时序，属大规模服务链路。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "kv-connector",
+        "rocm",
+        "pd-disaggregation"
+      ],
+      "pr_number": 67074
+    },
+    {
+      "sha": "aec644a8f9e7b8c6b962ee3fe02ba541fa9a430c",
+      "comment": "Nemotron Shortcut 有两处对不上的地方。第一是分桶权重加载：稀疏模型先把 indexer 读进来之后，后面某个只含注意力或 MLP 权重的桶会被误判为缺少 indexer 权重而拒绝，现在改成首次校验通过就在后续桶里记住这个结果，但完全没有 indexer 权重的稀疏 checkpoint 仍然拒绝加载。第二是视频预处理和训练格式不一致：单帧（T=1）的视频此前逐帧编码，绕过了 T=2 tubelets 才走的带时间戳路径，现在两种都走同一条路径，帧标签、加载器元数据、帧数上限和处理器缓存键都保留；替换片段单独编码，避免聊天模板合并 token 时把视觉占位符的区间抹掉。静图尺寸仍从 checkpoint 自带的 HF 处理器取，显式覆盖继续生效。测试补了分桶 refit 和视频处理两块。",
+      "sig": "sig-omni",
+      "sig_reason": "问题出在 Nemotron Shortcut 的视频预处理与视觉输入路径上。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "video",
+        "nemotron-shortcut"
+      ],
+      "pr_number": 69642
+    },
+    {
+      "sha": "94b13b3d84562054f089e709ba1e32cf9a153bb7",
+      "comment": "Kimi-K3 的低时延专用 decode 路径（decode_backend=latency_specialized）启动时要编译大量 CuTe DSL 内核，很多其实根本用不上。PR#69669 之后，8 张 B300 上跑 Kimi-K3.1-Pro、--max-num-seqs 64、TP（张量并行）8 路时，每卡编译次数从 1435 降到 479，加载权重之后的服务拉起时间从 583 秒缩到 260 秒，约省三分之二。原因是 compile_oproj 的缓存键里带了内核根本不读的参数：生产者不看 nb、has_delta、front，消费者不看 k、mla 和具体 batch，只看线程组数量，于是约 93 层每卡编译出约 570 个 o 投影内核。现在按生产者、消费者、融合三种类型分别只以真正读到的参数做缓存键，并且只对 CUDA graph 实际捕获的尺寸编译。decode 性能不变，两种构建回放同一批图时编译和捕获的内核完全一致。",
+      "sig": "sig-model-performance",
+      "sig_reason": "优化的是 Kimi-K3 专用 decode 内核的编译与 CUDA graph 捕获，属内核侧性能。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "kimi-k3",
+        "cute-dsl",
+        "cuda-graph"
+      ],
+      "pr_number": 69669
+    },
+    {
+      "sha": "e7f220fdfaf71bb85d8c4bb833070101e9a6ced6",
+      "comment": "#68831 给多模态编码器加上 CUDA graph 之后，评审时的基准测试发现：落在捕获范围之外的批次反而变慢了。管理器仍然逐项排序和拼接输入、逐项克隆输出。直接返回批次显存的视图确实更省，但一个缓存条目就会拖着整个批次不放，短音频在远不到 5K token 时就能撞上限。这次的做法是绕掉不必要的中转，只对确实带多余底层显存的输出做压缩，把必需的分配和拷贝合批，并去掉前端和注意力元数据上重复的计算。Triton 写的音频注意力原来在 18 层或 32 层编码器里每层都重算一遍相同的窗口长度，现在不必逐层重算。捕获上限保持不变，默认仍是 5,120 个编码器 token。改动涉及 Qwen3-Omni 思考器、编码器注意力与编码器 graph 管理器，并补了相应测试和设计文档。",
+      "sig": "sig-omni",
+      "sig_reason": "优化对象是 Qwen3 语音编码器与多模态编码器 graph 的开销。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "multimodal",
+        "audio",
+        "cuda-graph"
+      ],
+      "pr_number": 69116
+    },
+    {
+      "sha": "c62590e002f2ec6c5ca4ce8bd3f6d8e1cd04547f",
+      "comment": "digest 里没有这条的 PR 描述，以下按标题和改动文件推断。Rust 前端的 server crate 原来绑死在自带的引擎实现上，现在改成对任意实现 Llm 接口的对象工作，也就是说 OpenAI 兼容服务层可以套在外部引擎前面跑。从文件看，server 的 Cargo.toml 放开了对具体引擎的依赖，cmd 的 CLI 和 main 负责把引擎装配进去，llm 一侧导出接口并调整 fingerprint 用来标识引擎，另外补了一个 external_engine_openai_qwen 示例演示接外部引擎。这是当天最大的一个提交，加一千五百行、删七百多行，横跨二十个文件，动的是前端与引擎之间的模块边界，风险在于所有调用点都要跟着改，只能靠那个示例和 CLI 测试来验证。没有描述可参考，具体接口签名和兼容性承诺无法确认。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 Rust 前端 server 与引擎抽象层的边界，属 Rust 前端与 OpenAI 兼容接口。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "rust-frontend",
+        "openai-api",
+        "engine-interface"
+      ],
+      "pr_number": 64729
+    }
+  ]
+}
