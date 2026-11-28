@@ -1,18 +1,614 @@
 {
   "date": "2026-11-27",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-11-27T13:13:11+08:00",
-  "daily_summary": "## 今日概览\n34 条（抓于当日下午，全天仍在进行）。三条线。一是 AMD 侧把 KV 卸载与稀疏注意力的能力对齐补上：内嵌 UMBP 池的驱逐水位默认从 MORI 的 0.9/0.7 改成 0.99/0.97，此前拿它当 KV 缓存用时平均只有八成满（#67944）；HY4 在 ROCm 上补齐 attention sink、ShardQ 与 iHC 序列并行三样 NVIDIA 已有的能力（#70004）；Mooncake 连接器不再拒绝 prefill 端与 HiSparse decode 端分组不一致的布局（#66502）。二是 NVIDIA 上的内核与平台扩展：Inkling 2 打通 Ampere 与 Ada（#69165）、Qwen4Exp 的 QSA prefill 切到 FlashInfer 的稀疏内核（#69735）。三是 Rust 前端与接口继续补齐，同时 AMD CI 修掉一批自伤式的超时与假失败（#70159、#70155、#69911）。\n\n## 今日重点\n\n### AMD / ROCm\n- **KV 卸载**：vLLM 的 ROCm 镜像带的 MORI v1.2.3.post1 把内嵌 UMBP 池的驱逐水位设成 0.9 降到 0.7，拿它当 KV 缓存用时平均只有八成满，现在两个水位都没配的情况下默认改用 0.99/0.97（#67944）。MoRIIO 的 WRITE 模式碰到复用别的层 KV 的注意力层会挂住，Gemma 4 的多 token 预测草稿层就是这种：这些层不在注册传输组里但仍会触发保存（#68374）。MoRIIO 还支持一组内核块装进一个调度块的 4D 布局，此前 Qwen3-32B 配 AITER FA 直接报 Unsupported cache shape（#69819）。\n- **稀疏 MLA**：HY4 在 ROCm 上此前缺三样 NVIDIA 已有且不需要改 AITER 的能力，本次在 fp8_ds_mla 分支传入 attention sink、接上 ShardQ 与 iHC 序列并行，使 HY4 与 HY4 Flash 能在 gfx950 上用起来（#70004）。ROCm 的自动注意力后端选择把 is_turboquant_run 传给了校验函数却漏传 is_ultraquant_run，导致 --kv-cache-dtype ultraquant_4bit 下引擎启动即失败，除非显式指定后端（#70169）。\n- **CI**：Miscellaneous Kernels 步骤在 MI355 上反复顶满 54 分钟且没有失败测试，原因是全局的每测试清理对自行跳过的内核测试也照样执行，修完 MI355X 上 283 个此类测试从 102.53 秒降到 2.20 秒（#70159）。块量化 fp8/int8 的纯 PyTorch 参考矩阵乘改成每个 K 块一次算完所有 N，MI300X 上 test_block_fp8 从 386 秒降到 120 秒（#70155）。子进程栈转储自 Python 3.14 成为默认后全部失败（py-spy 0.4.1 读不了 3.14 进程），现在钉到 0.4.4 并在原生帧失败时降级（#69911）。AITER 打开后 ViT 后端断言与自定义 all-reduce 三个测试因假设 AITER 关闭而失败（#62524）；granite4_h 的流水线并行测试在 MI250 上自 11 月 23 日已失败 6 次，改用 fp32 的 lm_head（#70134）。\n\n### NVIDIA\n- **Inkling 2**：此前只支持 Hopper 与 SM12x，因为 Triton 路径用了 SM90 以上才有的特性；现在按架构关掉这些特性，让 Ampere 与 Ada（SM80/SM86/SM89）也能跑，Hopper 与 Blackwell 编出的 PTX 逐字节不变，RTX 3090 上张量并行 2 单流约 100 输出 tok/s（#69165）。配套修一个内核侧正确性问题：short_conv 的 prefill 分块在块内没有 token 落在前 W-1 个位置时会跳过读 conv cache，而该判断看的是块里最后一行的请求起点，padding 行的起点是 0，于是漏读（#70246）。\n- **稀疏注意力与显存**：Qwen4Exp 的 8K prefill 里 QSA 在 B200 上占单步 GPU 时间的 26%，此前 Triton 内核一次只处理一行查询、相邻行各自加载 K/V；现在含 prefill 的步骤切到 FlashInfer 的 QToken-KvBlock-Sparse 内核，同一请求 8 行相邻查询在选中块的并集上一起 attend，decode 仍用 Triton 并保留完整 CUDA graph（#69735）。稀疏索引器的 decode logits 缓冲此前按模型全局上下文长度分配列数，在 decode 上下文并行下每个 rank 都持有大量冗余列、挤占 CUDA graph 内存，现在按每 rank 的本地上下文定尺寸（#70178）。Qwen4Exp 建 lm_head 时没把量化配置传进去，文档推荐的在线量化写法在这类模型上静默失效、头一直保持 BF16；接上之后在 nvidia/Qwen3.8-Flash-Next-NVFP4 上省 0.59 GiB（#70214）。\n\n### 跨平台 / 引擎通用\n- **Rust 前端与接口**：开始提供 /v1/decisions，覆盖 Python 侧用 NextTokenStrategy 读取的 Qwen3、Qwen3.5、Gemma 4，每个问题是关闭思考的贪心单 token 读取（#70031）。rerank 尊重 return_documents，客户端手里有文档时只回下标与分数（#70216）。Kimi K3 的 strict 工具允许参数 schema 里带指向自身 property 树的 $ref，此前直接 400（#69622）。/v1/completions 的 top_logprobs 此前按解码后的字符串建键，多个候选解码成同一字符串时靠后的候选会覆盖被采样 token 的条目（#65741）。请求级 media_io_kwargs 改经 prompt_extras 传给渲染器，此前 chat 路上被覆盖丢失（#69842）。\n- **建模后端与模型**：Emu3 的 HF 处理器因分词器不带 BOS 而自行前插，只经 Transformers 后端服务的 BAAI/Emu3-Chat-hf 在多模态提示上会丢掉该前缀，现在后端识别处理器加在分词结果前的 token（#70116）。上一轮给 Transformers 后端引入的检查点张量拆分，在被后端跳过的模块上仍会进拆分并直接抛错，例如 Qianfan-OCR 视觉塔的 attn.qkv（#70076）。Hy4-flash 的 Engram 用 n-gram 哈希取嵌入行，词表填充 id 会进到模型，此前这些位置及其后两个 token 取到的是错的行（#69404）。另有 18 个模型实现文件的死代码清理，净减 431 行（#69975）。\n- **LoRA 与调度**：LoRA 以前默认给 input embedding 与 lm_head 也包一层，适配器没用到也要为它们分配 GPU 缓冲，现在默认跳过、用 --lora-enable-vocab-modules 单独打开（#69354）。批量不变路径加 --lora-split-k-reduction 开关（#70197）。多模态张量改经 S3 引用传递：受信任客户端把张量打包成 SafeTensors 上传，请求体只带一个小引用，此前是 base64 内联、大请求在路由层很吃开销（#68477）。\n- **分离式与权重**：Mamba align 前缀缓存在分离式部署下让 decode 端始终没有可命中的提示状态——prefill 端发送的是 N-1 步的运行态、该点不在块网格上，实测 Qwen3.5-9B 的提示 token 命中为 0/123032，拿到检查点后可达 59.4%；现在 prefill 端在能缓存的检查点处截断、decode 端自行重算尾部（#67064）。休眠模式后端删掉未被生产使用的 SleepModeState 状态枚举与四个从未被调用的能力方法（#70038）。\n- **CI 与其它**：新 commit 上发 /ci retry 时，机器人会把上次失败的 step key 转给新构建，其中若含分片覆盖率检查会让生成器在 bootstrap 阶段就失败，现在把它排除（#69996）。torch.cuda 的禁用检查原先是独立 hook 且正则存在漏匹配，现在并入禁止字符串检查（#69009）。\n\n## 需要关注\n- Qwen4Exp 的在线量化 targets 此前指名 lm_head 会静默失效，依赖该配置压显存的部署升级后头才真的量化，数值会变（#70214）。\n- ROCm 上 --kv-cache-dtype ultraquant_4bit 此前不显式指定后端就启动失败（#70169），UMBP 的池水位默认值也变了，KV 命中率与内存占用需要重新观察（#67944）。\n- Inkling 2 现在能跑 Ampere/Ada，但过程中暴露的 DSpark warmup 显存不足是另一条 PR 在修（#69165）。\n- 当日仍在进行，晚间合并的部分留到下一轮补。\n",
+  "generated_at": "2026-11-28T11:50:16+08:00",
+  "daily_summary": "## 今日概览\n75 条（含 Actions 全天数据校准后补的 41 条）。四条主线。一是 AMD 侧把 KV 卸载与分离式的边界情况补齐：内嵌 UMBP 池的驱逐水位默认从 MORI 的 0.9/0.7 改成 0.99/0.97，此前拿它当 KV 缓存用时平均只有八成满（#67944）；MoRIIO 的 WRITE 模式会让 prefill 实例一直占着已经结束请求的缓存块直到重启（#67218）；Mamba 混合模型把状态检查点放进 attention 块内部时，从 UMBP 恢复永远命中不了（#67942）。二是平台与内核覆盖面继续扩：Inkling 2 打通 Ampere/Ada（#69165）、第一代 Inkling 靠换掉 SM90 以下的 FA4 相对注意力也跑通（#69960）、Qwen4Exp 的 QSA prefill 切到 FlashInfer 稀疏内核（#69735）、HY4 Flash 放开流水线并行与分离式 prefill/decode（#70300）。三是 Rust 前端成批补齐错误语义与日志对齐，把客户端伪造角色边界、输出流错误、畸形消息段等都按 Python 侧的行为处理（#70271、#70323、#70320、#70319）。四是 CI 自身的问题被集中修：ROCm 镜像缓存机器人挂在 build 最终状态上，一天被触发 396 次而真正有活的只有 5 次（#70086）。\n\n## 今日重点\n\n### AMD / ROCm\n- **KV 卸载与分离式**：UMBP 池水位默认改成 0.99/0.97（#67944）。MoRIIO 的 WRITE 模式下，decode 端提前释放传输或新请求复用上一个已结束请求的传输 ID，prefill 实例就会一直占着那些缓存块直到重启（#67218）。Mamba 混合模型的状态检查点落在 attention 块内部时，从 UMBP 恢复永远命中不了，回流的 prompt 只能从更早的边界接着算或整段重算（#67942）。MoRIIO 还补上复用别的层 KV 的注意力层（#68374）与一组内核块装进一个调度块的 4D 布局（#69819）。Mooncake 连接器不再拒绝 prefill 端与 HiSparse decode 端分组不一致的布局（#66502）。专家并行负载均衡的异步策略计算原本跑在推理进程里受全局解释器锁牵制，现在搬进一个常驻 CPU 子进程，负载聚合与显存拷贝仍走原路径（#68606）。\n- **稀疏 MLA 与量化格式**：HY4 在 ROCm 补齐 attention sink、ShardQ 与 iHC 序列并行三样（#70004）；自动注意力后端选择漏传 is_ultraquant_run，导致 --kv-cache-dtype ultraquant_4bit 下启动即失败（#70169）。\n- **CI**：镜像缓存机器人此前挂在每个 build 的最终状态上，2026-11-25 被触发 396 次、其中 191 次是根本不碰 ROCm 栈的 PR，现在改盯这两个作业自己的状态（#70086）。MI355 的 Miscellaneous Kernels 里 10 个测试函数共 125 个用例从 dist_init 迁到 SingleRankGroup 单进程组装饰器（#70348）。Kimi-K3 nightly 的分离式用例自前一日那笔改动起，prefiller 在 checkpoint 处停下、上报的命中低一个单位，测试期望同步调整（#70333）。HY4 序列并行测试在 ROCm 解码层上的断言修掉（#70305）。\n\n### NVIDIA\n- **Inkling 2**：此前只支持 Hopper 与 SM12x，现在按架构关掉 SM90 以上的特性，让 Ampere 与 Ada 也能跑，Hopper/Blackwell 的 PTX 逐字节不变（#69165）；第一代 Inkling 的 FA4 内核用了 score_mod，在 SM90 以下直接抛 NotImplementedError，现在 SM8x 上改用 Inkling 2 的相对注意力实现（#69960）。冷启动后仍会在服务过程中继续编译 prefill 注意力的 Triton 变体、每个在途请求停顿数秒，问题出在按 16 整除的特化，改 3 行消除（#69452）。\n- **稀疏注意力**：Qwen4Exp 的 8K prefill 里 QSA 占 B200 单步 GPU 时间的 26%，含 prefill 的步骤切到 FlashInfer 的 QToken-KvBlock-Sparse 内核，同一请求 8 行相邻查询在选中块的并集上一起 attend（#69735）；解码侧把 FP8 QSA 内核扩到所有逻辑索引批次规模并加上 split-K、tiny-M 档位融合与 PDL 重叠（#70187）。Kimi K3 的索引器一直没把 indexer_logits_dtype 传下去，命令行配了也无效、MQA logits 始终是 FP32（#69838）。稀疏索引器的 decode logits 缓冲改按每个 decode 上下文并行 rank 的本地上下文定尺寸（#70178）。\n- **模型与并行**：HY4 Flash 此前设 supports_pp 为 False 且校验要求流水线并行度为 1，DFly 投机解码路径只接受 DecodeBenchConnector，因此既开不了流水线并行也不能做分离式部署，本次两点一起放开（#70300）。DeepSeek-V4.1 的 prefill 上下文并行此前只跑纯文本，现在图像走编码器缓存复用与分段映射，空闲的秩不再去请求越界的图像切片（#64435）。Qwen4Exp 建 lm_head 时没传量化配置，文档推荐的在线量化写法静默失效，接上后在 NVFP4 检查点上省 0.59 GiB（#70214）。\n\n### Intel XPU\n- KV 连接器与编码器连接器的测试此前在 Intel CI 里完全没有覆盖，依赖也没锁哈希；现在照 CUDA 侧的做法建一套钉住 lmcache 0.5.7.post1 的锁哈希依赖集并重新启用（#69581）。XPU 的 CI 之前每个提交都从头构建整个镜像，现在改用 Docker Bake 复用共享基础镜像，main 上未命中才构建并发布基础镜像（#67428）。\n\n### 跨平台 / 引擎通用\n- **Rust 前端与接口**：开始提供 /v1/decisions（#70031）；客户端文本照抄 DeepSeek 的特殊标记写法等价于自己伪造角色边界与图片占位符，Python 侧早已处理，本次补 Rust 侧（#70271）；输出流错误与提交错误同样分类（#70323）；畸形消息段报出自己的错误而不是笼统 400（#70320）；提示里没有占位符的媒体按请求错误拒绝（#70319）；请求 ID 加 generate 前缀（#70325）；KV 缓存用量日志写明设备名（#70322）；迭代详情日志改成像 Python 那样输出（#70321）；top_logprobs 里被采样 token 的条目不再被同串候选覆盖（#68488）。Python 侧：截断后重建回显文本（#70121）、非可迭代的 tool_calls 回 400（#70293）、/tokenize 尊重 reasoning_effort 与 documents（#69917）、池化的 chat 请求应用 --default-chat-template-kwargs（#68664）、模型级媒体 I/O 默认值合并移进渲染器去掉两处重复注入（#70307）。\n- **后端与权重**：CPU 后端不再为只用查表的词表 embedding 建 GEMM 权重 pack，并修掉 checkpoint 重载后 tied LM head 仍拿旧 pack（#67782）。给 DFlash 这类草稿模型抓目标模型隐藏状态的支持修好，此前文本配置放在 decoder 键下的模型启动即失败（#69064）。树外平台现在能通过新的平台钩子注册自己的 FP8 MoE 专家后端，此前 oracle 只能落到 NONE（#68968）。\n- **多模态**：LLaVA-OneVision、LLaVA-NeXT-Video、Qwen3-VL、Molmo2、GLM-4.1V 经 mm_processor_kwargs 传的 num_frames、fps 等参数此前不生效，视频占位符数量按处理器的采样结果算（#68583）；Unlimited-OCR、DeepSeek-OCR、MiniCPM-V 4.6、MiniCPM-OCR 的多模态 token 数与处理器对不上，会造成请求直接失败、预算算小或编码器显存探测偏大（#68623）；预渲染特征走 skip_mm_cache 时接收端缓存仍会命中旧条目，现在绕过（#69392）；分离式编码器代理把完整的每视频参数原样转发给每个子请求，导致只含一个视频的子请求都取用列表第一个元素（#70167）；DeepSeek-V4.1 的 eager 视觉编码器与 Hy4 VL 的轴键两条问题（#70067、#69573）。\n- **其它**：休眠模式后端删掉未被生产使用的状态枚举与四个从未被调用的能力方法（#70038）。Mamba 的两个对齐接口合并成一个无参接口并补批量校验（#70289）。文档侧放宽「用户可见变更」的书写要求（#70340）；Kimi-K3.1-Pro 的 B300 分离式预设与 GB200 AgentX 预设对齐 InferenceX 基准（#70188、#70285）。\n\n## 需要关注\n- Inkling 2 现在能跑 Ampere/Ada，但过程中暴露的 DSpark warmup 显存不足由另一条 PR 单独修（#69165）。\n- Qwen4Exp 的在线量化 targets 此前指名 lm_head 会静默失效，升级后头才真的量化、数值会变（#70214）。\n- UMBP 池水位默认值改变，KV 命中率与内存占用需要重新观察（#67944）。\n- MoRIIO 的 WRITE 泄漏（#67218）与 Mamba 检查点命中（#67942）都是不报错的静默问题，跑 MoRIIO/UMBP 的部署值得优先升级。\n- 11-27 已按 Actions 全天数据校准到 75 条；11-28 仍在进行。\n",
   "sig_summaries": {
-    "sig-core": "11 条，前端接口与建模后端。\n- Rust 前端开始提供 /v1/decisions，覆盖 Python 侧用 NextTokenStrategy 读取的 Qwen3、Qwen3.5、Gemma 4，每个谓词、选择或打分问题是一次关闭思考的贪心单 token 读取，由选项标签的对数概率打分（#70031）。\n- rerank 尊重 return_documents，客户端手里本来就有文档时只回原始下标与相关度分数（#70216）。\n- Kimi K3 的 strict 工具允许参数 schema 里带指向自身 property 树的 $ref，此前 Python 前端直接返回 400（#69622）。\n- /v1/completions 的 top_logprobs 按解码后的字符串建键，多个候选解码成同一字符串时靠后的候选会覆盖被采样 token 的条目，破坏 top_logprobs 与 token_logprobs 的一致性（#65741）。\n- 请求级 media_io_kwargs 改经 prompt_extras 传给渲染器，此前在 chat 这条路上被覆盖丢失，两套合并逻辑也不一致（#69842）。\n- 建模后端：Emu3 的 HF 处理器自行前插 BOS，只经 Transformers 后端服务时该前缀会在 vLLM 分词时丢掉（#70116）；被后端跳过的模块其融合张量仍会进入拆分并抛错，例如 Qianfan-OCR 视觉塔的 attn.qkv（#70076）。\n- 模型：Hy4-flash 的 Engram 把词表填充 id 按 n-gram 哈希取到了错误的嵌入行，现在按 pad 处理（#69404）；18 个模型实现文件的死代码清理，净减 431 行（#69975）。\n- 接口：多模态张量改经 S3 引用传递，请求体只带一个小引用而不是 base64 内联（#68477）。\n",
-    "sig-model-performance": "6 条。\n- Inkling 2 此前只支持 Hopper 与 SM12x，因为 Triton 路径用了 SM90 以上才有的特性；现在按架构关掉这些特性，让 Ampere 与 Ada 也能跑，Hopper/Blackwell 的 PTX 逐字节不变，RTX 3090 张量并行 2 下单流约 100 输出 tok/s（#69165）。配套的 short_conv 修复：块内没有 token 落在前 W-1 个位置时本应读 conv cache，但判断看的是块里最后一行的请求起点，padding 行起点为 0 导致漏读（#70246）。\n- Qwen4Exp 的 8K prefill 里 QSA 稀疏注意力占 B200 单步 GPU 时间的 26%，现在含 prefill 的步骤切到 FlashInfer 的 QToken-KvBlock-Sparse 内核，同一请求 8 行相邻查询在选中块的并集上一起 attend，每次 K/V 加载被多行共享；选择与数学不变，decode 仍用 Triton（#69735）。\n- 稀疏索引器的 decode logits 缓冲改按每个 decode 上下文并行 rank 的本地 KV 上下文定尺寸，此前按全局上下文分配导致大量冗余列挤占 CUDA graph 内存（#70178）。\n- HY4 在 ROCm 的 fp8_ds_mla 分支补上 attention sink、ShardQ 与 iHC 序列并行，使 HY4 与 HY4 Flash 能在 gfx950 上使用（#70004）。\n- LoRA 的批量不变路径新增 --lora-split-k-reduction 开关，从配置、参数解析一路传到 shrink 内核（#70197）。\n",
-    "sig-large-scale-serving": "5 条，全在 KV 卸载与分离式传输。\n- 内嵌 UMBP 池的驱逐水位默认改成 0.99/0.97，此前 ROCm 镜像带的 MORI 把默认设成 0.9 降到 0.7，拿它当 KV 缓存用时平均只有八成满（#67944）。\n- MoRIIO 的 WRITE 模式遇到复用别的层 KV 缓存的注意力层会挂住，Gemma 4 的多 token 预测草稿层就是这种：这些层不在 register_kv_caches 注册的传输组里，但保存路径照样触发（#68374）。\n- MoRIIO 支持一组内核块装进一个调度块的分组 4D 布局，此前 Qwen3-32B 配 AITER FA 报 Unsupported MoRIIO K/V cache shape（#69819）。\n- Mooncake 连接器不再拒绝 prefill 端与 HiSparse decode 端分组不一致的布局，按层匹配 region、各端用自己的 group ID 配对 page，decode 端每个分组只导入没命中的后缀（#66502）。\n- Mamba align 前缀缓存在分离式部署下让 decode 端始终没有可命中的提示状态，实测 Qwen3.5-9B 的提示 token 命中为 0/123032、拿到检查点后可达 59.4%；现在 prefill 端在本地能缓存的检查点处截断提示，decode 端自行重算尾部（#67064）。\n",
-    "sig-omni": "2 条。\n- DeepSeek-V4.1 的图像输入走默认 eager 视觉编码器路径时（cudagraph_mm_encoder 关闭，含 enforce_eager 打开），_build_image_span 会抛 RuntimeError 说检测到 GPU 与 CPU 之间的同步，此前的修复只覆盖了 CUDA graph 路径（#70067）。\n- Hy4 VL 打开 cudagraph_mm_encoder 且把 limit_mm_per_prompt 的 video 设成 0 时（官方 recipe 就这么传），每个图像批次都会抛 ValueError，现在只在真的带视频时才发出编码器图的轴键（#69573）。\n",
-    "sig-quantization": "2 条。\n- Qwen4ExpForCausalLM 建 lm_head 时没把量化配置传进去，文档推荐的在线量化写法（在 quantization_config.targets 里指名 lm_head）在这类模型上静默失效，头一直保持 BF16；接上之后配 fp8_per_channel_static 在 nvidia/Qwen3.8-Flash-Next-NVFP4 上省 0.59 GiB，没指名时行为不变（#70214）。\n- RocmPlatform 的自动注意力后端选择把 is_turboquant_run 传给了校验函数，却漏传 is_ultraquant_run，导致用 --kv-cache-dtype ultraquant_4bit 时引擎启动即失败，除非显式指定 --attention-backend（#70169）。\n",
-    "sig-ci": "7 条，AMD CI 占大头。\n- Miscellaneous Kernels 步骤在 MI355 上反复顶满 54 分钟且没有失败测试，原因是全局的每测试清理对自行跳过的内核测试也执行；修完 MI355X 上 283 个此类测试从 102.53 秒降到 2.20 秒（#70159）。\n- 块量化 fp8/int8 GEMM 与 MoE 测试的纯 PyTorch 参考矩阵乘改为每个 K 块一次算完所有 N、累加顺序不变，MI300X 上 test_block_fp8 从 386 秒降到 120 秒（#70155）。\n- 子进程栈转储自 Python 3.14 成为默认后全部失败（py-spy 0.4.1 读不了 3.14 进程），现在把 ROCm 测试镜像的 py-spy 钉到 0.4.4，原生帧转储失败时先不带 --native 再退到 gdb（#69911）。\n- AITER 打开后 test_mha_attn_platform 与 test_custom_all_reduce 的三个用例因假设 AITER 关闭而失败，断言改为同时接受 FLASH_ATTN 与 ROCM_AITER_FA（#62524）。\n- test_pp_tied_word_embeddings 的 granite4_h 参数在 MI250 上偶发失败、main 自 11 月 23 日已失败 6 次，改用 fp32 的 lm_head（#70134）。\n- /ci retry 在新 commit 上会把上次失败的 step key 转给新构建，其中含分片覆盖率检查时会让流水线生成器在 bootstrap 阶段失败，现在把它排除（#69996）。\n- torch.cuda 的禁用检查原先是独立 pre-commit hook 且旧正则要求括号后跟字母数字，导致 current_platform.mem_get_info() 这类写法从未命中，现在并入禁止字符串检查（#69009）。\n",
-    "sig-rl": "1 条。休眠模式后端 SleepModeBackend 里留着一批没被生产使用的推测性脚手架：SleepModeState 状态枚举、_state 与 state() 接口，以及四个从未被调用的能力 classmethod。本次全部删除，实际状态由分配器与后端各自持有（#70038）。\n"
+    "sig-core": "26 条，Rust 前端与接口是主体。\n- **Rust 前端**：开始提供 /v1/decisions，每个问题是关闭思考的贪心单 token 读取（#70031）；客户端照抄 DeepSeek 特殊标记等价于伪造角色边界与图片占位符，本次补 Rust 侧编码（#70271）；输出流错误与提交错误统一分类（#70323）；畸形消息段报出自己的错误（#70320）；提示里没有占位符的媒体按请求错误拒绝（#70319）；请求 ID 加 generate 前缀（#70325）；KV 缓存用量日志写明设备名（#70322）；迭代详情日志对齐 Python（#70321）；top_logprobs 里被采样 token 的条目不再被同串候选覆盖（#68488）。\n- **前端与接口**：截断后重建回显文本（#70121）、非可迭代的 tool_calls 回 400（#70293）、/tokenize 尊重 reasoning_effort 与 documents（#69917）、池化 chat 请求应用 --default-chat-template-kwargs（#68664）、模型级媒体 I/O 默认值合并移进渲染器（#70307）、Kimi K3 的 strict 工具允许自引用 $ref（#69622）、rerank 尊重 return_documents（#70216）、请求级 media_io_kwargs 经 prompt_extras 传递（#69842）。\n- **后端与模型**：CPU 后端不再为查表用途建权重 pack，并修掉重载后 tied LM head 拿着旧 pack（#67782）；Emu3 的 HF 处理器前插 BOS 被丢掉的问题修掉（#70116）；top_logprobs 按解码后的字符串建键时被同串候选覆盖被采样条目（#65741）；异步多模态解析器与 tracker 互相引用形成环、原始 base64 媒体只能等循环回收（#70166）；被跳过模块的融合张量不再进入拆分（#70076）；Hy4-flash 的 Engram 按 pad 处理词表填充 id（#69404）；模型实现死代码清理（#69975）。\n- **接口正确性**：多模态张量改经 S3 引用传递（#68477）；LoRA 默认不再给 embedding 与 lm_head 包一层（#69354）。\n",
+    "sig-ci": "14 条，CI 自身的浪费与假失败是主题。\n- ROCm 镜像缓存机器人此前挂在每个 build 的最终状态上，一天被触发 396 次、其中 191 次根本不碰 ROCm 栈，现在改盯两个作业自己的状态（#70086）。\n- MI355 的 Miscellaneous Kernels 里 10 个测试函数共 125 个用例从 dist_init 迁到 SingleRankGroup 单进程组装饰器，去掉每个测试后的全局清理（#70348）。\n- Kimi-K3 nightly 的分离式用例里 prefiller 在 Mamba checkpoint 处停下，上报命中低一个单位，期望值同步调整（#70333）；HY4 序列并行测试在 ROCm 解码层上的失败修掉（#70305）；LoRA 的 Mixtral 测试启用 embedding 模块（#70327）。\n- Intel：KV 与编码器连接器测试此前在 XPU CI 里没有覆盖且依赖没锁哈希，现在建一套钉住 lmcache 0.5.7.post1 的依赖集并重新启用（#69581）；改用 Docker Bake 复用共享基础镜像，避免每次从头构建整镜像（#67428）。\n- /ci retry 排除分片覆盖率检查（#69996）、torch.cuda 禁用检查并入禁止字符串检查（#69009）、py-spy 钉到 0.4.4 修 Python 3.14 栈转储（#69911）、AITER 打开后的 ViT 与自定义 all-reduce 断言（#62524）、块量化参考矩阵乘提速（#70155）、跳过自测后的全局清理（#70159）、granite4_h 用 fp32 lm_head（#70134）。\n",
+    "sig-large-scale-serving": "11 条，MoRIIO/UMBP 的静默问题成串。\n- **AMD 侧**：MoRIIO 的 WRITE 模式下，decode 端提前释放传输、或新请求复用上一个已结束请求的传输 ID，都会让 prefill 实例一直占着缓存块直到重启（#67218）。Mamba 混合模型把状态检查点放进 attention 块内部时，从 UMBP 恢复永远命中不了，只能从更早边界接着算或整段重算（#67942）。内嵌 UMBP 池的驱逐水位默认改成 0.99/0.97，此前 MORI 的 0.9/0.7 让它平均只有八成满（#67944）。MoRIIO 补上复用别的层 KV 的注意力层（#68374）与分组 4D 布局（#69819）。\n- **专家并行**：负载均衡的异步策略计算从推理进程搬进常驻 CPU 子进程，避开全局解释器锁挤占推理线程，负载聚合、显存到主存拷贝与映射提交仍走原路径（#68606）。\n- **连接器与并行**：Mooncake 不再拒绝 prefill 端与 HiSparse decode 端分组不一致的布局（#66502）；Mamba align 前缀缓存在分离式部署下让 decode 端始终没有可命中的提示状态，实测提示 token 命中 0/123032、拿到检查点后可达 59.4%，现在 prefill 在能缓存的检查点处截断（#67064）；HY4 Flash 放开流水线并行，并允许 DFly 投机解码配非基准的 KV 连接器做分离式部署（#70300）；DeepSeek-V4.1 的 prefill 上下文并行支持图像输入，走编码器缓存复用与分段映射（#64435）；分离式编码器代理把完整的每视频参数转发给每个子请求，导致单视频子请求全取列表第一个元素（#70167）。\n",
+    "sig-model-performance": "11 条，Inkling 与 Qwen4Exp 各占一半。\n- **Inkling**：第二代打通 Ampere/Ada，按架构关掉 SM90 以上才有的特性，Hopper/Blackwell 的 PTX 逐字节不变（#69165）；第一代在 SM8x 上改用第二代的相对注意力绕开 FA4 的 score_mod 限制（#69960）；冷启动后仍在服务过程中编译 prefill 注意力的 Triton 变体、每个在途请求停顿数秒，按 16 整除的特化改 3 行消除（#69452）；short_conv 的 prefill 分块因看的是块末行的请求起点而漏读 conv cache（#70246）。\n- **Qwen4Exp**：8K prefill 里 QSA 占 B200 单步 GPU 时间的 26%，含 prefill 的步骤切到 FlashInfer 的 QToken-KvBlock-Sparse 内核（#69735）；解码侧把 FP8 QSA 内核扩到所有逻辑索引批次规模，加 split-K、tiny-M 档位融合、PDL 重叠与 cvt.rn.bf16x2 反量化（#70187）。\n- **Kimi K3**：索引器一直没把 indexer_logits_dtype 传给稀疏索引器，命令行配了也无效、MQA logits 始终 FP32（#69838）；decode logits 缓冲改按每个 decode 上下文并行 rank 的本地上下文定尺寸，此前冗余列挤占 CUDA graph 内存（#70178）。\n- **其它**：MambaBase 的两个对齐接口合并成一个无参接口并补批量校验（#70289）；HY4 在 ROCm 补 attention sink、ShardQ 与 iHC 序列并行（#70004）；LoRA 批量不变路径加 --lora-split-k-reduction（#70197）。\n",
+    "sig-omni": "5 条。\n- LLaVA-OneVision、LLaVA-NeXT-Video、Qwen3-VL、Molmo2、GLM-4.1V 经 mm_processor_kwargs 传的 num_frames、fps、max_fps、min_frames 等参数此前不生效，视频占位符数量改为按处理器实际采样结果算（#68583）。\n- Unlimited-OCR、DeepSeek-OCR、MiniCPM-V 4.6、MiniCPM-OCR 计算多模态 token 数与应用处理器选项的方式与 HuggingFace 处理器对不上，后果是请求直接失败、token 预算算小、或编码器显存探测偏大（#68623）。\n- 预渲染特征用 skip_mm_cache=True 发给生成服务时，接收端仍会命中缓存里的旧条目，现在这类条目绕过接收端缓存（#69392）。\n- DeepSeek-V4.1 的 eager 视觉编码器路径抛 GPU 与 CPU 同步错误（#70067）；Hy4 VL 在 video 上限为 0 时仍发出编码器图的轴键导致每个图像批次报错（#69573）。\n",
+    "sig-quantization": "3 条。\n- FP8 MoE 的专家后端选择此前是内置的，树外平台只能落到 NONE，没有途径接入自己的量化专家内核；新增格式无关的平台钩子 get_moe_experts_cls，默认返回空列表由各平台实现（#68968）。\n- Qwen4Exp 建 lm_head 时没传量化配置，文档推荐的在线量化写法在这类模型上静默失效、头一直 BF16；接上之后在 NVFP4 检查点上省 0.59 GiB（#70214）。\n- ROCm 的自动注意力后端选择漏传 is_ultraquant_run，导致 --kv-cache-dtype ultraquant_4bit 下引擎启动即失败，除非显式指定后端（#70169）。\n",
+    "sig-spec-decode": "1 条。给 DFlash 这类草稿模型做训练需要抓目标模型在文档图片上的隐藏状态，但 nvidia/Nemotron-3.5-Parse 把文本配置放在 config 的 decoder 键下，隐藏状态抽取在启动阶段就失败，此前的支持只覆盖了常规的文本配置布局（#69064）。\n",
+    "sig-rl": "1 条。休眠模式后端里留着一批没被生产使用的脚手架：SleepModeState 状态枚举、_state 与 state() 接口，以及四个从未被调用的能力 classmethod，本次全部删除（#70038）。\n",
+    "other": "3 条，文档与配方。\n- 放宽贡献文档里「用户可见变更」的书写要求，减少 PR 模板上的形式化负担（#70340）。\n- Kimi-K3.1-Pro 的 B300 分离式预设把并发档位指到 64、264、640 并对齐 InferenceX 基准（#70188）；GB200 的 AgentX 预设同样按基准对齐（#70285）。\n"
   },
   "commits": [
+    {
+      "sha": "9172ffc42e16e3a276ab8519c6d6a949c0f1d76c",
+      "comment": "此前 FP8 MoE 的专家后端选择是内置的：平台属于 out-of-tree（树外）时，oracle 只能落到 Fp8MoeBackend.NONE，第三方平台没有途径接入自己的量化专家内核。本 PR 加了格式无关的平台钩子 get_moe_experts_cls，默认返回空列表，由各平台注册自己的 FusedMoEExperts 类。自动选择时 FP8 oracle 按注册顺序逐个尝试，取第一个通过 is_supported_config 的类；显式 --moe-backend 仍然优先。若全部被拒，会打一条列出原因的警告，然后按未注册继续选择。新增的 OOT 后端拿到的是未转换的权重，布局由专家类自己处理，并补了 kernel oracle 测试。",
+      "sig": "sig-quantization",
+      "sig_reason": "主旨是 FP8 量化 MoE 专家内核的平台注册与分发机制。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "moe",
+        "fp8",
+        "quantization",
+        "platform"
+      ],
+      "pr_number": 68968
+    },
+    {
+      "sha": "4ab76af1fd9a3717ecdfad53382df3e4222e5613",
+      "comment": "修复 #70119：/v1/completions 带 echo=true 和 truncate_prompt_tokens 时，若未设置 truncation_side，回显的是完整原文，而引擎实际收到的是截断后的 token，回显和真正执行的请求不一致。#62691 此前只修了显式设置 truncation_side 的情形。本 PR 在 renderer 重建回显文本：未设置截断方向时回显与引擎收到的 token 对齐；prompt 恰好等于截断长度时按原样回显，不受无法无损还原文本的 tokenizer 影响。模型输入 ID、usage.prompt_tokens、return_token_ids、显式截断方向和 token-ID 输入的行为不变。在 Apple M5 仅 CPU 验证：truncated_echo 用例从 6 失败 18 通过变为 24 全过。",
+      "sig": "sig-core",
+      "sig_reason": "OpenAI 兼容 completions 接口与 renderer 的回显行为修复，属前端。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "frontend",
+        "completions",
+        "tokenizer"
+      ],
+      "pr_number": 70121
+    },
+    {
+      "sha": "20da5d1983b671300cdd53a17621f24236313bdb",
+      "comment": "此前 chat-completions 请求里 messages[].tool_calls 传 1、true 或 1.5 这类不可迭代值时，pre-validator 会抛未捕获的 TypeError，请求以 HTTP 500 失败。本 PR 给 ChatCompletionRequest 补校验，把这种畸形输入转成 Pydantic ValidationError 返回 400。一次性生成器和 tool call 元组仍会被物化成列表，这正是当初加 pre-validator 的原因，行为不变；已有的 tool-choice 与 reasoning_content 校验也不受影响。在提交 fb9ed466 上运行请求校验单元测试，全部通过。改动只有协议文件和测试各一处。",
+      "sig": "sig-core",
+      "sig_reason": "chat-completions 的 OpenAI 兼容接口参数校验修复，属前端。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "frontend",
+        "chat-completions",
+        "validation"
+      ],
+      "pr_number": 70293
+    },
+    {
+      "sha": "5f1df80d3663a236c4b30d0948dca6f83619f227",
+      "comment": "此前 HY4 Flash 设 supports_pp 为 False，且并行配置校验要求流水线并行度为 1，无法开流水线并行；DFly 投机解码路径只接受 DecodeBenchConnector，其它 KV 连接器一律拒绝，也就不能做分离式 prefill/decode 部署。本 PR 放开这两点：HY4 Flash 在 NVIDIA CUDA 上支持流水线并行大于 1，带不带 DFly 都可以，CI 的流水线并行等价测试显示输出与流水线并行 1 逐位一致，精度与张量并行持平。DFly 可用 NixlConnector 或 MooncakeConnector 跑 1P1D，精度和接受长度与非分离式部署一致。验证环境为 GB200 上的 Hy4-flash-FP8。#69424 也动了同一连接器守卫，但处理的是本地卸载连接器，不重复。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是放开流水线并行与分离式 prefill/decode 部署，投机解码只是载体。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "pipeline-parallel",
+        "pd-disaggregation",
+        "speculative-decoding",
+        "hy4-flash"
+      ],
+      "pr_number": 70300
+    },
+    {
+      "sha": "0f15cf0115aca5eb9d59140089cd07c195d95dd4",
+      "comment": "此前 MambaBase 有 get_prefill_checkpoint_alignment 和 get_kv_cache_checkpoint_alignment 两个对齐接口，各层分别声明，签名还要接 VllmConfig。本 PR 合并成单个无参的 get_cache_checkpoint_alignment，并给批量 checkpoint 缓冲受前缀缓存网格限制的 FlashInfer GDN 这类后端加 requires_grid_checkpoint_alignment 属性。MambaMixer2、ShortConv、ZayaCCA、Qwen 与 Kimi 的门控 delta 注意力等各层均已迁移，每层的内核 checkpoint 对齐只剩一个声明来源，不再读配置参数。这是 #69699 路线图的第 2 步。改动涉及 19 个文件，含注意力后端选择与 GPU model runner 测试。",
+      "sig": "sig-model-performance",
+      "sig_reason": "统一 Mamba/线性注意力内核侧的 cache 对齐接口，影响注意力后端选择。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "mamba",
+        "linear-attention",
+        "checkpoint-alignment",
+        "prefix-cache"
+      ],
+      "pr_number": 70289
+    },
+    {
+      "sha": "0ee12948bcfcbf8fcd056d2296adb7b16728220a",
+      "comment": "此前 Inkling 2 冷启动后，会在服务过程中于引擎线程继续编译 prefill 注意力和注意力前导内核的 Triton 变体，问题与按 16 整除的特化有关，导致每个在途请求停顿数秒。修复只改 3 行，调整 attention_sm90 与 sconv，消除 _rel_attention_kernel、_attn_prologue_kernel、_qr_rel_kernel 三个内核在 warmup 之后的重复编译（修复 #69451）。1x H200 上，并发 1、投机解码关闭时最差 TTFT（首 token 时延）从 7.5s 降到 0.8s；并发 16、投机解码开启时 p99 首 token 时延从 10.4s 降到 4.9s。冷启动编译时间从 6.6-12.1s 降到 1.0-2.2s；贪心解码输出不变，GSM8K 在噪声内，H200 与 B200 上内核耗时本身变化不超过正负 1%。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修复注意力内核运行时重编译导致的请求停顿，落点在 kernel 侧性能。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "triton",
+        "prefill",
+        "ttft",
+        "inkling2"
+      ],
+      "pr_number": 69452
+    },
+    {
+      "sha": "6bb706395e05bf14f2ae97d20e63f522545d665c",
+      "comment": "作者认为 AI 辅助生成的 PR 更新文档过于积极，于是放宽贡献指南里「记录用户可见变更」一节：改动不够显著时不再要求同步更新渲染文档。仅改 docs/contributing/README.md 一处 13 行，不影响任何代码，作用是减少小改动带来的无关文档 diff。",
+      "sig": "other",
+      "sig_reason": "只修改贡献流程文档，不涉及任何 SIG 的代码域。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "contributing",
+        "policy"
+      ],
+      "pr_number": 70340
+    },
+    {
+      "sha": "6beda2a3aba2a03c52eba24f5385fbbebbe77577",
+      "comment": "此前 (MI355) Miscellaneous Kernels 单 GPU 内核测试里 10 个测试函数共 125 个用例用 dist_init 建分布式环境，并在每个测试后跑全局清理。本 PR 把它们迁到 #68162 引入的 SingleRankGroup 单进程组装饰器加 skip_global_cleanup，是 #70159 的后续；测试体、断言和 skip 逻辑不变。MI355X 上受影响的测试从 89.88s 降到 5.89s，三个文件整体从 200.85s 降到 114.51s，前后同为 293 通过 486 跳过、逐个用例结果一致。buildkite 的 kernels 与 models_basic 测试区配置同步修改。",
+      "sig": "sig-ci",
+      "sig_reason": "改动对象是 CI 内核测试的初始化方式与流水线用时，不涉及产品代码。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "kernel-tests",
+        "rocm",
+        "test-time"
+      ],
+      "pr_number": 70348
+    },
+    {
+      "sha": "eb4106678d52c027fee187bccbbf5fc1da15f6f5",
+      "comment": "Python 前端的 LoggingStatLogger 自 #55650 起会在 KV 缓存用量日志里写设备名，而 Rust 前端一直固定打印 GPU，CPU 引擎的日志因此不准确。本 PR 给 EngineCoreReadyResponse 加 device_type 字段（Python 侧默认 None），把 DeviceConfig.device_type 带给不持有 VllmConfig 的前端。Rust 侧打印周期统计与迭代明细行时按实际设备命名：CPU 引擎现在输出 CPU KV cache used 等内容；CUDA 引擎和未携带新字段的旧 EngineCore 仍输出 GPU。改动含 mock 引擎与握手协议测试，cargo fmt、clippy 等检查通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端日志与握手协议字段扩展，属前端与指标范畴。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust-frontend",
+        "logging",
+        "kv-cache"
+      ],
+      "pr_number": 70322
+    },
+    {
+      "sha": "829070e2b5e10b94ee64cc764ecf2088840279ca",
+      "comment": "自 #67064 起，Kimi K3 nightly 的 P/D（分离式 prefill/decode）用例里 prefiller 会在 Mamba checkpoint 处停下，自身上报的前缀命中比原期望低一个命中单位，test_prefix_cache.py 全部 P/D 用例在 AMD 和 NVIDIA 上开始失败。本 PR 把含 prefiller 部署的期望值下调一个单位，无 prefiller 的部署不变。据 PR 描述：最后一次通过的 nightly 中 12 个 P/D 用例全部符合期望，首次失败的 nightly 里这 12 个失败、其余 16 个通过，且 AMD 与 NVIDIA 上 28 个用例的结果表一致。改动后 (MI355) 与 (4xB200) 两个前缀缓存测试套恢复通过。",
+      "sig": "sig-ci",
+      "sig_reason": "只调整 nightly 测试的期望值以匹配已知行为，属 CI 修复。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ci",
+        "prefix-cache",
+        "pd-disaggregation"
+      ],
+      "pr_number": 70333
+    },
+    {
+      "sha": "dddac39fb681db46109702b001e816adee0977b4",
+      "comment": "模型级的媒体 I/O 默认值此前存在重复注入：online 与 pooling 的 IO processor 在构造 chat 参数时又各自合并一次默认值。本 PR 把这部分合并逻辑移入 renderer，并删掉两处 IO processor 里的重复默认注入，使 chat 与 pooling 入口的媒体加载参数只在 renderer 一处生效。新增 tests/renderers/test_media_io_kwargs.py 做回归。PR 描述被截断，所属的整理议题编号未能完整给出；从改动看是前端媒体参数处理的分步重构，共 7 个文件。",
+      "sig": "sig-core",
+      "sig_reason": "renderer 接管媒体 I/O 默认值合并，属前端参数处理重构。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "renderer",
+        "media-io",
+        "pooling"
+      ],
+      "pr_number": 70307
+    },
+    {
+      "sha": "d83003b72257f7ae09e41530990eafdf62ff278f",
+      "comment": "这是 #68127 针对视频输入的后续修复。此前 LLaVA-OneVision、LLaVA-NeXT-Video、Qwen3-VL、Molmo2、GLM-4.1V 经 mm_processor_kwargs 传 num_frames、fps、max_fps、min_frames/max_frames 等采样参数时，HF processor 产出的是采样后的帧，但生成 prompt 占位符时又从采样前的输入或默认设置重新推导帧数与时间戳，占位符数量和视觉特征对不上导致请求失败，例如 LLaVA 在 num_frames=4 或 8 时报「试图把 785 个多模态 token 分配给 2353 个占位符」。本 PR 让各模型的 adapter 改用 processor 实际产出的 pixel_values_videos 等结果来构造占位符，5 个模型的处理测试随之更新。",
+      "sig": "sig-omni",
+      "sig_reason": "修复视觉语言模型视频占位符与特征不匹配，属多模态处理。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "video",
+        "llava",
+        "qwen3-vl"
+      ],
+      "pr_number": 68583
+    },
+    {
+      "sha": "c282bd3b72475904b6bbf0e34850d0487171299c",
+      "comment": "此前 --enable-logging-iteration-details 开关在 Rust 前端下没有效果：EngineCore 发来每次迭代的明细记录，客户端却直接丢弃，开关形同虚设。本 PR 把 stats 协议里的 SchedulerStats.iteration_records 解码成类型化记录，并随统计到达逐条打印，格式对齐 Python 的 LoggingStatLogger：内容含上下文请求数、生成 token 数、可选的迭代耗时与 dummy 标记、KV 缓存用量及编码器输入输出字段，且不受周期统计间隔影响。同时删掉了自 #61690 起已不在协议里的旧 iteration_details 单字段。cargo fmt、clippy 等检查通过。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端的迭代明细日志与指标解码，属前端与指标范畴。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust-frontend",
+        "logging",
+        "metrics"
+      ],
+      "pr_number": 70321
+    },
+    {
+      "sha": "2bd5514b47916ca9e87a12f6b1ef121c43df0dbb",
+      "comment": "此前每个异步多模态 chat 请求都会在 AsyncMultiModalContentParser 与 AsyncMultiModalItemTracker 之间建立互相引用，形成引用环，而 tracker 里还持有原始 base64 媒体 URL，内存只能等循环 GC 回收。本 PR 在 resolve_items 快照 item_groups 之后立刻清空 _items_by_modality，及时断开引用环；并在 asyncio.gather 之前清掉跟踪的回调，使媒体拉取失败时 tracker 同样释放引用。以 200 个 20MB 的 video_url 载荷压测，峰值跟踪内存从 760.1 MiB 降到 40.0 MiB，约 19 倍；批次结束后的驻留内存从 400.1 MiB 降到 0。改动纯为清理逻辑，只涉 tracker 与测试两个文件。",
+      "sig": "sig-core",
+      "sig_reason": "修复 renderers/chat_utils 的引用环内存泄漏，落点在前端而非模型侧。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "frontend",
+        "memory-leak",
+        "multimodal"
+      ],
+      "pr_number": 70166
+    },
+    {
+      "sha": "333c02eb9835c5aab01220ef22a552cf26f208a0",
+      "comment": "/v1/completions 的 top_logprobs 是按解码后的字符串建键的。字节回退会把一个泰文、中日韩或 emoji 字符拆成多个候选，这些候选解码出同一个字符串，就只能共用一个条目。Rust 前端用 IndexMap 收集，后写入的覆盖前面的，留下的是引擎顺序里最后一个候选的对数概率。这次改成保留概率最高的那个候选，和 Python 前端在 #65741 之后的行为对齐。改动集中在 position_top_logprobs_map 一处，非流式、流式和回显 prompt 三种路径一起生效。键、键顺序和条目数都不变，只有冲突键的取值变了。开了 return_tokens_as_token_ids 时键就是 token ID，本来也不会撞。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 Rust OpenAI 兼容接口的 logprobs 输出，属前端核心行为。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rust-frontend",
+        "logprobs",
+        "openai-api"
+      ],
+      "pr_number": 68488
+    },
+    {
+      "sha": "7f4c0cbc1ee1a87855845e70f5ce46274ccf9703",
+      "comment": "Python 的 token-in/token-out 路由从 vllm#24261 起给请求 ID 加 generate-tokens- 前缀，文档也是教客户端按这个前缀去中止请求。Rust 前端只用没前缀的原始 ID，所以照文档中止 generate-tokens-42 时匹配不到任何请求。现在改成由 resolve_request_context 带上路由前缀统一解析出完整 ID，覆盖 chatcmpl-、cmpl-、resp_、decision-、generative-scoring-、tokenize- 这些前缀。引擎侧请求、JSON 和 SSE 响应里的 request_id、媒体预处理的 span、以及中止用的键，都换成带前缀的完整 ID。base 仍然来自 X-Request-Id、请求体的 request_id 或者随机 ID。效果是按文档中止能真正生效，新加路由也不会再漏掉前缀。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端各路由的请求 ID 命名与中止行为修正。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "request-id",
+        "abort"
+      ],
+      "pr_number": 70325
+    },
+    {
+      "sha": "8bf8017544705588f0012561f4f79a161f79fd7d",
+      "comment": "Rust 前端在提交请求时会区分错误类型，客户端参数错给 400，可重试的容量问题给 503。同样的错误如果是从输出流里冒出来，之前一律答 500，客户端没法判断该不该重试。这次把提交阶段的分类逻辑用到输出流上，vllm_text::ErrorKind 新增 Unavailable，对应 HTTP 503 和 gRPC 的 UNAVAILABLE，原来那个判断可用性的旁路谓词也一并整理。覆盖 chat、completions、Responses、/inference/v1/generate、/generative_scoring 和 decisions 读取的非流式路径，以及 chat、completions、generate 的流式错误事件。效果是远端 Llm 提交后丢掉 worker 时返回可重试的 503 ServiceUnavailableError，worker 事后拒绝的请求返回 400 RemoteInvalidRequest。这是 #64729 评审提出的后续，因为 #68933 重写了分类逻辑而单独拆出来。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端 HTTP 与 gRPC 错误分类，属接口层核心逻辑。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "error-handling",
+        "grpc"
+      ],
+      "pr_number": 70323
+    },
+    {
+      "sha": "f8d13e87f3bf9d1d3405765b46be5204b773b4c0",
+      "comment": "客户端传的消息内容块结构不对时，Rust 前端返回的是 serde 的通用报错，「data did not match any variant of untagged enum MessageContent」，看不出到底是哪个字段缺了。这次给内容块自己做判别，把具体错误报出来。比如用户消息第二段写成 type 为 image_url 但 image_url 是个空对象，400 的文案现在变成 messages[0] 缺字段 url。Responses 的输入消息内容和 /tokenize 的 chat 消息走同一套处理。状态码没有变化，这类请求本来就是 400，改的是错误信息的可读性，客户端排查更快。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端请求校验的错误信息可读性修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rust-frontend",
+        "error-message",
+        "validation"
+      ],
+      "pr_number": 70320
+    },
+    {
+      "sha": "a726ffbee5086c452914907b1b64910e7f51442b",
+      "comment": "请求带了图片，但渲染出的 prompt 里没有对应的占位符时，Python 用 PromptUpdateMismatchError 报 400，Rust 前端却当成内部错误答 500，gRPC 路径给 INTERNAL。丢占位符有几种成因：请求自己的 token ID 没写占位符，可信的 chat_template 把媒体丢了，或者客户端把图片放在系统消息里而模板只渲染用户消息中的图片。这次把这类情况归为请求错误，HTTP 返回 400，gRPC 返回 INVALID_ARGUMENT。效果对照表很清楚：chat 和 chat render 模板没渲染出图片占位符时从 500 变 400，gRPC Generate 传缺占位符的 token ID 时从 INTERNAL 变 INVALID_ARGUMENT，HTTP /inference/v1/generate 之前经通用映射已经是 400，保持不变。",
+      "sig": "sig-core",
+      "sig_reason": "主旨是 Rust 前端的错误码分类，多模态只是触发场景。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rust-frontend",
+        "error-handling",
+        "multimodal"
+      ],
+      "pr_number": 70319
+    },
+    {
+      "sha": "ef706a1b8884d04e764041639a3ab12b8e24a4f4",
+      "comment": "#69354 把 embedding 和 lm_head 的 LoRA 改成要显式开启之后，nightly 里的 test_mixtral_lora 就开始失败，model_manager 打印忽略 embed_tokens 和 lm_head 权重的警告，断言随之不通过。这次照 #69354 改 tests/lora/test_llama_tp.py 的同一办法，在测试里打开 embedding 模块开关，只加一行。效果是 (MI355) Distributed 作业在 nightly 恢复通过。作者没有本地复现，因为这个测试要 4 张 GPU 和 Mixtral-8x7B，证据来自上游 CI 上本 PR 的那个作业。",
+      "sig": "sig-ci",
+      "sig_reason": "只改一个测试文件让 nightly 作业恢复，属 CI 测试维护。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ci",
+        "lora",
+        "rocm"
+      ],
+      "pr_number": 70327
+    },
+    {
+      "sha": "8ad82dae1db5418b6f96d882d64721d13d68d7a8",
+      "comment": "专家并行负载均衡的异步策略计算原本跑在推理进程里，受 Python 全局解释器锁牵制，会挤占推理线程。这次把策略计算搬进一个常驻的 CPU 子进程，移出去的只有策略计算，负载聚合、显存到主机内存的拷贝、迁移调度、专家权重传输和映射提交都还走原来的执行路径。这是 use_async 为 true（现有默认值）时的标准路径，同步模式的负载均衡和 profiling 仍在进程内直接调策略。配对 H20 上的 A/B 测试给出两个数字：Qwen3.6-35B-A3B 短 prefill 负载稳态吞吐提升 5.37%，DeepSeek-V4.1-Flash 独立 prefill 负载在固定请求速率下首 token 时延 P99 降低 58.0%。一致性方面有专门测试：喂相同的 CPU 负载快照，子进程给出的放置结果和直接调用完全相同，包括保留旧槽位和自定义 EplbStats 字段；扩展测试会验证策略调用跑在另一个进程里。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "改的是专家并行负载均衡的执行方式与推理进程开销。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "eplb",
+        "moe",
+        "async",
+        "throughput"
+      ],
+      "pr_number": 68606
+    },
+    {
+      "sha": "918f9c3e06e23136103841a4f46694eaa9446604",
+      "comment": "客户端文本里如果照抄 DeepSeek 的特殊标记写法，比如｜User｜或｜deepseek_image｜这类 added token 的字面量，直接编码进去就等价于用户自己伪造了角色边界和图片占位符。Python 侧在 #68468 处理了这个问题，本条是 Rust 侧的另一半，依赖 #68468 定契约但代码本身独立。做法是新增一个和 deepseek-recipe 同设计的 prompt writer：先保留原文和模板特殊标记的字节区间，有分词器时把每个区间换成对应的 added token ID，区间之间的文本用 encode_ordinary 一次性编码。deepseek.rs 里模板标记走 control 通道，客户端字段走 ordinary，包括消息正文、工具结果和引用、工具调用的名字和参数、工具 schema；回放的历史 assistant 文本和推理内容走 assistant 通道，只保留定位用的那批特殊标记。效果是消息正文里写｜deepseek_image｜不再被解释成真正的图片占位符，DeepSeek V4 和 V4.1 两个渲染器一起改。",
+      "sig": "sig-core",
+      "sig_reason": "Rust 前端的 prompt 渲染与解析器安全处理，属前端主线。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust-frontend",
+        "deepseek",
+        "prompt-rendering"
+      ],
+      "pr_number": 70271
+    },
+    {
+      "sha": "6dc0b3131b61bd3411f6803cee15fd3c09bb773a",
+      "comment": "给 DFlash 这类草稿模型做训练，需要在文档图片上抓目标模型的隐藏状态，供推测解码的训练数据用。nvidia/Nemotron-3.5-Parse 把它的文本配置放在 config 的 decoder 键下面，隐藏状态抽取在启动阶段就失败，之前的 #38987 只处理了常规的 text_config 键。这次让 extract_hidden_states 把带类型的文本配置保留在它原来的 Transformers 键名下，不动模型自己的配置结构。效果是 Nemotron 3.5 Parse 能正常启动，并对扩展后的文档 prompt 导出隐藏状态；Qwen3-VL 在双图 prompt 下，完整 prefill 和分块 prefill 两种设置导出的 token ID 和按位置对齐的隐藏状态保持一致。作者也搜过相关在开的 PR，没有发现重叠的修复。改动含配置解析、集成测试和使用文档。",
+      "sig": "sig-spec-decode",
+      "sig_reason": "修的是推测解码草稿模型训练所需的隐藏状态抽取。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec-decode",
+        "hidden-states",
+        "dflash",
+        "multimodal"
+      ],
+      "pr_number": 69064
+    },
+    {
+      "sha": "3fadb96f1caefc14a05b87bd33ace4084fd5e1e1",
+      "comment": "Unlimited-OCR、DeepSeek-OCR、MiniCPM-V 4.6 和 MiniCPM-OCR 计算多模态 token 数、以及应用处理器选项的方式，和各自的 Hugging Face 处理器对不上。后果有三种：请求直接失败，token 预算算小了，启动时的编码器显存 profiling 拿到的比真实请求需要的小。这次让占位符直接读处理器给出的 num_image_tokens，并按处理器的分块规则重算 dummy 输入。对照很具体：Unlimited-OCR 的请求级 max_crops 低于默认值时原本返回 500，开了 --trust-request-mm-kwargs 还会把引擎核心打死，现在占位符跟处理器一致；DeepSeek-OCR 的 dummy 原来是 2x2 方块，预算 693 和 833，而最大的页面实际需要 933 和 1121，现在改成按 max_crops 排一列瓦片，正好对上；MiniCPM-V 4.6 原本图像预算 648，真实上限是 797，一张普通的 1265x1112 图就要 720，16 帧视频在默认参数下会被拒。改动覆盖处理器、模型注册表和一批处理测试。",
+      "sig": "sig-omni",
+      "sig_reason": "多模态 OCR 与视觉模型的 token 计数和处理器对齐。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "ocr",
+        "token-count",
+        "processor"
+      ],
+      "pr_number": 68623
+    },
+    {
+      "sha": "277221814131cb0f49a0674eb1328e4d02fdccfc",
+      "comment": "同一个请求体，/tokenize 返回的 prompt 和 /v1/chat/completions 渲染出来的不一样，因为它把 reasoning_effort 和 documents 两个字段丢了。Python 侧 TokenizeChatRequest.build_chat_params 只转发了 add_generation_prompt 和 continue_final_message，请求模型又允许额外键，所以这两个字段是被静默丢弃的。Rust 侧把 tokenize 请求降级成 chat 请求时，把这两个字段硬编码成了空值。这次两边都改成透传，包括 reasoning_effort 到 enable_thinking 的映射，以及服务端的 --reasoning-effort-map 配置。效果是带这两个字段的请求，/tokenize 在 Python 和 Rust 前端上都返回和 chat 路由一致的 token ID；不带的请求渲染结果和之前完全相同。改动同时覆盖两个前端、命令行参数、测试和推理输出文档。",
+      "sig": "sig-core",
+      "sig_reason": "前端 /tokenize 接口的字段透传一致性修复。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "frontend",
+        "tokenize",
+        "reasoning"
+      ],
+      "pr_number": 69917
+    },
+    {
+      "sha": "5286d51a0e63f845085133a6a970205fb3490d63",
+      "comment": "MoRIIO 连接器的 WRITE 模式下，prefill 实例可能一直占着已经结束请求的 key-value 缓存块，直到实例重启才释放。两种触发方式：decode 实例在 prompt 还没 prefill 完时就提前释放了这次传输；或者新请求复用了上一个已经结束请求的传输 ID。共同结果是完成报告没能送回到对应请求上，块就一直挂着。这次改 moriio_connector 和 moriio_engine 的完成上报与路由，保证这两种请求结束时照样拿到释放块的报告。实验在 MI355X 上跑 Qwen3-0.6B：32 个在 prefill 期间就被 decode 释放的请求，在 main 上全部没释放，打上补丁后一个都不剩；8 个复用已结束传输 ID 的请求结果相同。服务精度没有变化，Qwen3-4B 在完整 GSM8K 上 WRITE 模式的严格匹配和宽松抽取从 main 的 0.872 和 0.867 变成 0.876 和 0.867。补了 HMA 调度、流水线并行、路由、张量并行确认、写中止和完成路由六组单测。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "MoRIIO KV 连接器在分离式 prefill/decode 下的缓存块泄漏修复。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "kv-connector",
+        "moriio",
+        "pd-disaggregation",
+        "rocm"
+      ],
+      "pr_number": 67218
+    },
+    {
+      "sha": "41f1a785f7ec1cf22197356407bc76467e068816",
+      "comment": "(MI355) HY4 Distributed 作业里，tests/models/hy_v4/test_sequence_parallel.py 的 test_ihc_shards_rows_and_preserves_generation[True] 在 main 上挂掉，报的是 HYV4DecoderLayer 对象没有 ihc_attn_boundary 属性，也就是 ROCm 的解码层没有 NVIDIA 那条融合边界。这次改测试三行，只在层上确实有这个边界时才注册钩子。效果是 MI355X（gfx950）两张 GPU 上该文件两个用例都通过，NVIDIA 路径的行为不变。",
+      "sig": "sig-ci",
+      "sig_reason": "只修 ROCm 分布式测试用例的钩子注册条件。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ci",
+        "rocm",
+        "sequence-parallel"
+      ],
+      "pr_number": 70305
+    },
+    {
+      "sha": "1185d98ea797be7a526d98f4c262cbdf36abefc2",
+      "comment": "Mamba 混合模型如果把状态检查点放在一个 attention 块内部，从 UMBP 连接器（vllm/distributed/kv_transfer 下的一个缓存连接器）恢复时永远命中不了这个检查点，回流的 prompt 只能从更早的边界接着算，或者整段重算。这次让连接器在这种边界上，把 attention 页和 core 交出的状态页一起存下来，用同一个边界作键，做法和已完成请求尾部那条路径本来就的一致。实现上是把页加到 _add_boundary_state_plans 已经在生成存储计划的条目里，计划的构造和校验仍留在一处；每页的块号从 core 当前的块表读，顺带覆盖 lazy_offload。同时把 prefix_match_unit 比调度块更细的 Mamba 混合模型的 enable_partial_hash_hits 默认改成 true，因为只有按哈希粒度的查找才能命中这些检查点；显式设置仍然优先，其它模型保持 false。改动含 umbp 调度器、单测、MoRI token 级端到端测试和使用文档。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "UMBP KV 连接器的边界存储与部分哈希命中策略。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-connector",
+        "umbp",
+        "mamba-hybrid",
+        "prefix-cache"
+      ],
+      "pr_number": 67942
+    },
+    {
+      "sha": "b9fc915ee62a82d5c6a3175ca0d3ee3f6e767b49",
+      "comment": "更新 Kimi-K3.1-Pro 配方的 b300_agentx_pd 预置，点位对齐 InferenceX 第 5175 号 PR 的 747bde06：客户端数换成 1、20、48、64、264、640，删去 96 和 660 两档，分离式 prefill 与 decode 的配比从一 prefill 一 decode 铺到四 prefill 五 decode。64 档以上在 prefill 侧开专家并行负载均衡并把索引器 logits 显存上限设成 4096 MB，264 和 640 档加前缀匹配单元 704 和滑动窗口细粒度命中开关，264 档在 decode 超过 128 行时把 MoE 切到 TRT-LLM 引擎，镜像、Dynamo 版本和草稿模型都没动。改动只涉及这一个 YAML，影响面是基准复现，不碰运行时代码。",
+      "sig": "other",
+      "sig_reason": "只改 recipes 目录下的模型部署配方 YAML，没有运行时或内核代码变更。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "recipe",
+        "kimi-k31",
+        "b300",
+        "pd-disaggregation"
+      ],
+      "pr_number": 70188
+    },
+    {
+      "sha": "0ed20f251508b8307fc856f97a484d4b9b6456c9",
+      "comment": "英特尔 XPU 的 CI 此前没有 KV 连接器和编码器连接器的测试覆盖，依赖也没有锁哈希。这次照 CUDA 侧第 65145 号 PR 的做法，给 XPU 的 KV 连接器测试单独建了一套锁哈希依赖集，里面钉住 lmcache 0.5.7.post1，并把 cuda-bindings 排除出去，免得 XPU 环境误载入 CUDA 13 的 Python 绑定。同时重新打开英特尔 V1 测试，把作业拆成 V1 Core、KV 加 EC 连接器、EC CPU、Metrics 和 NIXL 集成五类，与 CUDA 的作业划分对齐。Qwen3-30B 的 KV 连接器作业改到两卡 K8s 资源上跑，并去掉了运行时临时 pip install dpctl 这一步。验证是 XPU 依赖锁的 pin 和 hash 能复现，Buildkite 的 YAML 解析和作业依赖检查通过。改动都在流水线配置、Dockerfile 和测试依赖清单里。",
+      "sig": "sig-ci",
+      "sig_reason": "改的是 Intel XPU 的 Buildkite 作业划分与测试依赖锁，属 CI 基础设施。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "xpu",
+        "kv-connector",
+        "ec-connector",
+        "dependency-lock"
+      ],
+      "pr_number": 69581
+    },
+    {
+      "sha": "9038df7d8af6e8c7e9737bca0cde5f5bc887f34d",
+      "comment": "XPU 的 CI 之前每个提交都从头构建整个镜像，白等编译时间。现在改用 Docker Bake 复用共享基础镜像：注册表里有基础镜像就直接拿来 bake，main 分支上没命中就先构建并发布基础镜像，预合并 CI 上没命中则退回原来的 docker build 整镜像构建，最后统一推送按提交的镜像。改动涉及英特尔 CI 配置、镜像构建脚本、Dockerfile.xpu 和 docker-bake-xpu.hcl，只影响构建耗时，运行时代码不变。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 CI 的镜像构建与复用流程，无推理侧代码变更。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "xpu",
+        "docker-image",
+        "buildkite"
+      ],
+      "pr_number": 67428
+    },
+    {
+      "sha": "6311f4474f3456151932daa31ba5baee82bbf199",
+      "comment": "DeepSeek-V4.1 的 prefill 上下文并行此前只跑纯文本，图像输入接不进来。这次让图像走编码器缓存复用和 prefill 上下文并行的分段映射，并跳过空的并行分段窗口，空闲的秩不再去请求越界的图像切片，顺带支持 eager 模式下的定长 DSpark。代码集中在编码器运行器、default 模型状态和 pcp_manager 三处，另外加了分布式和 worker 两层测试。验证方面，之前在 H20 上单卡张量并行乘 4 倍上下文并行、DSpark 5、eager 的跑法过了 33 个图文用例，但那批跑依赖第 61554 号 PR 的共享 Engram 补丁，也早于本次 rebase，这一轮没有声明新的 GPU 跑。rebase 之后三个 CPU 层面的图像 gather 回归用例在 main 上失败、打上补丁通过，四卡 B200 的 nightly 选了一条张量并行 2 乘上下文并行 2 的 eager 回归，覆盖分块图像、带缓存的混合批次和非零的 DSpark 接受率。AMD 侧的并行镜像保持不变。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "主旨是让 prefill 上下文并行与编码器缓存在分布式 worker 侧接住图像输入。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "pcp",
+        "encoder-cache",
+        "deepseek-v41",
+        "multimodal"
+      ],
+      "pr_number": 64435
+    },
+    {
+      "sha": "4aec12a47e9ae0b72fff7dd830fdf945d91c4bd3",
+      "comment": "CPU 后端在构建词表 embedding 时会顺手准备一份 GEMM 权重 pack，但 token 查表实际用的是原始权重，这份 pack 只是白占内存。另一处是权重绑定场景下的 LM head：共享 embedding 被 checkpoint 重新加载更新之后，head 可能还拿着旧的 pack。这次在只查表的场景跳过 pack 构建，并把 head 的准备挪到共享权重加载完成之后做。Qwen2.5-0.5B 因此少一个 oneDNN 权重缓冲，省下 272,269,312 字节，约 259.66 MiB。绑定后的 head 在逐层重载和就地更新 kernel 格式两种情况下都能拿到新的词表权重。验证在 Linux arm64 的 69f420d614 上完成：原有的权重绑定和直接重加载用例 54 passed in 8.91s，两个独立的 Qwen 重加载检查（checkpoint 与 kernel 格式）在 spawn 出来的 worker 上 2 passed in 23.11s。",
+      "sig": "sig-core",
+      "sig_reason": "CPU 后端少建无用的权重 pack 并修掉重载后 tied LM head 拿着旧 pack，属后端正确性与内存",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "cpu",
+        "onednn",
+        "weight-pack",
+        "lm-head"
+      ],
+      "pr_number": 67782
+    },
+    {
+      "sha": "db7b1a98f0744ac4ab047fe056e6e46d0325d02d",
+      "comment": "给 Kimi-K3.1-Pro 配方补三套 GB200 预置，对齐 InferenceX 第 5199 号 PR 的 vLLM AgentX 分支，并把镜像钉到这些分支实际跑过的那一个。三套分别覆盖四机聚合的 16 路张量并行加 16 路 decode 上下文并行低延迟解码、走 vLLM Router 加 NIXL 且 prefill 侧在 MegaMoE 上开 16 路专家并行的分离式 prefill/decode、以及推送式 NIXL 下 8 路张量并行乘 2 段流水线并行的 prefill 配两到四个 8 路张量并行数据并行秩的 decode，客户端点从 1 铺到 210。描述里确认当时另外四个未合并的配方 PR 分别覆盖 Zhenwu、MI325X、MI355X 和 B300，这次不算重复。改动只涉及这一个 YAML。",
+      "sig": "other",
+      "sig_reason": "只新增 recipes 目录下的 GB200 部署预置，不触碰推理代码。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "recipe",
+        "gb200",
+        "pd-disaggregation",
+        "nixl"
+      ],
+      "pr_number": 70285
+    },
+    {
+      "sha": "8c97cff059fc0d142cbc4acef9fbba62c0e08aed",
+      "comment": "Inkling 第一代在 Ampere/Ada（SM80、86、89）上跑不起来，它的 FA4 注意力内核用了 score_mod，在 SM90 以下直接抛 NotImplementedError。第 69165 号 PR 已经让第二代在这代卡上跑通。这次的做法是在 SM8x 上把相对位置 logits 剪切成第二代那套分页 Triton rel_attention 内核需要的 (T + 128, H, E + 256) 布局，然后 prefill、decode 和滑动窗口层全都走这一个内核，不新增内核，两代共用同一份 Triton 实现。剪切是静态形状、没有主机同步，因此 CUDA graph 安全；SM8x 上也跳过 FA4 的 JIT 预热，反正那个内核不会被执行。测试上内核用例从 SM90 以上放宽到 SM80 以上，只依赖 FA4 的 score_mod 用例仍然要求 SM90 以上。按评审意见，配方改动被拆出本 PR。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是相对位置注意力内核在 SM8x 上的分发与复用，属内核侧能力补齐。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "ampere",
+        "attention-kernel",
+        "triton",
+        "inkling"
+      ],
+      "pr_number": 69960
+    },
+    {
+      "sha": "2d822105bc324a11b6b0b79952776379cb374c9a",
+      "comment": "打到池化端点的 chat 请求，也就是 /classify、/pooling 和带 messages 的 /v1/embeddings，之前会无视服务端的 --default-chat-template-kwargs；/score 和 /rerank 背后 cross-encoder 用的 chat 模板同样如此。而 /v1/chat/completions 和 /tokenize 早就生效了，同一个 flag 行为不一致。这次在池化的 io_processor 和工厂里补上服务端默认值，请求级的 chat_template_kwargs 优先级仍然更高，和 flag 文档写的一致。/score、/rerank 的优先级顺序是 Sentence Transformers 保存的 kwargs、服务端默认值、请求参数。带来的连带修正是 /tokenize 的 token 数现在和池化端点实际跑出来的一致，描述里举的例子是 Qwen3-0.6B 加 enable_thinking 的场景。测试补在 embed 的在线用例和 scoring 的 io_processor 单元测试里。",
+      "sig": "sig-core",
+      "sig_reason": "改的是 OpenAI 兼容入口与渲染层的模板参数传递，属接口与前端行为。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "pooling",
+        "chat-template",
+        "embeddings",
+        "rerank"
+      ],
+      "pr_number": 68664
+    },
+    {
+      "sha": "18d8b5e7024d9f373ba96c2ec613f8de09346213",
+      "comment": "Kimi K3 的 DSA 稀疏注意力索引器一直没有把 logits_dtype 传给 sparse_attn_indexer，所以命令行 attention-config 里配的 indexer_logits_dtype 被丢掉，MQA logits 始终是 FP32。GB300 和 B300 上的 Kimi-K3.1-Pro 配方预置写的是 bfloat16，实际拿到的却是 FP32。这次把配置值透传下去，Kimi K3 的默认仍是 FP32，默认配置下行为不变。在 main 分支、GB300、352 客户端的条件下，配上 bfloat16 加 deep_select 的 topk 后端，每 GPU 总吞吐提升 3.8%，首 token 时延 p90 下降 25%，端到端时延 p90 下降 4.3%。验证环境是 nightly 提交 c2cc003c5b、MXFP4 权重、prefill 和 decode 各 16 路数据专家并行共 32 卡、AgentX trace、60 分钟窗口、错误数 0，两组对照用同一镜像同一配方，标 BF16 的那组挂上本 PR 的 dsa.py。测试加了 fused 索引器用例和配置层用例。",
+      "sig": "sig-model-performance",
+      "sig_reason": "修的是注意力索引器内核的 logits dtype 透传，收益体现在吞吐与首包时延。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "dsa-indexer",
+        "bf16",
+        "kimi-k3",
+        "latency"
+      ],
+      "pr_number": 69838
+    },
+    {
+      "sha": "c1f05dc4738fafa9fa13627c36335e23a811a2b4",
+      "comment": "ROCm 镜像缓存机器人之前挂在每个 CI build 的最终状态上，也就是 buildkite/ci/pr 和 buildkite/ci，2026-11-25 在 vllm-runners 上被触发 396 次，真正有活的只有 5 次，其中 191 次是根本不碰 ROCm 栈的 PR。这次改成只监听「ci/step: ROCm image cache」和「ci/step: Cache a PR's ROCm images for main」这两个作业的状态，handle_buildkite_status 改从作业链接里的 builds/N 取 build 号且不再等整个 build 结束，因为这两个作业比 build 先跑完，promote 的判定也改成看缓存作业。新增一条测试把这两个 context 和 amd_rocm_cache.yaml 里的 step 标签绑在一起。",
+      "sig": "sig-ci",
+      "sig_reason": "只改 GitHub Actions 工作流与 CI 脚本，减少无效触发。",
+      "tags": [
+        "ci",
+        "medium-risk",
+        "rocm",
+        "github-actions",
+        "image-cache"
+      ],
+      "pr_number": 70086
+    },
+    {
+      "sha": "de7cf7f8cb5dc47d2e65207e0fabbe2c8f0d73b3",
+      "comment": "分离式编码器部署里，那个 Python 代理会把完整的 mm_processor_kwargs 原样转发给每一个编码器子请求。Qwen3-VL 对列表形式的 fps 和 num_frames 是按视频序号解释的，于是只含一个视频的子请求全都取用了列表第一个元素，而消费端按原始位置计算，两边算出的编码器缓存 key 不一致，表现为推送超时。这次加了 --enable-per-video-kwargs-slicing，默认关闭，打开后按每个子请求对应的原始视频位置切分请求级的 fps 和 num_frames，非视频子请求、标量和其它 kwargs、作用域优先的取值顺序都不变。视频 base hash 只对 Qwen3-VL 这一族做处理，把每个视频实际生效的采样值折进去，其它模态的缓存标识仍按上游原样；active 列表长度不够时，在路由之前和流式响应启动之前都返回 HTTP 400。改动同时更新了示例 README、Qwen3-VL 的处理用例和代理重试的单元测试。",
+      "sig": "sig-large-scale-serving",
+      "sig_reason": "修的是分离式编码器链路里编码器缓存 key 不一致导致的推送超时。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "epd",
+        "ec-connector",
+        "qwen3-vl",
+        "encoder-cache"
+      ],
+      "pr_number": 70167
+    },
+    {
+      "sha": "8c5ffad660f8846d7fa432c4153090de213eb972",
+      "comment": "Blackwell（sm_100 和 sm_103）上的 FP8 QSA 稀疏注意力解码内核此前只覆盖 base_programs 达到一定规模的批次，小批次走不到这条路径。这次把它扩到所有逻辑索引批次规模，并加上 split-K、tiny-M 档位融合的分页表查询、带开关的 PDL 重叠，同样的 split-K 路径在 qsa.py 里也加了一份，另外用 PTX 9.2 的 cvt.rn.bf16x2.e4m3x2 直接把 FP8 的 K 反量化成 BF16，ptxas 低于 13.2 时自动退回原来的写法。在一张 GB300（sm_103）上，H=24、HKV=2、D=256、TOPK=2048，rows 从 1 到 2048 的解码快 1.07 倍到 1.92 倍。小批次 rows 1 到 8、bp 不超过 16 这一档，靠 int16 pair 内核里的 split-K 加融合分页表查询拿到 1.09 倍到 1.28 倍，并且省掉一次 _qsa_physical_slots_kernel 启动。数学与上游保持一致，QK 用 BF16、PV 用 FP16，新的反量化指令与先转 FP16 再转 BF16 的老写法逐位相同，最大差值 0.00e+00。参考实现用例同步更新。",
+      "sig": "sig-model-performance",
+      "sig_reason": "主旨是 Blackwell 上稀疏注意力解码内核的吞吐优化与指令级改写。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "blackwell",
+        "fp8",
+        "sparse-attention",
+        "decode-kernel"
+      ],
+      "pr_number": 70187
+    },
+    {
+      "sha": "348707b0dc525e89c73544d7af4d6b6711075348",
+      "comment": "多模态拆分部署下有个 P0/P1 级的缓存状态错位。scale_out 的 render 端点用 skip_mm_cache=True 渲染，把完整张量作为 features 发给生成服务。生成服务侧 /generate 的 features 分支用 mm_input 重建解码器输入时没有带上这个跳过标记，于是 input_processor 读到的 skip_mm_cache 又变回 False。在默认 lru 多模态处理器缓存加上 IPC 打开的配置下，接收端的 LruKeyReplicatedReceiverCache 会把这些整张量条目插进缓存，还可能挤掉已有条目，而发送端的 LruKeyReplicatedSenderCache 并没有做对应的缓存操作，两侧状态就此错开，后续的正常请求或带 content 的请求会抛 MultiModalCacheMissError。这次让跳过标记沿输入链路一路传到引擎，接收端不再写自己的多模态缓存。新增了三组测试，分别覆盖 generate 流、缓存状态错位和跳过缓存标记的传递。",
+      "sig": "sig-omni",
+      "sig_reason": "修的是多模态处理器缓存在渲染与生成拆分部署下的状态错位与缓存未命中。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "mm-cache",
+        "scale-out",
+        "ipc"
+      ],
+      "pr_number": 69392
+    },
     {
       "sha": "47c0f890d6086aa360dafa2c0e07f15e1f94ba87",
       "comment": "DeepSeek-V4.1 的图像输入走默认的 eager 视觉编码器路径时（cudagraph_mm_encoder 关闭，含 enforce_eager 打开），_build_image_span 会抛 RuntimeError，说检测到 GPU 与 CPU 之间的同步。原因是 #58499 只把 CUDA graph 路径的 postprocess_encoder_output 改成了无同步，同一个 mixin 里的 eager 分支还在用同步的 host 到 device 拷贝和 GPU 布尔掩码索引。这次把拼装 image span 的这两处也改成不再触发主机与设备之间的同步，并补了图像输入的测试。修好之后 eager 路径能通过同步检查，顺带解除 test_deepseek_v41_image_pcp（PCP 即 prefill 上下文并行）在 CI 上的失败，为 #64435 让路。",
